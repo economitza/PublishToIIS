@@ -1,11 +1,9 @@
 function Get-MSBuild {
-    # 1. Intento desde PATH
     $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
     if ($cmd) {
         return $cmd.Source
     }
 
-    # 2. Rutas típicas Visual Studio
     $candidates = @(
         "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe",
         "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
