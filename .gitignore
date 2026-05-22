@@ -1,0 +1,9 @@
+bin/
+obj/
+*.zip
+*.nupkg
+*.user
+*.vs/
+_ReSharper*/
+*.cache
+*.log
