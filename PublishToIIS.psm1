@@ -44,36 +44,37 @@ function Publish {
     $backupWebConfig = Join-Path $tempDir "web.config"
     $targetWebConfig = Join-Path $Destination "web.config"
 
-    # Crear carpeta temp si no existe
     if (!(Test-Path $tempDir)) {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
     }
 
-    # 2. Backup del web.config existente (si existe)
+    # 2. Backup web.config
     if (Test-Path $targetWebConfig) {
         Copy-Item $targetWebConfig $backupWebConfig -Force
     }
 
     try {
-        # 3. Ejecutar MSBuild publish
-        msbuild $ProjectPath `
+        Write-Host "Running MSBuild publish..." -ForegroundColor Yellow
+
+        & $msbuild $ProjectPath `
             /p:Configuration=Release `
             /p:DeployOnBuild=true `
             /p:PublishUrl="$Destination" `
             /p:WebPublishMethod=FileSystem `
-            /p:DeployTarget=WebPublish
+            /p:DeployTarget=WebPublish `
+            /v:minimal
 
-        # 4. Restaurar web.config original
+        Write-Host "MSBuild completed" -ForegroundColor Green
+
+        # Restaurar web.config
         if (Test-Path $backupWebConfig) {
             Copy-Item $backupWebConfig $targetWebConfig -Force
+            Write-Host "web.config restored" -ForegroundColor Green
         }
     }
     finally {
-        # Restaurem el servidor
         iisreset /start
-
     }
-
 }
 
 Export-ModuleMember -Function Publish
