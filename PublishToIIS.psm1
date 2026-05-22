@@ -18,60 +18,127 @@ function Get-MSBuild {
         }
     }
 
-    throw "MSBuild not found (PATH or Visual Studio install required)"
+    throw "MSBuild not found. Install Visual Studio Build Tools or add MSBuild to PATH."
 }
 
 function Publish {
     param(
         [string]$ProjectPath = "C:\Users\joaquimms\Documents\git\20260430\central-de-compres\CentralCompres\CentralCompres.csproj",
-        [string]$Destination  = "C:\inetpub\wwwroot\economitza_espana"
+        [string]$Destination = "C:\inetpub\wwwroot\economitza_espana",
+        [string]$Configuration = "Release",
+        [switch]$KeepPrevious
     )
+
+    $ErrorActionPreference = "Stop"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     Write-Host "ENTER Publish function" -ForegroundColor Cyan
 
-    # Resolver MSBuild dinámicamente
     $msbuild = Get-MSBuild
     Write-Host "Using MSBuild: $msbuild" -ForegroundColor Yellow
 
-    # Parem IIS
-    iisreset /stop
-
-    # 1. Rutas derivadas
     $parentDir = Split-Path $Destination -Parent
-    $tempDir = Join-Path $parentDir "temp_publish_backup"
-    $backupWebConfig = Join-Path $tempDir "web.config"
+    $siteName = Split-Path $Destination -Leaf
+
+    $releasingDir = Join-Path $parentDir "${siteName}_releasing"
+    $previousDir = Join-Path $parentDir "${siteName}_previous"
+
     $targetWebConfig = Join-Path $Destination "web.config"
+    $releasingWebConfig = Join-Path $releasingDir "web.config"
 
-    if (!(Test-Path $tempDir)) {
-        New-Item -ItemType Directory -Path $tempDir | Out-Null
-    }
-
-    # 2. Backup web.config
-    if (Test-Path $targetWebConfig) {
-        Copy-Item $targetWebConfig $backupWebConfig -Force
-    }
+    $iisStopped = $false
+    $swapCompleted = $false
 
     try {
-        Write-Host "Running MSBuild publish..." -ForegroundColor Yellow
+        Write-Host "Destination:  $Destination" -ForegroundColor Gray
+        Write-Host "Releasing:    $releasingDir" -ForegroundColor Gray
+        Write-Host "Previous:     $previousDir" -ForegroundColor Gray
+
+        # Limpiar publicación temporal anterior
+        if (Test-Path $releasingDir) {
+            Write-Host "Removing stale releasing directory..." -ForegroundColor Yellow
+            Remove-Item $releasingDir -Recurse -Force
+        }
+
+        New-Item -ItemType Directory -Path $releasingDir | Out-Null
+
+        Write-Host "Running MSBuild publish into releasing directory..." -ForegroundColor Yellow
 
         & $msbuild $ProjectPath `
-            /p:Configuration=Release `
+            /p:Configuration=$Configuration `
             /p:DeployOnBuild=true `
-            /p:PublishUrl="$Destination" `
+            /p:PublishUrl="$releasingDir" `
             /p:WebPublishMethod=FileSystem `
             /p:DeployTarget=WebPublish `
             /v:minimal
 
-        Write-Host "MSBuild completed" -ForegroundColor Green
-
-        # Restaurar web.config
-        if (Test-Path $backupWebConfig) {
-            Copy-Item $backupWebConfig $targetWebConfig -Force
-            Write-Host "web.config restored" -ForegroundColor Green
+        if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild failed with exit code $LASTEXITCODE."
         }
+
+        Write-Host "MSBuild publish completed" -ForegroundColor Green
+
+        # Preservar web.config de producción, si existe.
+        # Esto mantiene settings locales/IIS/productivos fuera del artefacto publicado.
+        if (Test-Path $targetWebConfig) {
+            Copy-Item $targetWebConfig $releasingWebConfig -Force
+            Write-Host "Production web.config copied into releasing directory" -ForegroundColor Green
+        }
+
+        # Si había un previous viejo, eliminarlo antes del swap
+        if (Test-Path $previousDir) {
+            Write-Host "Removing old previous directory..." -ForegroundColor Yellow
+            Remove-Item $previousDir -Recurse -Force
+        }
+
+        Write-Host "Stopping IIS for final swap..." -ForegroundColor Yellow
+        iisreset /stop
+        $iisStopped = $true
+
+        # Mover destino actual a previous
+        if (Test-Path $Destination) {
+            Rename-Item -Path $Destination -NewName "${siteName}_previous"
+        }
+
+        # Activar nueva release
+        Rename-Item -Path $releasingDir -NewName $siteName
+
+        $swapCompleted = $true
+        Write-Host "Directory swap completed" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Publish failed: $($_.Exception.Message)" -ForegroundColor Red
+
+        # Intento de rollback si el swap quedó a medias
+        if ($iisStopped -and -not $swapCompleted) {
+            Write-Host "Attempting rollback..." -ForegroundColor Yellow
+
+            $destinationExists = Test-Path $Destination
+            $previousExists = Test-Path $previousDir
+
+            if (-not $destinationExists -and $previousExists) {
+                Rename-Item -Path $previousDir -NewName $siteName
+                Write-Host "Rollback completed" -ForegroundColor Green
+            }
+        }
+
+        throw
     }
     finally {
-        iisreset /start
+        if ($iisStopped) {
+            Write-Host "Starting IIS..." -ForegroundColor Yellow
+            iisreset /start
+        }
+
+        if ($swapCompleted -and -not $KeepPrevious) {
+            if (Test-Path $previousDir) {
+                Write-Host "Removing previous directory..." -ForegroundColor Yellow
+                Remove-Item $previousDir -Recurse -Force
+            }
+        }
+
+        $sw.Stop()
+        Write-Host ("Total execution time: {0:hh\:mm\:ss\.fff}" -f $sw.Elapsed) -ForegroundColor Cyan
     }
 }
 
