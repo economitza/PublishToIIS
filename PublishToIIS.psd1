@@ -1,5 +1,5 @@
 @{
-    RootModule = 'PublishToIIS.psm1'
+    RootModule = 'src\PublishToIIS.psm1'
     ModuleVersion = '0.1.0'
     GUID = 'd3f6d9b7-6c3a-4f0d-9a2b-123456789abc'
     Author = 'TODO: Add author'

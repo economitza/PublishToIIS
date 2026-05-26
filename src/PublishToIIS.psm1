@@ -1,3 +1,9 @@
+# Dot-source the config module
+$configPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) '..\config\config.ps1'
+if (Test-Path $configPath) {
+    . $configPath
+}
+
 function Get-MSBuild {
     $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -171,4 +177,4 @@ function Publish {
     }
 }
 
-Export-ModuleMember -Function Publish, Get-MSBuild
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig

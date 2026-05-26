@@ -15,5 +15,3 @@ function Get-PublishConfig {
 
     return $cfgAll.environments.$envName
 }
-
-Export-ModuleMember -Function Get-PublishConfig
