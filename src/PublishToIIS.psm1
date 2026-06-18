@@ -1,5 +1,5 @@
 # Dot-source the config module
-$configPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) '..\config\config.ps1'
+$configPath = Join-Path $PSScriptRoot '..\config\config.ps1'
 if (Test-Path $configPath) {
     . $configPath
 }
@@ -51,7 +51,7 @@ function Publish {
     if (-not $ProjectPath -or -not $Destination) {
         if (-not (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue)) {
             # try to dot-source config if available relative to module
-            $maybeCfg = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) '..\config\config.ps1'
+            $maybeCfg = Join-Path $PSScriptRoot '..\config\config.ps1'
             if (Test-Path $maybeCfg) { . $maybeCfg }
         }
 
