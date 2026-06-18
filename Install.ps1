@@ -106,7 +106,7 @@ $exclude = @(
     '.vscode',
     'bin',
     'obj',
-    'Install-ModuleLocal.ps1'
+    'Install.ps1'
 )
 
 # ------------------------------------------------------------
