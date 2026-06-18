@@ -11,7 +11,7 @@ function Get-PublishConfig {
     if (-not $envName -or [string]::IsNullOrWhiteSpace($envName)) { $envName = $env:PUBLISH_ENV }
     if (-not $envName -or [string]::IsNullOrWhiteSpace($envName)) { $envName = $cfgAll.defaultEnvironment }
 
-    if (-not $cfgAll.environments.PSObject.Properties.Name -contains $envName) { throw "Environment '$envName' not defined in $cfgFile" }
+    if ($cfgAll.environments.PSObject.Properties.Name -notcontains $envName) { throw "Environment '$envName' not defined in $cfgFile" }
 
     return $cfgAll.environments.$envName
 }
