@@ -27,11 +27,53 @@ function Get-MSBuild {
     throw "MSBuild not found. Install Visual Studio Build Tools or add MSBuild to PATH."
 }
 
+function Stop-IISAppPool {
+    param([Parameter(Mandatory)][string]$Name)
+
+    Import-Module WebAdministration -ErrorAction Stop
+
+    if (-not (Test-Path "IIS:\AppPools\$Name")) {
+        throw "Application pool '$Name' not found in IIS."
+    }
+
+    if ((Get-WebAppPoolState -Name $Name).Value -ne 'Stopped') {
+        Stop-WebAppPool -Name $Name
+    }
+
+    # Wait until fully stopped so the worker process releases file locks
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-WebAppPoolState -Name $Name).Value -ne 'Stopped') {
+        if ((Get-Date) -gt $deadline) { throw "Timed out waiting for app pool '$Name' to stop." }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Start-IISAppPool {
+    param([Parameter(Mandatory)][string]$Name)
+
+    Import-Module WebAdministration -ErrorAction Stop
+
+    if (-not (Test-Path "IIS:\AppPools\$Name")) {
+        throw "Application pool '$Name' not found in IIS."
+    }
+
+    if ((Get-WebAppPoolState -Name $Name).Value -ne 'Started') {
+        Start-WebAppPool -Name $Name
+    }
+
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-WebAppPoolState -Name $Name).Value -ne 'Started') {
+        if ((Get-Date) -gt $deadline) { throw "Timed out waiting for app pool '$Name' to start." }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Publish {
     param(
         [string]$ProjectPath,
         [string]$Destination,
         [string]$Environment,
+        [string]$AppPoolName,
         [string]$Configuration = "Release",
         [switch]$KeepPrevious
     )
@@ -47,8 +89,8 @@ function Publish {
 
     Write-Host "ENTER Publish function" -ForegroundColor Cyan
 
-    # If ProjectPath or Destination not provided, load from central config
-    if (-not $ProjectPath -or -not $Destination) {
+    # If ProjectPath, Destination or AppPoolName not provided, load from central config
+    if (-not $ProjectPath -or -not $Destination -or -not $AppPoolName) {
         if (-not (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue)) {
             # try to dot-source config if available relative to module
             $maybeCfg = Join-Path $PSScriptRoot '..\config\config.ps1'
@@ -59,6 +101,7 @@ function Publish {
             $cfg = Get-PublishConfig -Environment $Environment
             if (-not $ProjectPath -and $cfg.origin) { $ProjectPath = $cfg.origin }
             if (-not $Destination -and $cfg.destination) { $Destination = $cfg.destination }
+            if (-not $AppPoolName -and $cfg.appPool) { $AppPoolName = $cfg.appPool }
         }
     }
 
@@ -68,13 +111,16 @@ function Publish {
     $parentDir = Split-Path $Destination -Parent
     $siteName = Split-Path $Destination -Leaf
 
+    # Default the app pool to the site (destination) name when not configured
+    if (-not $AppPoolName) { $AppPoolName = $siteName }
+
     $releasingDir = Join-Path $parentDir "${siteName}_releasing"
     $previousDir = Join-Path $parentDir "${siteName}_previous"
 
     $targetWebConfig = Join-Path $Destination "web.config"
     $releasingWebConfig = Join-Path $releasingDir "web.config"
 
-    $iisStopped = $false
+    $poolStopped = $false
     $swapCompleted = $false
 
     try {
@@ -126,9 +172,9 @@ function Publish {
             Remove-Item $previousDir -Recurse -Force
         }
 
-        Write-Host "Stopping IIS for final swap..." -ForegroundColor Yellow
-        iisreset /stop
-        $iisStopped = $true
+        Write-Host "Stopping app pool '$AppPoolName' for final swap..." -ForegroundColor Yellow
+        Stop-IISAppPool -Name $AppPoolName
+        $poolStopped = $true
 
         # Mover destino actual a previous
         if (Test-Path $Destination) {
@@ -145,7 +191,7 @@ function Publish {
         Write-Host "Publish failed: $($_.Exception.Message)" -ForegroundColor Red
 
         # Intento de rollback si el swap quedó a medias
-        if ($iisStopped -and -not $swapCompleted) {
+        if ($poolStopped -and -not $swapCompleted) {
             Write-Host "Attempting rollback..." -ForegroundColor Yellow
 
             $destinationExists = Test-Path $Destination
@@ -160,9 +206,9 @@ function Publish {
         throw
     }
     finally {
-        if ($iisStopped) {
-            Write-Host "Starting IIS..." -ForegroundColor Yellow
-            iisreset /start
+        if ($poolStopped) {
+            Write-Host "Starting app pool '$AppPoolName'..." -ForegroundColor Yellow
+            Start-IISAppPool -Name $AppPoolName
         }
 
         if ($swapCompleted -and -not $KeepPrevious) {
