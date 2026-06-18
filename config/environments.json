@@ -1,5 +1,5 @@
 {
-  "defaultEnvironment": "dev",
+  "defaultEnvironment": "dev-joaquim-local",
   "environments": {
     "dev-joaquim-local": {
       "origin": "C:\\Users\\joaquimms\\Documents\\git\\20260430\\central-de-compres\\CentralCompres\\",
@@ -10,12 +10,14 @@
       "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest"
     },
     "staging": {
-      "origin": "C:\\path\\to\\project\\bin\\Staging",
-      "destination": "C:\\inetpub\\wwwroot\\site_staging"
+      "origin": "C:\\path\\to\\project-source",
+      "destination": "C:\\inetpub\\wwwroot\\site_staging",
+      "appPool": "site_staging"
     },
     "prod": {
-      "origin": "C:\\path\\to\\project\\bin\\Release",
-      "destination": "C:\\inetpub\\wwwroot\\site_prod"
+      "origin": "C:\\path\\to\\project-source",
+      "destination": "C:\\inetpub\\wwwroot\\site_prod",
+      "appPool": "site_prod"
     }
   }
 }
