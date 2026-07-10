@@ -9,6 +9,10 @@
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest"
     },
+    "devecoesp2": {
+      "origin": "E:\\git\\central-de-compres\\CentralCompres",
+      "destination": "E:\\wwwrootDevecoEsp2"
+    },
     "staging": {
       "origin": "C:\\path\\to\\project\\bin\\Staging",
       "destination": "C:\\inetpub\\wwwroot\\site_staging"
