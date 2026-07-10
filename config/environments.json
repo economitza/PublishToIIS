@@ -20,7 +20,7 @@
     "devecoand2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoAnd2"
-    }
+    },
     "staging": {
       "origin": "C:\\path\\to\\project-source",
       "destination": "C:\\inetpub\\wwwroot\\site_staging",
