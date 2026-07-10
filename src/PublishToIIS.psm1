@@ -102,6 +102,8 @@ function Publish {
             if (-not $ProjectPath -and $cfg.origin) { $ProjectPath = $cfg.origin }
             if (-not $Destination -and $cfg.destination) { $Destination = $cfg.destination }
             if (-not $AppPoolName -and $cfg.appPool) { $AppPoolName = $cfg.appPool }
+            # By convention the app pool matches the environment name; use it when not set explicitly
+            if (-not $AppPoolName -and $cfg._environment) { $AppPoolName = $cfg._environment }
         }
     }
 

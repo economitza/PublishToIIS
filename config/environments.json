@@ -3,27 +3,24 @@
   "environments": {
     "dev-joaquim-local": {
       "origin": "C:\\Users\\joaquimms\\Documents\\git\\20260430\\central-de-compres\\CentralCompres\\",
-      "destination": "C:\\inetpub\\wwwroot\\economitza_espana"
+      "destination": "C:\\inetpub\\wwwroot\\economitza_espana",
+      "appPool": "economitza_espana"
     },
     "devecoesp1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest",
-      "appPool": "devecoesp1"
+      "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest"
     },
     "devecoand1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoand1\\",
-      "appPool": "devecoand1"
+      "destination": "E:\\wwwrootDevecoand1\\"
     },
     "devecoesp2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoEsp2",
-      "appPool": "devecoesp2"
+      "destination": "E:\\wwwrootDevecoEsp2"
     },
     "devecoand2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoAnd2",
-      "appPool": "devecoand2"
+      "destination": "E:\\wwwrootDevecoAnd2"
     },
     "staging": {
       "origin": "C:\\path\\to\\project-source",

@@ -13,5 +13,8 @@ function Get-PublishConfig {
 
     if ($cfgAll.environments.PSObject.Properties.Name -notcontains $envName) { throw "Environment '$envName' not defined in $cfgFile" }
 
-    return $cfgAll.environments.$envName
+    $envCfg = $cfgAll.environments.$envName
+    # Expose the resolved environment name so callers can default the app pool to it
+    $envCfg | Add-Member -NotePropertyName '_environment' -NotePropertyValue $envName -Force
+    return $envCfg
 }
