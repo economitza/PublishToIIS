@@ -7,19 +7,23 @@
     },
     "devecoesp1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest"
+      "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest",
+      "appPool": "devecoesp1"
     },
     "devecoand1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoand1\\"
+      "destination": "E:\\wwwrootDevecoand1\\",
+      "appPool": "devecoand1"
     },
     "devecoesp2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoEsp2"
+      "destination": "E:\\wwwrootDevecoEsp2",
+      "appPool": "devecoesp2"
     },
     "devecoand2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
-      "destination": "E:\\wwwrootDevecoAnd2"
+      "destination": "E:\\wwwrootDevecoAnd2",
+      "appPool": "devecoand2"
     },
     "staging": {
       "origin": "C:\\path\\to\\project-source",
