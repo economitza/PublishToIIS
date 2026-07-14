@@ -75,6 +75,7 @@ function Publish {
         [string]$Environment,
         [string]$AppPoolName,
         [string]$Configuration = "Release",
+        [hashtable]$MSBuildProperties = @{},
         [switch]$KeepPrevious
     )
 
@@ -147,12 +148,22 @@ function Publish {
         }
         else { $projectToBuild = $ProjectPath }
 
+        # Build extra MSBuild properties passed by the caller (e.g. @{ MvcBuildViews = 'true' })
+        $extraProps = @()
+        foreach ($key in $MSBuildProperties.Keys) {
+            $extraProps += "/p:$key=$($MSBuildProperties[$key])"
+        }
+        if ($extraProps.Count) {
+            Write-Host "Extra MSBuild properties: $($extraProps -join ' ')" -ForegroundColor Gray
+        }
+
         & $msbuild $projectToBuild `
             /p:Configuration=$Configuration `
             /p:DeployOnBuild=true `
             /p:PublishUrl="$releasingDir" `
             /p:WebPublishMethod=FileSystem `
             /p:DeployTarget=WebPublish `
+            @extraProps `
             /v:minimal
 
         if ($LASTEXITCODE -ne 0) {
