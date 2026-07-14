@@ -6,10 +6,10 @@
     CompanyName = 'Economitza'
     Copyright = '(c) 2026 Economitza'
     Description = 'PublishToIIS - helper module to publish .NET projects to IIS with safe swap'
-    FunctionsToExport = @('Publish','Get-MSBuild','Get-PublishConfig')
+    FunctionsToExport = @('Publish','Get-MSBuild','Get-PublishConfig','Update-PublishToIIS')
     CmdletsToExport = @()
     VariablesToExport = @()
-    AliasesToExport = @()
+    AliasesToExport = @('Publish-Update')
     FileList = @('src\PublishToIIS.psm1','config\environments.json','config\config.ps1')
     PrivateData = @{
         PSData = @{

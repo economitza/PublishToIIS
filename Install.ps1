@@ -17,7 +17,10 @@ Uso:
 #>
 
 [CmdletBinding()]
-param()
+param(
+    # Omite la pausa final "press any key" (para instalaciones desatendidas, p.ej. Update-PublishToIIS)
+    [switch]$NoPause
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -42,10 +45,12 @@ if (-not $isAdmin) {
         '-ExecutionPolicy', 'Bypass'
         '-File', "`"$PSCommandPath`""
     )
+    if ($NoPause) { $argList += '-NoPause' }
 
     Start-Process powershell.exe `
         -Verb RunAs `
-        -ArgumentList $argList
+        -ArgumentList $argList `
+        -Wait
 
     exit
 }
@@ -62,6 +67,20 @@ $moduleName = Split-Path $moduleRoot -Leaf
 Write-Host ""
 Write-Host "Module Root : $moduleRoot"
 Write-Host "Module Name : $moduleName"
+
+# ------------------------------------------------------------
+# Recordar la ruta del repo origen para futuras actualizaciones
+# (usado por Update-PublishToIIS para hacer fetch+pull y reinstalar)
+# ------------------------------------------------------------
+
+if (Test-Path (Join-Path $moduleRoot '.git')) {
+    [Environment]::SetEnvironmentVariable('PUBLISHTOIIS_REPO', $moduleRoot, 'Machine')
+    $env:PUBLISHTOIIS_REPO = $moduleRoot
+    Write-Host "Saved repo path (PUBLISHTOIIS_REPO): $moduleRoot" -ForegroundColor Gray
+}
+else {
+    Write-Warning "Source is not a git checkout; skipping PUBLISHTOIIS_REPO. 'Update-PublishToIIS' will need -RepoPath."
+}
 
 # ------------------------------------------------------------
 # Obtener versión desde manifest
@@ -181,6 +200,8 @@ Get-Module `
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green
 
-Write-Host ""
-Write-Host "Press any key to exit..."
-[void][System.Console]::ReadKey($true)
+if (-not $NoPause) {
+    Write-Host ""
+    Write-Host "Press any key to exit..."
+    [void][System.Console]::ReadKey($true)
+}

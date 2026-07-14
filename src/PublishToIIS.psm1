@@ -236,4 +236,69 @@ function Publish {
     }
 }
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig
+function Update-PublishToIIS {
+    <#
+    .SYNOPSIS
+        Actualiza el módulo: hace git fetch + pull en el repo origen y reinstala.
+
+    .DESCRIPTION
+        Localiza la copia de trabajo git (por -RepoPath o la variable de entorno
+        PUBLISHTOIIS_REPO que guarda Install.ps1), trae los últimos cambios y
+        ejecuta Install.ps1 para copiar la nueva versión a los módulos de PowerShell.
+
+    .EXAMPLE
+        Update-PublishToIIS
+
+    .EXAMPLE
+        Update-PublishToIIS -RepoPath 'C:\Users\me\git\PublishToIIS'
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$RepoPath
+    )
+
+    $ErrorActionPreference = "Stop"
+
+    # Resolver la ruta del repo: parámetro explícito o variable de entorno guardada en la instalación
+    if (-not $RepoPath) {
+        $RepoPath = $env:PUBLISHTOIIS_REPO
+        if (-not $RepoPath) {
+            $RepoPath = [Environment]::GetEnvironmentVariable('PUBLISHTOIIS_REPO', 'Machine')
+        }
+    }
+
+    if (-not $RepoPath) {
+        throw "No se encontró la ruta del repo. Pásala con -RepoPath o reinstala con Install.ps1 para fijar PUBLISHTOIIS_REPO."
+    }
+    if (-not (Test-Path $RepoPath)) {
+        throw "La ruta del repo no existe: $RepoPath"
+    }
+    if (-not (Test-Path (Join-Path $RepoPath '.git'))) {
+        throw "La ruta '$RepoPath' no es una copia de trabajo git (falta .git)."
+    }
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) { throw "git no está en el PATH." }
+
+    Write-Host "Updating repo: $RepoPath" -ForegroundColor Cyan
+
+    & git -C $RepoPath fetch --prune
+    if ($LASTEXITCODE -ne 0) { throw "git fetch falló con código $LASTEXITCODE." }
+
+    & git -C $RepoPath pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw "git pull falló con código $LASTEXITCODE." }
+
+    Write-Host "Repo actualizado. Reinstalando módulo..." -ForegroundColor Yellow
+
+    $installScript = Join-Path $RepoPath 'Install.ps1'
+    if (-not (Test-Path $installScript)) { throw "No se encontró Install.ps1 en $RepoPath." }
+
+    # Install.ps1 se auto-eleva (UAC) si hace falta; -NoPause evita la espera de tecla
+    & $installScript -NoPause
+
+    Write-Host "Update completado." -ForegroundColor Green
+}
+
+Set-Alias -Name Publish-Update -Value Update-PublishToIIS
+
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS -Alias Publish-Update
