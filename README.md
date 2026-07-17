@@ -16,6 +16,15 @@ Uso rápido:
 
   Publish -ProjectPath $cfg.origin -Destination $cfg.destination -Configuration Release
 
+- web.config: por defecto se PRESERVA el del servidor (el del repo se descarta).
+  Para publicar el web.config del repo (p. ej. cuando la release incluye cambios
+  de configuracion como customErrors):
+
+  Publish ... -OverrideWebconfig
+
+  Con -OverrideWebconfig el web.config del servidor queda guardado al lado como
+  `web.config.previous` para poder comparar o restaurar.
+
 Estructura relevante:
 
 - `src/` : implementación del módulo

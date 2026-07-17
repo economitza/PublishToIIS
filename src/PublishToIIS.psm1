@@ -68,6 +68,39 @@ function Start-IISAppPool {
     }
 }
 
+function Protect-ProductionWebConfig {
+    <#
+    .SYNOPSIS
+        Gestiona el web.config al publicar: por defecto preserva el de producción.
+
+    .DESCRIPTION
+        Comportamiento por defecto: copia el web.config del destino (producción)
+        sobre el recién publicado, manteniendo la configuración del servidor.
+        Con -Override se publica el web.config del repo y el de producción se
+        guarda al lado como 'web.config.previous' para poder comparar/restaurar.
+
+    .OUTPUTS
+        'preserved' | 'overridden' | 'no-production-webconfig'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TargetWebConfig,
+        [Parameter(Mandatory)][string]$ReleasingWebConfig,
+        [switch]$Override
+    )
+
+    if (-not (Test-Path $TargetWebConfig)) {
+        return 'no-production-webconfig'
+    }
+
+    if ($Override) {
+        Copy-Item $TargetWebConfig "$ReleasingWebConfig.previous" -Force
+        return 'overridden'
+    }
+
+    Copy-Item $TargetWebConfig $ReleasingWebConfig -Force
+    return 'preserved'
+}
+
 function Publish {
     param(
         [string]$ProjectPath,
@@ -76,7 +109,8 @@ function Publish {
         [string]$AppPoolName,
         [string]$Configuration = "Release",
         [hashtable]$MSBuildProperties = @{},
-        [switch]$KeepPrevious
+        [switch]$KeepPrevious,
+        [switch]$OverrideWebconfig
     )
 
     # Check for admin privileges
@@ -172,11 +206,14 @@ function Publish {
 
         Write-Host "MSBuild publish completed" -ForegroundColor Green
 
-        # Preservar web.config de producción, si existe.
-        # Esto mantiene settings locales/IIS/productivos fuera del artefacto publicado.
-        if (Test-Path $targetWebConfig) {
-            Copy-Item $targetWebConfig $releasingWebConfig -Force
-            Write-Host "Production web.config copied into releasing directory" -ForegroundColor Green
+        # web.config: por defecto se preserva el de producción; con -OverrideWebconfig
+        # se publica el del repo y el de producción queda como web.config.previous.
+        $webConfigResult = Protect-ProductionWebConfig -TargetWebConfig $targetWebConfig `
+            -ReleasingWebConfig $releasingWebConfig -Override:$OverrideWebconfig
+        switch ($webConfigResult) {
+            'preserved'  { Write-Host "Production web.config preserved (repo one discarded)" -ForegroundColor Green }
+            'overridden' { Write-Host "REPO web.config PUBLISHED (-OverrideWebconfig); production copy saved as web.config.previous" -ForegroundColor Yellow }
+            default      { Write-Host "No production web.config found; publishing the repo one" -ForegroundColor Yellow }
         }
 
         # Si había un previous viejo, eliminarlo antes del swap
@@ -301,4 +338,4 @@ function Update-PublishToIIS {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig -Alias Publish-Update
