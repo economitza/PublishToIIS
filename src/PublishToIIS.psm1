@@ -101,6 +101,62 @@ function Protect-ProductionWebConfig {
     return 'preserved'
 }
 
+function New-DeployInfo {
+    <#
+    .SYNOPSIS
+        Escribe deploy-info.json (rama, commit, fechas, entorno) en el directorio publicado.
+
+    .DESCRIPTION
+        Sello de versión del despliegue (Fase 1 del dashboard de publicación): toma
+        rama/commit de la copia de trabajo git de ProjectPath y lo escribe como
+        deploy-info.json en OutputDir. Pensado para ejecutarse tras el MSBuild y antes
+        del swap, de modo que el sello viaje atómicamente con el site y quede
+        consultable en GET /deploy-info.json.
+
+        Si ProjectPath no es una copia de trabajo git, avisa y escribe el sello con
+        branch/commit nulos: el sello nunca debe abortar una publicación.
+
+    .OUTPUTS
+        PSCustomObject con el contenido escrito.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [Parameter(Mandatory)][string]$OutputDir,
+        [string]$Environment
+    )
+
+    $branch = $null; $commit = $null; $commitDate = $null
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($git) {
+        $insideRepo = (& git -C $ProjectPath rev-parse --is-inside-work-tree 2>$null)
+        if ($LASTEXITCODE -eq 0 -and "$insideRepo".Trim() -eq 'true') {
+            $branch = ("$(& git -C $ProjectPath rev-parse --abbrev-ref HEAD 2>$null)").Trim()
+            $commit = ("$(& git -C $ProjectPath rev-parse --short HEAD 2>$null)").Trim()
+            $commitDate = ("$(& git -C $ProjectPath show -s --format=%cI HEAD 2>$null)").Trim()
+        }
+    }
+
+    if (-not $commit) {
+        Write-Warning "New-DeployInfo: '$ProjectPath' no es una copia de trabajo git (o git no está disponible); se escribe el sello sin rama/commit."
+        $branch = $null; $commit = $null; $commitDate = $null
+    }
+
+    $info = [pscustomobject]@{
+        branch      = $branch
+        commit      = $commit
+        commitDate  = $commitDate
+        publishDate = (Get-Date).ToString('o')
+        environment = $Environment
+        publishedBy = "$env:USERNAME@$env:COMPUTERNAME"
+    }
+
+    $file = Join-Path $OutputDir 'deploy-info.json'
+    $info | ConvertTo-Json | Set-Content -Path $file -Encoding UTF8
+    return $info
+}
+
 function Publish {
     param(
         [string]$ProjectPath,
@@ -214,6 +270,13 @@ function Publish {
             'preserved'  { Write-Host "Production web.config preserved (repo one discarded)" -ForegroundColor Green }
             'overridden' { Write-Host "REPO web.config PUBLISHED (-OverrideWebconfig); production copy saved as web.config.previous" -ForegroundColor Yellow }
             default      { Write-Host "No production web.config found; publishing the repo one" -ForegroundColor Yellow }
+        }
+
+        # Sello de versión del despliegue: viaja dentro de releasing/ y por tanto con el swap
+        $deployInfoEnv = if ($Environment) { $Environment } else { $siteName }
+        $deployInfo = New-DeployInfo -ProjectPath $ProjectPath -OutputDir $releasingDir -Environment $deployInfoEnv
+        if ($deployInfo.commit) {
+            Write-Host "deploy-info.json stamped: $($deployInfo.branch)@$($deployInfo.commit) -> $deployInfoEnv" -ForegroundColor Green
         }
 
         # Si había un previous viejo, eliminarlo antes del swap
@@ -338,4 +401,4 @@ function Update-PublishToIIS {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo -Alias Publish-Update

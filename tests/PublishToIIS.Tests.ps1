@@ -18,6 +18,55 @@ Describe 'Get-PublishConfig' {
     }
 }
 
+Describe 'New-DeployInfo' {
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_di_" + [Guid]::NewGuid())
+        $script:repoDir = Join-Path $script:tmp 'repo'
+        $script:outDir = Join-Path $script:tmp 'releasing'
+        New-Item -ItemType Directory -Path $script:repoDir | Out-Null
+        New-Item -ItemType Directory -Path $script:outDir | Out-Null
+        # Working copy git mínima con un commit en una rama conocida
+        git -C $script:repoDir init --quiet --initial-branch=test-branch
+        git -C $script:repoDir -c user.email=t@t -c user.name=t commit --allow-empty -m 'init' --quiet
+    }
+
+    AfterEach {
+        Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'writes deploy-info.json with branch, commit and metadata from the working copy' {
+        $info = New-DeployInfo -ProjectPath $script:repoDir -OutputDir $script:outDir -Environment 'devecoand2'
+        $file = Join-Path $script:outDir 'deploy-info.json'
+        Test-Path $file | Should -BeTrue
+        $json = Get-Content $file -Raw | ConvertFrom-Json
+        $json.branch | Should -Be 'test-branch'
+        $json.commit | Should -Match '^[0-9a-f]{7,}$'
+        $json.commitDate | Should -Not -BeNullOrEmpty
+        $json.publishDate | Should -Not -BeNullOrEmpty
+        $json.environment | Should -Be 'devecoand2'
+        $json.publishedBy | Should -Be "$env:USERNAME@$env:COMPUTERNAME"
+        $info.commit | Should -Be $json.commit
+    }
+
+    It 'resolves git info from a subdirectory of the working copy (project inside repo)' {
+        $sub = Join-Path $script:repoDir 'CentralCompres'
+        New-Item -ItemType Directory -Path $sub | Out-Null
+        $json = New-DeployInfo -ProjectPath $sub -OutputDir $script:outDir -Environment 'e'
+        $json.branch | Should -Be 'test-branch'
+    }
+
+    It 'still writes the stamp (with null branch/commit) when the path is not a git repo' {
+        $noRepo = Join-Path $script:tmp 'norepo'
+        New-Item -ItemType Directory -Path $noRepo | Out-Null
+        $json = New-DeployInfo -ProjectPath $noRepo -OutputDir $script:outDir -Environment 'e' -WarningAction SilentlyContinue
+        $file = Join-Path $script:outDir 'deploy-info.json'
+        Test-Path $file | Should -BeTrue
+        $json.branch | Should -BeNullOrEmpty
+        $json.commit | Should -BeNullOrEmpty
+        $json.publishDate | Should -Not -BeNullOrEmpty
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

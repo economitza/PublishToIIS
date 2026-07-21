@@ -25,6 +25,10 @@ Uso rápido:
   Con -OverrideWebconfig el web.config del servidor queda guardado al lado como
   `web.config.previous` para poder comparar o restaurar.
 
+- Sello de versión: cada Publish escribe `deploy-info.json` (rama, commit, fechas,
+  entorno, quién publica) en la raíz del site — consultable en `GET /deploy-info.json`.
+  También invocable a mano: `New-DeployInfo -ProjectPath <workingCopy> -OutputDir <dir> -Environment <env>`
+
 Estructura relevante:
 
 - `src/` : implementación del módulo

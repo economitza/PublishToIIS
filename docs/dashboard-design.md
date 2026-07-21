@@ -25,7 +25,7 @@ Matices importantes:
 - Al servidor remoto hoy solo hay acceso por **RDP**: el disparo remoto del
   publish es el problema de transporte a resolver (Fase 3).
 
-## Fase 1 — Sello de versión en el site publicado (`deploy-info.json`)
+## Fase 1 — Sello de versión en el site publicado (`deploy-info.json`) — ✅ IMPLEMENTADA (2026-07-21)
 
 En cada `Publish`, escribir en la raíz del site publicado un `deploy-info.json`:
 
