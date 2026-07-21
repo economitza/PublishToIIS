@@ -22,7 +22,7 @@ CONFIG_PATH = ROOT.parent / "config" / "environments.json"
 # Repo local por defecto para listar ramas cuando el origin del entorno
 # no existe en esta máquina (p. ej. rutas E:\ de los servidores de test).
 DEFAULT_BRANCH_REPO = r"C:\Users\joaquimms\Documents\git\20260430\central-de-compres"
-PROBE_TIMEOUT = 5
+PROBE_TIMEOUT = 20  # los app pools fríos de los entornos de test tardan en despertar
 
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
