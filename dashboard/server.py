@@ -9,6 +9,7 @@ entornos cuyo `origin` existe en esta máquina (el disparo remoto es Fase 3).
 Uso:  python server.py [puerto]   (por defecto 8765)
 """
 import json
+import re
 import ssl
 import subprocess
 import sys
@@ -103,22 +104,32 @@ def publish(env_name, branch):
     if not env["localOrigin"]:
         return 501, {"error": "origin no accesible desde esta máquina: disparo remoto pendiente (Fase 3)"}
 
-    repo = env["origin"]
-    for cmd in (["git", "-C", repo, "fetch", "--prune"],
-                ["git", "-C", repo, "checkout", branch],
-                ["git", "-C", repo, "pull", "--ff-only"]):
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            return 500, {"error": f"{' '.join(cmd[:4])} falló", "detail": r.stderr[-2000:]}
+    # Validar la rama ANTES de interpolarla en el comando (evita inyección en el
+    # borde Python->PowerShell; Invoke-DeployOrder revalida del lado PS).
+    if not re.match(r"^[A-Za-z0-9._/+\-]+$", branch or ""):
+        return 400, {"error": f"Rama con formato inválido: '{branch}'"}
 
     module = str(ROOT.parent / "PublishToIIS.psd1")
-    ps = (f"Import-Module '{module}'; "
-          f"Publish -Environment '{env_name}'")
+    ps = (f"$ErrorActionPreference='Stop'; "
+          f"Import-Module '{module}' -Force; "
+          f"Invoke-DeployOrder -Environment '{env_name}' -Branch '{branch}' -Execute")
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                        capture_output=True, text=True, timeout=1800)
+    out = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
+
     if r.returncode != 0:
-        return 500, {"error": "Publish falló", "detail": (r.stderr or r.stdout)[-3000:]}
-    return 200, {"ok": True, "output": r.stdout[-3000:]}
+        detail = out or "(el proceso no devolvió salida)"
+        low = detail.lower()
+        if "administrator" in low or "administrador" in low:
+            detail += ("\n\n>>> ACCIÓN: el publish necesita privilegios de administrador "
+                       "(parar el app pool y swap de IIS) y el dashboard corre sin elevar. "
+                       "Arranca el servidor desde una consola 'Ejecutar como administrador', "
+                       "o configura la tarea 'Publish Dashboard' con privilegios elevados.")
+        elif "did not match" in low or "no fast-forward" in low or "ff-only" in low:
+            detail += ("\n\n>>> ACCIÓN: la rama local del repo diverge del remoto; "
+                       "resuélvela a mano (o elige otra rama) antes de reintentar.")
+        return 500, {"error": f"Publish de '{env_name}' falló", "detail": detail[-4000:]}
+    return 200, {"ok": True, "output": out[-4000:]}
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -387,6 +387,17 @@ function Invoke-DeployOrder {
         throw "Rama con formato inválido: '$Branch'"
     }
 
+    # Pre-check de admin en modo real: fallar aquí (antes del checkout) con un
+    # mensaje accionable, en vez de dejar que Publish reviente a medias.
+    if ($Execute) {
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if (-not $isAdmin) {
+            throw ("El publish requiere privilegios de administrador (parar el app pool y swap de IIS) " +
+                   "y el proceso actual NO está elevado. Arranca el dashboard/consola como administrador, " +
+                   "o registra el runner con una cuenta con permisos de admin.")
+        }
+    }
+
     $cfg = Get-PublishConfig -Environment $Environment
     $repo = Split-Path ($cfg.origin.TrimEnd('\', '/')) -Parent
 
