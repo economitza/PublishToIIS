@@ -4,7 +4,9 @@
     "dev-joaquim-local": {
       "origin": "C:\\Users\\joaquimms\\Documents\\git\\20260430\\central-de-compres\\CentralCompres\\",
       "destination": "C:\\inetpub\\wwwroot\\economitza_espana",
-      "appPool": "economitza_espana"
+      "appPool": "economitza_espana",
+      "siteUrl": "http://localhost:56006",
+      "serverName": "localhost"
     },
     "devecoesp1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",

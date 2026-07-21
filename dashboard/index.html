@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Dashboard de publicación</title>
+<style>
+  body { font-family: "Segoe UI", sans-serif; margin: 2rem; background: #f5f6f8; color: #222; }
+  h1 { font-size: 1.3rem; }
+  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  th, td { padding: .55rem .8rem; border-bottom: 1px solid #e3e5e8; text-align: left; font-size: .92rem; vertical-align: middle; }
+  th { background: #2c3e50; color: #fff; font-weight: 600; }
+  tr:hover td { background: #f0f4f8; }
+  .sem { font-size: 1.2rem; }
+  .muted { color: #888; font-size: .85rem; }
+  input.branch { width: 230px; padding: .3rem .4rem; }
+  button.pub { padding: .35rem .9rem; border: 0; border-radius: 4px; background: #2980b9; color: #fff; cursor: pointer; }
+  button.pub:disabled { background: #b6bdc4; cursor: not-allowed; }
+  button.pub.busy { background: #f39c12; }
+  #refresh { margin-left: 1rem; font-size: .8rem; }
+  code { background: #eef; padding: 0 .3rem; border-radius: 3px; }
+  #log { white-space: pre-wrap; background: #1e1e1e; color: #d7d7d7; padding: .8rem; margin-top: 1rem;
+         font-family: Consolas, monospace; font-size: .8rem; max-height: 260px; overflow: auto; display: none; }
+</style>
+</head>
+<body>
+<h1>Dashboard de publicación <button id="refresh" onclick="refreshAll()">⟳ refrescar</button></h1>
+<table id="tbl">
+  <thead><tr>
+    <th>Entorno</th><th>Servidor</th><th>Rama a publicar</th><th></th>
+    <th>Online</th><th>Desplegado</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+<div class="muted" style="margin-top:.6rem">
+  🟢 responde · ⚪ apagado/no alcanzable · 🔴 error — Detalles vía <code>/deploy-info.json</code>.
+  Publish disponible solo para entornos con origin local (el resto, Fase 3).
+</div>
+<div id="log"></div>
+
+<script>
+const tbody = document.querySelector('#tbl tbody');
+const log = document.getElementById('log');
+let branchesCache = null;
+
+function esc(s) { return (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function fetchJson(url, opts) {
+  const r = await fetch(url, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error ? j.error + (j.detail ? '\n' + j.detail : '') : r.status);
+  return j;
+}
+
+async function loadBranches() {
+  if (!branchesCache) branchesCache = await fetchJson('/api/branches');
+  const dl = document.createElement('datalist');
+  dl.id = 'branches';
+  for (const b of branchesCache)
+    dl.insertAdjacentHTML('beforeend', `<option value="${esc(b.name)}">${esc(b.date.slice(0,16))}</option>`);
+  document.body.appendChild(dl);
+}
+
+function semaforo(s) { return s === 'ok' ? '🟢' : (s === 'error' ? '🔴' : '⚪'); }
+
+async function refreshStatus(env, row) {
+  const cellOnline = row.querySelector('.online'), cellInfo = row.querySelector('.info');
+  cellOnline.textContent = '…';
+  try {
+    const st = await fetchJson('/api/status?env=' + encodeURIComponent(env.name));
+    cellOnline.innerHTML = `<span class="sem" title="${esc(st.error || ('HTTP ' + st.httpStatus))}">${semaforo(st.online)}</span>`;
+    const di = st.deployInfo;
+    cellInfo.innerHTML = di
+      ? `<code>${esc(di.branch)}</code>@<code>${esc(di.commit)}</code><div class="muted">${esc((di.publishDate||'').slice(0,16))} · ${esc(di.publishedBy||'')}</div>`
+      : `<span class="muted">${env.siteUrl ? 'sin deploy-info.json (versión anterior a fase 1)' : 'configura siteUrl en environments.json'}</span>`;
+  } catch (e) { cellOnline.textContent = '⚠'; cellInfo.innerHTML = `<span class="muted">${esc(e.message)}</span>`; }
+}
+
+async function doPublish(env, row, btn) {
+  const branch = row.querySelector('input.branch').value.trim();
+  if (!branch) { alert('Elige una rama'); return; }
+  if (!confirm(`Publicar la rama\n\n  ${branch}\n\nal entorno ${env.name}?`)) return;
+  btn.disabled = true; btn.classList.add('busy'); btn.textContent = 'Publicando…';
+  log.style.display = 'block'; log.textContent = `[${env.name}] Publish ${branch} lanzado…`;
+  try {
+    const r = await fetchJson('/api/publish', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ env: env.name, branch }) });
+    log.textContent = `[${env.name}] OK\n` + (r.output || '');
+  } catch (e) { log.textContent = `[${env.name}] ERROR\n` + e.message; }
+  btn.disabled = false; btn.classList.remove('busy'); btn.textContent = 'Publish';
+  refreshStatus(env, row);
+}
+
+async function refreshAll() {
+  const envs = await fetchJson('/api/environments');
+  tbody.innerHTML = '';
+  for (const env of envs) {
+    const row = document.createElement('tr');
+    row.innerHTML = `
+      <td><b>${esc(env.name)}</b><div class="muted">${esc(env.destination)}</div></td>
+      <td>${esc(env.serverName) || '<span class="muted">—</span>'}</td>
+      <td><input class="branch" list="branches" placeholder="buscar rama…"></td>
+      <td><button class="pub" ${env.localOrigin ? '' : 'disabled title="origin no local: Fase 3"'}>Publish</button></td>
+      <td class="online">…</td>
+      <td class="info">…</td>`;
+    tbody.appendChild(row);
+    row.querySelector('button.pub').onclick = ev => doPublish(env, row, ev.target);
+    refreshStatus(env, row);
+  }
+}
+
+loadBranches().then(refreshAll);
+setInterval(refreshAll, 60000);
+</script>
+</body>
+</html>
