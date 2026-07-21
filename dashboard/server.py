@@ -50,52 +50,21 @@ def http_get(url):
     return urllib.request.urlopen(req, timeout=PROBE_TIMEOUT, context=_ssl_ctx)
 
 
-def read_local_deploy_info(destination):
-    """Lee deploy-info.json del propio directorio publicado (fuente autoritativa
-    para entornos con destino local, sin depender de ninguna URL)."""
-    if not destination:
-        return None
-    p = Path(destination) / "deploy-info.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8-sig"))
-        except Exception:
-            return None
-    return None
-
-
 def probe(env):
-    """Estado de un entorno: deploy-info.json (qué hay desplegado) + semáforo online.
-
-    Para destinos locales el deploy-info se lee del disco (autoritativo); si no,
-    se intenta por HTTP contra siteUrl. El semáforo online siempre es por HTTP.
-    """
+    """Estado de un entorno vía HTTP contra su siteUrl: deploy-info.json (qué hay
+    desplegado y servido) + semáforo online. Mismo mecanismo para todos los
+    entornos (local o remoto): lo autoritativo es lo que el site sirve."""
     site_url = env.get("siteUrl", "")
-    destination = env.get("destination", "")
-    result = {"online": "off", "deployInfo": None, "httpStatus": None, "error": None, "source": None}
-
-    # 1) deploy-info: primero el disco (si el destino es una ruta local accesible)
-    if destination and Path(destination).exists():
-        di = read_local_deploy_info(destination)
-        if di:
-            result["deployInfo"] = di
-            result["source"] = "disk"
-
+    result = {"online": "off", "deployInfo": None, "httpStatus": None, "error": None}
     if not site_url:
-        if result["deployInfo"] is None:
-            result["error"] = "sin siteUrl ni destino local legible"
+        result["error"] = "sin siteUrl configurada"
         return result
-
     base = site_url.rstrip("/")
-    # 2) fallback HTTP para el deploy-info si no lo tenemos del disco
-    if result["deployInfo"] is None:
-        try:
-            with http_get(base + "/deploy-info.json") as r:
-                result["deployInfo"] = json.loads(r.read().decode("utf-8-sig"))
-                result["source"] = "http"
-        except Exception:
-            pass  # sello aún no publicado en ese site: no es un error del site
-    # 3) semáforo online (siempre HTTP)
+    try:
+        with http_get(base + "/deploy-info.json") as r:
+            result["deployInfo"] = json.loads(r.read().decode("utf-8-sig"))
+    except Exception:
+        pass  # sello aún no publicado en ese site: no es un error del site
     try:
         with http_get(base + "/") as r:
             result["httpStatus"] = r.status
