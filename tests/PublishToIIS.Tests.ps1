@@ -67,6 +67,30 @@ Describe 'New-DeployInfo' {
     }
 }
 
+Describe 'Invoke-DeployOrder (dry-run)' {
+    It 'resuelve el plan sin efectos para un entorno válido' {
+        $plan = Invoke-DeployOrder -Environment 'devecoand2' -Branch 'main_deploy-20260720a' -WarningAction SilentlyContinue
+        $plan.mode | Should -Be 'DRY-RUN'
+        $plan.environment | Should -Be 'devecoand2'
+        $plan.branch | Should -Be 'main_deploy-20260720a'
+        # repo = carpeta padre del origin (…\CentralCompres → raíz del repo)
+        $plan.repo | Should -Not -Match 'CentralCompres$'
+        $plan.destination | Should -Not -BeNullOrEmpty
+    }
+
+    It 'rechaza un entorno fuera de la lista blanca' {
+        { Invoke-DeployOrder -Environment 'devecoand2' -AllowedEnvironments @('devecoesp1') } | Should -Throw '*no permitido*'
+    }
+
+    It 'excluye prod de la lista blanca por defecto' {
+        { Invoke-DeployOrder -Environment 'prod' } | Should -Throw '*no permitido*'
+    }
+
+    It 'rechaza ramas con formato inválido (inyección)' {
+        { Invoke-DeployOrder -Environment 'devecoand2' -Branch 'main; rm -rf /' } | Should -Throw '*formato inválido*'
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

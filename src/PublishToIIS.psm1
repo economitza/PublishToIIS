@@ -336,6 +336,95 @@ function Publish {
     }
 }
 
+function Invoke-DeployOrder {
+    <#
+    .SYNOPSIS
+        Ejecuta una "orden de despliegue": valida entorno/rama, hace checkout y publica.
+
+    .DESCRIPTION
+        Cuerpo compartido por el job de deploy de GitLab CI (Fase 3 del dashboard) y
+        el ensayo local, para que ambos ejecuten EXACTAMENTE el mismo código.
+
+        Por defecto es DRY-RUN: valida el entorno contra una lista blanca, valida el
+        formato de la rama y resuelve el plan (repo, destino, argumentos de Publish)
+        SIN tocar el repo ni publicar. Con -Execute hace fetch/checkout/pull de la
+        rama en la copia de trabajo del entorno y llama a Publish (requiere admin).
+
+        Seguridad: prod/staging quedan fuera de la lista blanca por defecto; hay que
+        pasarlos explícitamente en -AllowedEnvironments para poder desplegarlos.
+
+    .OUTPUTS
+        PSCustomObject con el plan resuelto.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$Branch = 'main',
+        [string[]]$AllowedEnvironments,
+        [switch]$OverrideWebconfig,
+        [string]$Configuration,
+        [switch]$Execute
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    if (-not (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue)) {
+        $maybeCfg = Join-Path $PSScriptRoot '..\config\config.ps1'
+        if (Test-Path $maybeCfg) { . $maybeCfg }
+    }
+
+    # Lista blanca por defecto: entornos de config salvo prod/staging.
+    if (-not $AllowedEnvironments) {
+        $cfgFile = Join-Path $PSScriptRoot '..\config\environments.json'
+        $names = (Get-Content $cfgFile -Raw | ConvertFrom-Json).environments.PSObject.Properties.Name
+        $AllowedEnvironments = @($names | Where-Object { $_ -notin @('prod', 'staging') })
+    }
+
+    if ($Environment -notin $AllowedEnvironments) {
+        throw "Entorno no permitido: '$Environment'. Permitidos: $($AllowedEnvironments -join ', ')"
+    }
+    if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
+        throw "Rama con formato inválido: '$Branch'"
+    }
+
+    $cfg = Get-PublishConfig -Environment $Environment
+    $repo = Split-Path ($cfg.origin.TrimEnd('\', '/')) -Parent
+
+    $pubArgs = @{ Environment = $Environment }
+    if ($OverrideWebconfig) { $pubArgs.OverrideWebconfig = $true }
+    if ($Configuration) { $pubArgs.Configuration = $Configuration }
+
+    $plan = [pscustomobject]@{
+        environment       = $Environment
+        branch            = $Branch
+        repo              = $repo
+        origin            = $cfg.origin
+        destination       = $cfg.destination
+        overrideWebconfig = [bool]$OverrideWebconfig
+        configuration     = if ($Configuration) { $Configuration } else { 'Release (default)' }
+        mode              = if ($Execute) { 'EXECUTE' } else { 'DRY-RUN' }
+    }
+
+    Write-Host "== Plan de despliegue ==" -ForegroundColor Cyan
+    ($plan | Format-List | Out-String).Trim() | Write-Host
+
+    if (-not $Execute) {
+        Write-Host "DRY-RUN: no se toca el repo ni se publica. Repite con -Execute para ejecutar." -ForegroundColor Yellow
+        return $plan
+    }
+
+    Write-Host "Checkout de '$Branch' en $repo..." -ForegroundColor Yellow
+    & git -C $repo fetch --prune
+    if ($LASTEXITCODE) { throw "git fetch falló (código $LASTEXITCODE)." }
+    & git -C $repo checkout $Branch
+    if ($LASTEXITCODE) { throw "git checkout falló (código $LASTEXITCODE)." }
+    & git -C $repo pull --ff-only
+    if ($LASTEXITCODE) { throw "git pull falló (código $LASTEXITCODE)." }
+
+    Publish @pubArgs
+    return $plan
+}
+
 function Update-PublishToIIS {
     <#
     .SYNOPSIS
@@ -401,4 +490,4 @@ function Update-PublishToIIS {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder -Alias Publish-Update
