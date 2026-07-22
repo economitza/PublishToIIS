@@ -148,6 +148,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path in ("/", "/index.html"):
             self._send(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
+        elif url.path == "/favicon.svg":
+            self._send(200, (ROOT / "favicon.svg").read_bytes(), "image/svg+xml")
         elif url.path == "/api/environments":
             self._send(200, load_environments())
         elif url.path == "/api/status":
