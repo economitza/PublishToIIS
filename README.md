@@ -29,9 +29,19 @@ Uso rápido:
   entorno, quién publica) en la raíz del site — consultable en `GET /deploy-info.json`.
   También invocable a mano: `New-DeployInfo -ProjectPath <workingCopy> -OutputDir <dir> -Environment <env>`
 
+- Publish local sin UAC (tarea 'Publish Local'): registrar una vez con
+  `tools\Register-PublishLocalTask.ps1` (se auto-eleva; acepta
+  `-Environment/-Branch/-Execute` para dejar ya una orden escrita). Después, cada
+  publish es: escribir `%ProgramData%\PublishToIIS\publish-order.json`
+  (`{"environment":"...","branch":"...","execute":true}`) y
+  `schtasks /run /tn "Publish Local"`. Log en `publish-order.log`; la orden se
+  consume (se renombra a `.consumed`) para que un /run accidental no re-publique.
+  Sin `execute:true` la orden es dry-run.
+
 Estructura relevante:
 
 - `src/` : implementación del módulo
+- `tools/` : runner y registrador de la tarea elevada 'Publish Local'
 - `config/environments.json` : fichero central con `origin` y `destination` por entorno
 - `config/config.ps1` : loader `Get-PublishConfig`
 - `tests/` : pruebas Pester
