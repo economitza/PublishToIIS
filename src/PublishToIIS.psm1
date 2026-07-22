@@ -436,6 +436,42 @@ function Invoke-DeployOrder {
     return $plan
 }
 
+function Read-PublishOrder {
+    <#
+    .SYNOPSIS
+        Lee y valida un fichero de orden de publicación (publish-order.json).
+
+    .DESCRIPTION
+        Formato de la orden: JSON con `environment` y `branch` obligatorios y
+        opcionalmente `execute` (por defecto false = dry-run) y `overrideWebconfig`.
+        La orden la escribe un proceso sin privilegios y la consume la tarea
+        elevada 'Publish Local' (tools\Run-PublishOrder.ps1); esta función hace la
+        validación de formato y la lista blanca de entornos / revalidación de la
+        rama las aplica después Invoke-DeployOrder (defensa en profundidad).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        throw "No hay orden de publicación en '$Path'."
+    }
+    $raw = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $raw.environment) { throw "La orden no indica 'environment'." }
+    if (-not $raw.branch) { throw "La orden no indica 'branch'." }
+    if ($raw.branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
+        throw "Rama con formato inválido en la orden: '$($raw.branch)'"
+    }
+
+    [pscustomobject]@{
+        environment       = [string]$raw.environment
+        branch            = [string]$raw.branch
+        execute           = [bool]$raw.execute
+        overrideWebconfig = [bool]$raw.overrideWebconfig
+    }
+}
+
 function Update-PublishToIIS {
     <#
     .SYNOPSIS
@@ -501,4 +537,4 @@ function Update-PublishToIIS {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder -Alias Publish-Update

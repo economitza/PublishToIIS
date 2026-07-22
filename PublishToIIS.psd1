@@ -6,7 +6,7 @@
     CompanyName = 'Economitza'
     Copyright = '(c) 2026 Economitza'
     Description = 'PublishToIIS - helper module to publish .NET projects to IIS with safe swap'
-    FunctionsToExport = @('Publish','Get-MSBuild','Get-PublishConfig','Update-PublishToIIS','Protect-ProductionWebConfig','New-DeployInfo','Invoke-DeployOrder')
+    FunctionsToExport = @('Publish','Get-MSBuild','Get-PublishConfig','Update-PublishToIIS','Protect-ProductionWebConfig','New-DeployInfo','Invoke-DeployOrder','Read-PublishOrder')
     CmdletsToExport = @()
     VariablesToExport = @()
     AliasesToExport = @('Publish-Update')

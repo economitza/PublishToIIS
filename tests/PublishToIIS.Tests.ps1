@@ -91,6 +91,47 @@ Describe 'Invoke-DeployOrder (dry-run)' {
     }
 }
 
+Describe 'Read-PublishOrder' {
+    BeforeEach {
+        $script:orderPath = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_order_" + [Guid]::NewGuid() + ".json")
+    }
+
+    AfterEach {
+        Remove-Item $script:orderPath -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'lee una orden completa' {
+        '{"environment":"dev-joaquim-local","branch":"main_deploy-20260720a","execute":true,"overrideWebconfig":false}' |
+            Set-Content $script:orderPath -Encoding UTF8
+        $order = Read-PublishOrder -Path $script:orderPath
+        $order.environment | Should -Be 'dev-joaquim-local'
+        $order.branch | Should -Be 'main_deploy-20260720a'
+        $order.execute | Should -BeTrue
+        $order.overrideWebconfig | Should -BeFalse
+    }
+
+    It 'execute es false (dry-run) si la orden no lo indica' {
+        '{"environment":"dev-joaquim-local","branch":"main"}' | Set-Content $script:orderPath -Encoding UTF8
+        (Read-PublishOrder -Path $script:orderPath).execute | Should -BeFalse
+    }
+
+    It 'rechaza órdenes sin environment o sin branch' {
+        '{"branch":"main"}' | Set-Content $script:orderPath -Encoding UTF8
+        { Read-PublishOrder -Path $script:orderPath } | Should -Throw "*environment*"
+        '{"environment":"dev-joaquim-local"}' | Set-Content $script:orderPath -Encoding UTF8
+        { Read-PublishOrder -Path $script:orderPath } | Should -Throw "*branch*"
+    }
+
+    It 'rechaza ramas con formato inválido (inyección)' {
+        '{"environment":"dev-joaquim-local","branch":"main; rm -rf /"}' | Set-Content $script:orderPath -Encoding UTF8
+        { Read-PublishOrder -Path $script:orderPath } | Should -Throw '*formato inválido*'
+    }
+
+    It 'falla con mensaje claro si no hay orden' {
+        { Read-PublishOrder -Path $script:orderPath } | Should -Throw '*No hay orden*'
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())
