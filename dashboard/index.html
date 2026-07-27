@@ -42,8 +42,9 @@
   <button id="refreshJira" onclick="refreshJiraEnvs(true)">⟳ refrescar</button>
 </h1>
 <table id="tblJira">
-  <thead><tr><th>Entorno</th><th>Jira asociado</th><th>Fecha despliegue</th></tr></thead>
-  <tbody><tr><td colspan="3" class="muted">cargando…</td></tr></tbody>
+  <thead><tr><th>Entorno</th><th>Jira</th><th>Título</th><th>Estado</th>
+    <th>Asignado</th><th>Abierto por</th><th>Fecha despliegue</th></tr></thead>
+  <tbody><tr><td colspan="7" class="muted">cargando…</td></tr></tbody>
 </table>
 <div class="muted" style="margin-top:.6rem">
   <span id="jiraMeta"></span>Último comentario de Jira con link por entorno (host con
@@ -130,12 +131,16 @@ async function refreshJiraEnvs(force = false) {
   if (force) tb.innerHTML = '<tr><td colspan="3" class="muted">actualizando desde Jira…</td></tr>';
   try {
     const r = await fetchJson('/api/test-envs' + (force ? '?refresh=1' : ''));
-    if (r.error) { tb.innerHTML = `<tr><td colspan="3" class="muted">⚠ ${esc(r.error)}</td></tr>`; return; }
-    tb.innerHTML = r.envs.length ? '' : '<tr><td colspan="3" class="muted">sin menciones de entornos</td></tr>';
+    if (r.error) { tb.innerHTML = `<tr><td colspan="7" class="muted">⚠ ${esc(r.error)}</td></tr>`; return; }
+    tb.innerHTML = r.envs.length ? '' : '<tr><td colspan="7" class="muted">sin menciones de entornos</td></tr>';
     for (const e of r.envs) {
       tb.insertAdjacentHTML('beforeend', `<tr>
         <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
         <td><a href="${esc(r.jiraBase)}/browse/${esc(e.jira)}" target="_blank">${esc(e.jira)}</a></td>
+        <td>${esc(e.titulo || '')}</td>
+        <td>${esc(e.estado || '—')}</td>
+        <td>${esc(e.asignado || '—')}</td>
+        <td>${esc(e.reporter || '—')}</td>
         <td>${esc(e.fecha)}</td></tr>`);
     }
     document.getElementById('jiraMeta').innerHTML =
