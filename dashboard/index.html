@@ -37,6 +37,19 @@
   Publish disponible solo para entornos con origin local (el resto, Fase 3).
   El Publish local necesita el dashboard <b>elevado</b>: arráncalo con <code>dashboard-admin.cmd</code>.
 </div>
+
+<h1 style="margin-top:2rem">Entornos de test según Jira
+  <button id="refreshJira" onclick="refreshJiraEnvs(true)">⟳ refrescar</button>
+</h1>
+<table id="tblJira">
+  <thead><tr><th>Entorno</th><th>Jira asociado</th><th>Fecha despliegue</th></tr></thead>
+  <tbody><tr><td colspan="3" class="muted">cargando…</td></tr></tbody>
+</table>
+<div class="muted" style="margin-top:.6rem">
+  <span id="jiraMeta"></span>Último comentario de Jira con link por entorno (host con
+  <code>test</code>/<code>dev</code>), en cronológico inverso: la mención más reciente fija la
+  entrada. Sin <code>deploy-info.json</code> es inferencia — un deploy sin comentario no se ve.
+</div>
 <div id="log"></div>
 
 <script>
@@ -110,8 +123,32 @@ async function refreshAll() {
   }
 }
 
+async function refreshJiraEnvs(force = false) {
+  const tb = document.querySelector('#tblJira tbody');
+  const btn = document.getElementById('refreshJira');
+  btn.disabled = true;
+  if (force) tb.innerHTML = '<tr><td colspan="3" class="muted">actualizando desde Jira…</td></tr>';
+  try {
+    const r = await fetchJson('/api/test-envs' + (force ? '?refresh=1' : ''));
+    if (r.error) { tb.innerHTML = `<tr><td colspan="3" class="muted">⚠ ${esc(r.error)}</td></tr>`; return; }
+    tb.innerHTML = r.envs.length ? '' : '<tr><td colspan="3" class="muted">sin menciones de entornos</td></tr>';
+    for (const e of r.envs) {
+      tb.insertAdjacentHTML('beforeend', `<tr>
+        <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
+        <td><a href="${esc(r.jiraBase)}/browse/${esc(e.jira)}" target="_blank">${esc(e.jira)}</a></td>
+        <td>${esc(e.fecha)}</td></tr>`);
+    }
+    document.getElementById('jiraMeta').innerHTML =
+      `<span title="ventana de ${esc(r.windowDays)} días">Generado ${esc(r.generatedAt)} · </span>`;
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="3" class="muted">⚠ ${esc(e.message)}</td></tr>`;
+  } finally { btn.disabled = false; }
+}
+
 loadBranches().then(refreshAll);
+refreshJiraEnvs();
 setInterval(refreshAll, 60000);
+setInterval(refreshJiraEnvs, 600000);
 </script>
 </body>
 </html>
