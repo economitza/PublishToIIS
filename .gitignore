@@ -7,3 +7,6 @@ obj/
 _ReSharper*/
 *.cache
 *.log
+
+__pycache__/
+*.pyc
