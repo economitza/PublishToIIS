@@ -21,6 +21,9 @@
   code { background: #eef; padding: 0 .3rem; border-radius: 3px; }
   #log { white-space: pre-wrap; background: #1e1e1e; color: #d7d7d7; padding: .8rem; margin-top: 1rem;
          font-family: Consolas, monospace; font-size: .8rem; max-height: 260px; overflow: auto; display: none; }
+  tr.fr th { background: #3d5165; padding: .3rem .5rem; }
+  tr.fr input { width: 100%; box-sizing: border-box; padding: .25rem .4rem; border: 0;
+                border-radius: 3px; font-size: .8rem; }
 </style>
 </head>
 <body>
@@ -42,8 +45,19 @@
   <button id="refreshJira" onclick="refreshJiraEnvs(true)">⟳ refrescar</button>
 </h1>
 <table id="tblJira">
-  <thead><tr><th>Entorno</th><th>Jira</th><th>Título</th><th>Estado</th>
-    <th>Asignado</th><th>Abierto por</th><th>Fecha despliegue</th></tr></thead>
+  <thead>
+    <tr><th>Entorno</th><th>Jira</th><th>Título</th><th>Estado</th>
+      <th>Asignado</th><th>Abierto por</th><th>Fecha despliegue</th></tr>
+    <tr class="fr">
+      <th><input data-f="env" placeholder="filtrar…"></th>
+      <th><input data-f="jira" placeholder="filtrar…"></th>
+      <th><input data-f="titulo" placeholder="filtrar…"></th>
+      <th><input data-f="estado" placeholder="filtrar…"></th>
+      <th><input data-f="asignado" placeholder="filtrar…"></th>
+      <th><input data-f="reporter" placeholder="filtrar…"></th>
+      <th><input data-f="fecha" placeholder="filtrar…"></th>
+    </tr>
+  </thead>
   <tbody><tr><td colspan="7" class="muted">cargando…</td></tr></tbody>
 </table>
 <div class="muted" style="margin-top:.6rem">
@@ -124,29 +138,48 @@ async function refreshAll() {
   }
 }
 
+let jiraEnvsData = null;
+
+// Filtro por columna: cada input de la fila .fr filtra su campo (substring,
+// sin mayúsculas); solo se repinta el tbody, así los inputs no pierden el foco.
+function renderJiraRows() {
+  const tb = document.querySelector('#tblJira tbody');
+  if (!jiraEnvsData) return;
+  const r = jiraEnvsData;
+  const filters = [...document.querySelectorAll('#tblJira tr.fr input')]
+    .map(i => [i.dataset.f, i.value.trim().toLowerCase()])
+    .filter(([, v]) => v);
+  const rows = r.envs.filter(e =>
+    filters.every(([f, v]) => String(e[f] ?? '').toLowerCase().includes(v)));
+  tb.innerHTML = rows.length ? '' : '<tr><td colspan="7" class="muted">sin entornos que mostrar</td></tr>';
+  for (const e of rows) {
+    tb.insertAdjacentHTML('beforeend', `<tr>
+      <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
+      <td><a href="${esc(r.jiraBase)}/browse/${esc(e.jira)}" target="_blank">${esc(e.jira)}</a></td>
+      <td>${esc(e.titulo || '')}</td>
+      <td>${esc(e.estado || '—')}</td>
+      <td>${esc(e.asignado || '—')}</td>
+      <td>${esc(e.reporter || '—')}</td>
+      <td>${esc(e.fecha)}</td></tr>`);
+  }
+}
+
+for (const i of document.querySelectorAll('#tblJira tr.fr input')) i.oninput = renderJiraRows;
+
 async function refreshJiraEnvs(force = false) {
   const tb = document.querySelector('#tblJira tbody');
   const btn = document.getElementById('refreshJira');
   btn.disabled = true;
-  if (force) tb.innerHTML = '<tr><td colspan="3" class="muted">actualizando desde Jira…</td></tr>';
+  if (force) tb.innerHTML = '<tr><td colspan="7" class="muted">actualizando desde Jira…</td></tr>';
   try {
     const r = await fetchJson('/api/test-envs' + (force ? '?refresh=1' : ''));
     if (r.error) { tb.innerHTML = `<tr><td colspan="7" class="muted">⚠ ${esc(r.error)}</td></tr>`; return; }
-    tb.innerHTML = r.envs.length ? '' : '<tr><td colspan="7" class="muted">sin menciones de entornos</td></tr>';
-    for (const e of r.envs) {
-      tb.insertAdjacentHTML('beforeend', `<tr>
-        <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
-        <td><a href="${esc(r.jiraBase)}/browse/${esc(e.jira)}" target="_blank">${esc(e.jira)}</a></td>
-        <td>${esc(e.titulo || '')}</td>
-        <td>${esc(e.estado || '—')}</td>
-        <td>${esc(e.asignado || '—')}</td>
-        <td>${esc(e.reporter || '—')}</td>
-        <td>${esc(e.fecha)}</td></tr>`);
-    }
+    jiraEnvsData = r;
+    renderJiraRows();
     document.getElementById('jiraMeta').innerHTML =
       `<span title="ventana de ${esc(r.windowDays)} días">Generado ${esc(r.generatedAt)} · </span>`;
   } catch (e) {
-    tb.innerHTML = `<tr><td colspan="3" class="muted">⚠ ${esc(e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="muted">⚠ ${esc(e.message)}</td></tr>`;
   } finally { btn.disabled = false; }
 }
 
