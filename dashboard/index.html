@@ -189,7 +189,7 @@ function renderJiraRows() {
       : '<span class="muted">—</span>';
     tb.insertAdjacentHTML('beforeend', `<tr>
       <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
-      <td><span class="sem" title="${esc(e.online ? 'HTTP ' + (e.httpStatus ?? '—') : 'aún sin sondar')}">${e.online ? semaforo(e.online) : '·'}</span></td>
+      <td><span class="sem" title="${esc(e.online ? 'HTTP ' + (e.httpStatus ?? '—') + (e.onlinePath && e.onlinePath !== '/' ? ' en ' + e.onlinePath : '') : 'aún sin sondar')}">${e.online ? semaforo(e.online) : '·'}</span></td>
       <td><a href="${esc(r.jiraBase)}/browse/${esc(e.jira)}" target="_blank">${esc(e.jira)}</a></td>
       <td>${esc(e.titulo || '')}</td>
       <td>${esc(e.estado || '—')}</td>
