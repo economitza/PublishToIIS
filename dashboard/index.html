@@ -46,24 +46,29 @@
 </h1>
 <table id="tblJira">
   <thead>
-    <tr><th>Entorno</th><th>Jira</th><th>Título</th><th>Estado</th>
-      <th>Asignado</th><th>Abierto por</th><th>Fecha despliegue</th></tr>
+    <tr><th>Entorno</th><th>Online</th><th>Jira</th><th>Título</th><th>Estado</th>
+      <th>Asignado</th><th>Abierto por</th><th>Fecha despliegue</th><th>Sirviendo</th></tr>
     <tr class="fr">
       <th><input data-f="env" placeholder="filtrar…"></th>
+      <th><input data-f="onlineTxt" placeholder="filtrar…"></th>
       <th><input data-f="jira" placeholder="filtrar…"></th>
       <th><input data-f="titulo" placeholder="filtrar…"></th>
       <th><input data-f="estado" placeholder="filtrar…"></th>
       <th><input data-f="asignado" placeholder="filtrar…"></th>
       <th><input data-f="reporter" placeholder="filtrar…"></th>
       <th><input data-f="fecha" placeholder="filtrar…"></th>
+      <th><input data-f="sirviendoTxt" placeholder="filtrar…"></th>
     </tr>
   </thead>
-  <tbody><tr><td colspan="7" class="muted">cargando…</td></tr></tbody>
+  <tbody><tr><td colspan="9" class="muted">cargando…</td></tr></tbody>
 </table>
 <div class="muted" style="margin-top:.6rem">
   <span id="jiraMeta"></span>Último comentario de Jira con link por entorno (host con
   <code>test</code>/<code>dev</code>), en cronológico inverso: la mención más reciente fija la
-  entrada. Sin <code>deploy-info.json</code> es inferencia — un deploy sin comentario no se ve.
+  entrada. La columna Jira sin <code>deploy-info.json</code> es inferencia — un deploy sin
+  comentario no se ve. Online y Sirviendo salen de sondar el entorno por HTTP
+  (Sirviendo solo si el site sella <code>deploy-info.json</code>; los de RC no lo hacen).
+  Los filtros aceptan texto libre y ofrecen desplegable con los valores presentes.
 </div>
 <div id="log"></div>
 
@@ -140,6 +145,31 @@ async function refreshAll() {
 
 let jiraEnvsData = null;
 
+const ONLINE_TXT = { ok: '🟢 ok', error: '🔴 error', off: '⚪ off' };
+
+// Campos derivados para pintar y filtrar Online/Sirviendo como texto plano.
+function decorateJiraEnvs(envs) {
+  for (const e of envs) {
+    e.onlineTxt = ONLINE_TXT[e.online] || '';
+    e.sirviendoTxt = e.sirviendo ? `${e.sirviendo.branch}@${e.sirviendo.commit}` : '';
+  }
+}
+
+// Desplegables de los filtros: un datalist por columna con los valores
+// presentes en los datos (el input sigue aceptando texto libre).
+function buildJiraFilterOptions(envs) {
+  for (const inp of document.querySelectorAll('#tblJira tr.fr input')) {
+    const f = inp.dataset.f, id = 'fl-' + f;
+    const values = [...new Set(envs.map(e => String(e[f] ?? '')).filter(Boolean))].sort();
+    document.getElementById(id)?.remove();
+    const dl = document.createElement('datalist');
+    dl.id = id;
+    for (const v of values) dl.insertAdjacentHTML('beforeend', `<option value="${esc(v)}">`);
+    document.body.appendChild(dl);
+    inp.setAttribute('list', id);
+  }
+}
+
 // Filtro por columna: cada input de la fila .fr filtra su campo (substring,
 // sin mayúsculas); solo se repinta el tbody, así los inputs no pierden el foco.
 function renderJiraRows() {
@@ -151,16 +181,22 @@ function renderJiraRows() {
     .filter(([, v]) => v);
   const rows = r.envs.filter(e =>
     filters.every(([f, v]) => String(e[f] ?? '').toLowerCase().includes(v)));
-  tb.innerHTML = rows.length ? '' : '<tr><td colspan="7" class="muted">sin entornos que mostrar</td></tr>';
+  tb.innerHTML = rows.length ? '' : '<tr><td colspan="9" class="muted">sin entornos que mostrar</td></tr>';
   for (const e of rows) {
+    const sirviendo = e.sirviendo
+      ? `<code>${esc(e.sirviendo.branch)}</code>@<code>${esc(e.sirviendo.commit)}</code>
+         <div class="muted">${esc((e.sirviendo.publishDate || '').slice(0, 16))} · ${esc(e.sirviendo.publishedBy || '')}</div>`
+      : '<span class="muted">—</span>';
     tb.insertAdjacentHTML('beforeend', `<tr>
       <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
+      <td><span class="sem" title="${esc(e.online ? 'HTTP ' + (e.httpStatus ?? '—') : 'aún sin sondar')}">${e.online ? semaforo(e.online) : '·'}</span></td>
       <td><a href="${esc(r.jiraBase)}/browse/${esc(e.jira)}" target="_blank">${esc(e.jira)}</a></td>
       <td>${esc(e.titulo || '')}</td>
       <td>${esc(e.estado || '—')}</td>
       <td>${esc(e.asignado || '—')}</td>
       <td>${esc(e.reporter || '—')}</td>
-      <td>${esc(e.fecha)}</td></tr>`);
+      <td>${esc(e.fecha)}</td>
+      <td>${sirviendo}</td></tr>`);
   }
 }
 
@@ -170,16 +206,19 @@ async function refreshJiraEnvs(force = false) {
   const tb = document.querySelector('#tblJira tbody');
   const btn = document.getElementById('refreshJira');
   btn.disabled = true;
-  if (force) tb.innerHTML = '<tr><td colspan="7" class="muted">actualizando desde Jira…</td></tr>';
+  if (force) tb.innerHTML = '<tr><td colspan="9" class="muted">actualizando desde Jira…</td></tr>';
   try {
     const r = await fetchJson('/api/test-envs' + (force ? '?refresh=1' : ''));
-    if (r.error) { tb.innerHTML = `<tr><td colspan="7" class="muted">⚠ ${esc(r.error)}</td></tr>`; return; }
+    if (r.error) { tb.innerHTML = `<tr><td colspan="9" class="muted">⚠ ${esc(r.error)}</td></tr>`; return; }
+    decorateJiraEnvs(r.envs);
     jiraEnvsData = r;
+    buildJiraFilterOptions(r.envs);
     renderJiraRows();
     document.getElementById('jiraMeta').innerHTML =
-      `<span title="ventana de ${esc(r.windowDays)} días">Generado ${esc(r.generatedAt)} · </span>`;
+      `<span title="ventana de ${esc(r.windowDays)} días">Generado ${esc(r.generatedAt)}` +
+      (r.probedAt ? ` · sonda ${esc(r.probedAt)}` : '') + ' · </span>';
   } catch (e) {
-    tb.innerHTML = `<tr><td colspan="7" class="muted">⚠ ${esc(e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="9" class="muted">⚠ ${esc(e.message)}</td></tr>`;
   } finally { btn.disabled = false; }
 }
 
