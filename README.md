@@ -29,14 +29,41 @@ Uso rápido:
   entorno, quién publica) en la raíz del site — consultable en `GET /deploy-info.json`.
   También invocable a mano: `New-DeployInfo -ProjectPath <workingCopy> -OutputDir <dir> -Environment <env>`
 
-- Publish local sin UAC (tarea 'Publish Local'): registrar una vez con
-  `tools\Register-PublishLocalTask.ps1` (se auto-eleva; acepta
-  `-Environment/-Branch/-Execute` para dejar ya una orden escrita). Después, cada
-  publish es: escribir `%ProgramData%\PublishToIIS\publish-order.json`
-  (`{"environment":"...","branch":"...","execute":true}`) y
-  `schtasks /run /tn "Publish Local"`. Log en `publish-order.log`; la orden se
-  consume (se renombra a `.consumed`) para que un /run accidental no re-publique.
-  Sin `execute:true` la orden es dry-run.
+- Publish sin privilegios (tarea 'Publish Local'). El único paso que necesita
+  elevación es registrar la tarea, UNA vez por máquina:
+
+      tools\Register-PublishLocalTask.ps1              # equipo de desarrollo
+      tools\Register-PublishLocalTask.ps1 -Unattended  # servidor
+
+  `-Unattended` registra la tarea con LogonType **S4U**: se ejecuta aunque nadie
+  tenga sesión iniciada (imprescindible si la llamada llega de fuera) y sin
+  guardar contraseña. Sin él, la tarea solo corre con la sesión del usuario
+  abierta, que es lo que interesa en un portátil.
+
+  A partir de ahí, cada publicación se pide desde una consola **normal**:
+
+      Request-Publish -Environment devecoand1 -Branch main_deploy-20260730 -Execute
+
+  `Request-Publish` es exactamente la llamada que hará el job de CI o el
+  dashboard: escribe la orden, dispara la tarea y espera el resultado. Todo el
+  trabajo con privilegios (checkout, MSBuild, parada del app pool y swap) lo hace
+  la tarea. Opciones: `-NoWait` (dispara y vuelve), `-TimeoutSeconds`,
+  `-OverrideWebconfig`, `-TaskName`.
+
+  Piezas sueltas, por si se quiere disparar a mano o desde otro lenguaje:
+  `Write-PublishOrder` deja `%ProgramData%\PublishToIIS\publish-order.json`
+  (`{"environment":"...","branch":"...","execute":true}`), `schtasks /run /tn
+  "Publish Local"` la dispara y `Wait-PublishResult` espera el desenlace. La
+  tarea deja `publish-order.log` (transcript) y `publish-order.result.json`
+  (`status` ok/error, mensaje, tiempos); la orden se consume (se renombra a
+  `.consumed`) para que un /run accidental no re-publique. Sin `execute:true` la
+  orden es dry-run.
+
+  *Gotcha:* el `result.json` lo escribe la tarea **elevada** y, con la ACL por
+  defecto de `%ProgramData%`, quien la dispara sin privilegios no puede borrarlo
+  — se comía el resultado de la ejecución anterior. Por eso cada orden lleva un
+  `runId` que la tarea devuelve en el resultado y `Wait-PublishResult` exige que
+  coincida (`-RunId`). El registro además da permiso de Modify sobre la carpeta.
 
 Estructura relevante:
 

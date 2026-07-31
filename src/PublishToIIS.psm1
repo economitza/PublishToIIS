@@ -373,12 +373,7 @@ function Invoke-DeployOrder {
         if (Test-Path $maybeCfg) { . $maybeCfg }
     }
 
-    # Lista blanca por defecto: entornos de config salvo prod/staging.
-    if (-not $AllowedEnvironments) {
-        $cfgFile = Join-Path $PSScriptRoot '..\config\environments.json'
-        $names = (Get-Content $cfgFile -Raw | ConvertFrom-Json).environments.PSObject.Properties.Name
-        $AllowedEnvironments = @($names | Where-Object { $_ -notin @('prod', 'staging') })
-    }
+    $AllowedEnvironments = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
 
     if ($Environment -notin $AllowedEnvironments) {
         throw "Entorno no permitido: '$Environment'. Permitidos: $($AllowedEnvironments -join ', ')"
@@ -469,7 +464,209 @@ function Read-PublishOrder {
         branch            = [string]$raw.branch
         execute           = [bool]$raw.execute
         overrideWebconfig = [bool]$raw.overrideWebconfig
+        runId             = [string]$raw.runId
     }
+}
+
+function Get-PublishDataDir {
+    # Carpeta de intercambio entre el proceso SIN privilegios (que deja la orden)
+    # y la tarea elevada 'Publish Local' (que la consume).
+    param([string]$DataDir)
+    if ($DataDir) { return $DataDir }
+    Join-Path $env:ProgramData 'PublishToIIS'
+}
+
+function Get-AllowedEnvironments {
+    # Lista blanca por defecto: entornos de config salvo prod/staging.
+    param([string[]]$AllowedEnvironments)
+    if ($AllowedEnvironments) { return $AllowedEnvironments }
+
+    $cfgFile = Join-Path $PSScriptRoot '..\config\environments.json'
+    $names = (Get-Content $cfgFile -Raw | ConvertFrom-Json).environments.PSObject.Properties.Name
+    @($names | Where-Object { $_ -notin @('prod', 'staging') })
+}
+
+function Write-PublishOrder {
+    <#
+    .SYNOPSIS
+        Deja escrita una orden de publicación (publish-order.json). NO requiere privilegios.
+
+    .DESCRIPTION
+        Es la mitad sin privilegios del flujo: valida entorno y rama con las mismas
+        reglas que Invoke-DeployOrder y escribe la orden que consumirá la tarea
+        elevada 'Publish Local'. Cada orden lleva un `runId` que la tarea devuelve
+        en el resultado, para poder distinguirlo del de la ejecución anterior.
+
+    .OUTPUTS
+        PSCustomObject con `path` (fichero de orden) y `runId`.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Branch,
+        [switch]$Execute,
+        [switch]$OverrideWebconfig,
+        [string[]]$AllowedEnvironments,
+        [string]$DataDir,
+        [string]$RunId = [Guid]::NewGuid().ToString()
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+    if ($Environment -notin $allowed) {
+        throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+    }
+    if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
+        throw "Rama con formato inválido: '$Branch'"
+    }
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    # Intento de limpiar el resultado anterior. GOTCHA: el fichero lo escribe la
+    # tarea ELEVADA y con la ACL por defecto de %ProgramData% un proceso sin
+    # privilegios no puede borrarlo (sí sobrescribirlo la tarea). Por eso esto es
+    # best-effort y la garantía de verdad es el -Since de Wait-PublishResult.
+    Remove-Item (Join-Path $dir 'publish-order.result.json') -Force -ErrorAction SilentlyContinue
+
+    $orderPath = Join-Path $dir 'publish-order.json'
+    [pscustomobject]@{
+        environment       = $Environment
+        branch            = $Branch
+        execute           = [bool]$Execute
+        overrideWebconfig = [bool]$OverrideWebconfig
+        runId             = $RunId
+        requestedBy       = "$env:USERNAME@$env:COMPUTERNAME"
+        requestedAt       = (Get-Date).ToString('o')
+    } | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
+
+    [pscustomobject]@{ path = $orderPath; runId = $RunId }
+}
+
+function Start-PublishTask {
+    # Dispara la tarea elevada. Se aísla en su propia función para poder
+    # sustituirla en los tests y para dejar un único punto de cambio si algún día
+    # el disparo llega por otra vía (runner de CI, servicio, ...).
+    param(
+        [string]$TaskName = 'Publish Local',
+        [string]$DataDir
+    )
+    $out = & schtasks /run /tn $TaskName 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ("No se pudo disparar la tarea '$TaskName' (código $LASTEXITCODE): $out. " +
+               "Regístrala una vez con tools\Register-PublishLocalTask.ps1.")
+    }
+}
+
+function Wait-PublishResult {
+    <#
+    .SYNOPSIS
+        Espera a que la tarea elevada deje el resultado de la publicación.
+
+    .DESCRIPTION
+        Con -RunId (o, en su defecto, -Since) descarta el resultado de una
+        ejecución anterior: imprescindible porque el fichero de resultado lo
+        escribe la tarea elevada y quien la dispara (sin privilegios) no siempre
+        puede borrarlo antes. El runId es determinista; el reloj no, con dos
+        llamadas seguidas.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$DataDir,
+        [string]$RunId,
+        [datetime]$Since,
+        [int]$TimeoutSeconds = 900,
+        [int]$PollSeconds = 2
+    )
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $resultPath = Join-Path $dir 'publish-order.result.json'
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $resultPath) {
+            # Pequeña espera defensiva: el fichero puede estar a medio escribir.
+            try {
+                $result = Get-Content $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $fresh = $true
+                if ($RunId) {
+                    $fresh = ($result.runId -eq $RunId)
+                }
+                elseif ($PSBoundParameters.ContainsKey('Since')) {
+                    $stamp = if ($result.finishedAt) { [datetime]$result.finishedAt }
+                             else { (Get-Item $resultPath).LastWriteTime }
+                    $fresh = $stamp -ge $Since
+                }
+                if ($fresh) { return $result }
+            }
+            catch { Start-Sleep -Milliseconds 300 }
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    throw "Timeout de $TimeoutSeconds s esperando el resultado en '$resultPath'. Revisa publish-order.log."
+}
+
+function Request-Publish {
+    <#
+    .SYNOPSIS
+        Pide una publicación SIN privilegios: escribe la orden, dispara la tarea
+        elevada 'Publish Local' y espera el resultado.
+
+    .DESCRIPTION
+        Es exactamente la llamada que hará el job de CI o el dashboard: no eleva
+        nada, solo deja la orden y la dispara. Todo el trabajo con privilegios
+        (checkout, MSBuild, parada del app pool y swap) lo hace la tarea.
+
+        La tarea hay que registrarla UNA vez en la máquina, con privilegios:
+        tools\Register-PublishLocalTask.ps1 (con -Unattended en servidores).
+
+    .EXAMPLE
+        Request-Publish -Environment devecoand1 -Branch main_deploy-20260730 -Execute
+
+    .EXAMPLE
+        Request-Publish -Environment devecoand1 -Branch main_deploy-20260730 -NoWait
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Branch,
+        [switch]$Execute,
+        [switch]$OverrideWebconfig,
+        [string[]]$AllowedEnvironments,
+        [string]$TaskName = 'Publish Local',
+        [string]$DataDir,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 900
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    $order = Write-PublishOrder -Environment $Environment -Branch $Branch `
+        -Execute:$Execute -OverrideWebconfig:$OverrideWebconfig `
+        -AllowedEnvironments $AllowedEnvironments -DataDir $DataDir
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    Write-Host "Orden escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
+    Write-Host "Disparando la tarea '$TaskName'..." -ForegroundColor Yellow
+    Start-PublishTask -TaskName $TaskName -DataDir $dir
+
+    if ($NoWait) {
+        return [pscustomobject]@{
+            status      = 'triggered'
+            environment = $Environment
+            branch      = $Branch
+            runId       = $order.runId
+            orderPath   = $order.path
+            logPath     = Join-Path $dir 'publish-order.log'
+        }
+    }
+
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds
+    $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
+    Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
+    return $result
 }
 
 function Update-PublishToIIS {
@@ -537,4 +734,4 @@ function Update-PublishToIIS {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish -Alias Publish-Update
