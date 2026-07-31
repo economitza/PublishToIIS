@@ -76,6 +76,12 @@ Uso rápido:
   existe y un `Import-Module PublishToIIS` a secas carga la copia instalada, que
   puede ser vieja — comprobable con `(Get-Module PublishToIIS).Path`.
 
+- **Encoding: los `.ps1`/`.psm1` con acentos van en UTF-8 CON BOM.** Windows
+  PowerShell 5.1 lee un fichero sin BOM como ANSI y los acentos salen como
+  mojibake, tanto en pantalla como en cualquier texto que el script componga; y
+  5.1 es quien ejecuta `Install.ps1` y el registro de la tarea. Hay dos pruebas
+  en `tests/` que fallan si aparece un fichero sin BOM o con mojibake ya escrito.
+
 Estructura relevante:
 
 - `src/` : implementación del módulo

@@ -1,4 +1,4 @@
-# Dot-source the config module
+﻿# Dot-source the config module
 $configPath = Join-Path $PSScriptRoot '..\config\config.ps1'
 if (Test-Path $configPath) {
     . $configPath

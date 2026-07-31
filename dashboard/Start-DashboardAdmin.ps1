@@ -1,4 +1,4 @@
-# Arranca el dashboard de publicación ELEVADO (admin), necesario SOLO para ejecutar
+﻿# Arranca el dashboard de publicación ELEVADO (admin), necesario SOLO para ejecutar
 # un Publish en local (dev-joaquim-local). El dashboard "siempre activo" (tarea
 # programada 'Publish Dashboard') corre sin privilegios a propósito, y con eso basta
 # para ver estado/semáforos y para disparar los deploy remotos por GitLab.

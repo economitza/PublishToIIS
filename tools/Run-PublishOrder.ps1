@@ -1,4 +1,4 @@
-# Ejecutado por la tarea programada elevada 'Publish Local'.
+﻿# Ejecutado por la tarea programada elevada 'Publish Local'.
 # Lee la orden de %ProgramData%\PublishToIIS\publish-order.json, la consume
 # (la renombra a .consumed para que un /run accidental no re-publique) y
 # ejecuta Invoke-DeployOrder.

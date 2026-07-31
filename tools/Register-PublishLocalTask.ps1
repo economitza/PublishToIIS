@@ -1,4 +1,4 @@
-# Registra (una sola vez, requiere elevación por UAC) la tarea programada
+﻿# Registra (una sola vez, requiere elevación por UAC) la tarea programada
 # 'Publish Local': RunLevel Highest, sin trigger, se dispara bajo demanda con
 #   schtasks /run /tn "Publish Local"
 # tras dejar la orden en %ProgramData%\PublishToIIS\publish-order.json.

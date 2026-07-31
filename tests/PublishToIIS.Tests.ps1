@@ -1,4 +1,39 @@
-Import-Module -Name (Join-Path $PSScriptRoot '..\PublishToIIS.psd1') -Force
+﻿Import-Module -Name (Join-Path $PSScriptRoot '..\PublishToIIS.psd1') -Force
+
+Describe 'Encoding de los scripts' {
+    # Windows PowerShell 5.1 lee un .ps1 UTF-8 SIN BOM como ANSI: los acentos
+    # salen como mojibake (la a con tilde se convierte en dos caracteres raros)
+    # en pantalla y en cualquier texto que el script componga. Como el registro
+    # de la tarea y el Install los ejecuta
+    # powershell.exe (5.1), todo fichero con acentos tiene que llevar BOM.
+    It 'todo .ps1/.psm1/.psd1 con caracteres no ASCII lleva BOM UTF-8' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $sinBom = Get-ChildItem -Path $root -Recurse -Include *.ps1, *.psm1, *.psd1 -File |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' } |
+            Where-Object {
+                $bytes = [IO.File]::ReadAllBytes($_.FullName)
+                $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+                $noAscii = @($bytes | Where-Object { $_ -gt 127 }).Count -gt 0
+                $noAscii -and -not $bom
+            } |
+            ForEach-Object { $_.FullName.Replace("$root\", '') }
+
+        $sinBom -join ', ' | Should -BeNullOrEmpty
+    }
+
+    It 'ningún script arrastra mojibake ya escrito' {
+        $root = Split-Path $PSScriptRoot -Parent
+        # El patrón se compone por código: escrito literal, este fichero se
+        # detectaría a sí mismo.
+        $mojibake = "$([char]0xC3).|$([char]0xE2)$([char]0x82)|$([char]0xE2)$([char]0x80)"
+        $malos = Get-ChildItem -Path $root -Recurse -Include *.ps1, *.psm1, *.psd1 -File |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' } |
+            Where-Object { (Get-Content $_.FullName -Raw) -match $mojibake } |
+            ForEach-Object { $_.FullName.Replace("$root\", '') }
+
+        $malos -join ', ' | Should -BeNullOrEmpty
+    }
+}
 
 Describe 'Get-PublishConfig' {
     It 'loads a defined environment config' {
