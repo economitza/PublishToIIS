@@ -559,6 +559,50 @@ function Start-PublishTask {
     }
 }
 
+function Write-PublishLogTail {
+    # Vuelca lo que la tarea haya escrito en el transcript desde la última vez.
+    # Se abre con ReadWrite|Delete a propósito: el fichero lo tiene abierto
+    # Start-Transcript y con el share por defecto no se podría leer en caliente.
+    param(
+        [string]$Path,
+        [long]$Position,
+        # Marca de creación del transcript que ya habíamos visto: si cambia, la
+        # tarea ha empezado uno nuevo y hay que leerlo desde el principio
+        [ref]$Stamp
+    )
+
+    if (-not (Test-Path $Path)) { return $Position }
+    try {
+        $creado = (Get-Item $Path).CreationTimeUtc
+        if ($Stamp -and $Stamp.Value -ne $creado) {
+            $Stamp.Value = $creado
+            $Position = 0
+        }
+
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                              [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try {
+            # Si el fichero ha encogido, es un transcript nuevo: volver al principio
+            if ($fs.Length -lt $Position) { $Position = 0 }
+            if ($fs.Length -eq $Position) { return $Position }
+            [void]$fs.Seek($Position, [IO.SeekOrigin]::Begin)
+            $reader = New-Object IO.StreamReader($fs)
+            $texto = $reader.ReadToEnd()
+            $Position = $fs.Length
+        }
+        finally { $fs.Dispose() }
+
+        foreach ($linea in $texto -split "`r?`n") {
+            if ($linea.Trim()) { Write-Host "  | $linea" -ForegroundColor DarkGray }
+        }
+    }
+    catch {
+        # Un fallo leyendo el log no puede tumbar la espera del resultado
+        Write-Verbose "No se pudo leer el log: $($_.Exception.Message)"
+    }
+    return $Position
+}
+
 function Wait-PublishResult {
     <#
     .SYNOPSIS
@@ -577,14 +621,30 @@ function Wait-PublishResult {
         [string]$RunId,
         [datetime]$Since,
         [int]$TimeoutSeconds = 900,
-        [int]$PollSeconds = 2
+        [int]$PollSeconds = 2,
+        # La tarea escribe su consola en publish-order.log, no en la nuestra: sin
+        # esto, quien la dispara se queda mirando una pantalla muda durante todo
+        # el publish. Con -Quiet se calla y solo devuelve el resultado.
+        [switch]$Quiet
     )
 
     $dir = Get-PublishDataDir -DataDir $DataDir
     $resultPath = Join-Path $dir 'publish-order.result.json'
+    $logPath = Join-Path $dir 'publish-order.log'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    # Arrancar al final del log existente: lo de la ejecución anterior no es
+    # nuestro y volcarlo confunde. Cuando la tarea cree su transcript, el cambio
+    # de fecha de creación hace que se lea desde el principio.
+    $logPos = 0
+    $logStamp = [datetime]::MinValue
+    if (Test-Path $logPath) {
+        $logPos = (Get-Item $logPath).Length
+        $logStamp = (Get-Item $logPath).CreationTimeUtc
+    }
+    if (-not $Quiet) { $PollSeconds = 1 }
 
     while ((Get-Date) -lt $deadline) {
+        if (-not $Quiet) { $logPos = Write-PublishLogTail -Path $logPath -Position $logPos -Stamp ([ref]$logStamp) }
         if (Test-Path $resultPath) {
             # Pequeña espera defensiva: el fichero puede estar a medio escribir.
             try {
@@ -598,7 +658,11 @@ function Wait-PublishResult {
                              else { (Get-Item $resultPath).LastWriteTime }
                     $fresh = $stamp -ge $Since
                 }
-                if ($fresh) { return $result }
+                if ($fresh) {
+                    # Vaciar lo que la tarea escribió justo antes de terminar
+                    if (-not $Quiet) { [void](Write-PublishLogTail -Path $logPath -Position $logPos -Stamp ([ref]$logStamp)) }
+                    return $result
+                }
             }
             catch { Start-Sleep -Milliseconds 300 }
         }
@@ -638,7 +702,10 @@ function Request-Publish {
         [string]$TaskName = 'Publish Local',
         [string]$DataDir,
         [switch]$NoWait,
-        [int]$TimeoutSeconds = 900
+        [int]$TimeoutSeconds = 900,
+        # Por defecto se va volcando el log de la tarea mientras publica, para no
+        # dejar la consola muda durante minutos
+        [switch]$Quiet
     )
 
     $ErrorActionPreference = 'Stop'
@@ -663,7 +730,7 @@ function Request-Publish {
         }
     }
 
-    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
     $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
     Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
     return $result

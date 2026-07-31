@@ -53,6 +53,12 @@ Uso rápido:
   la tarea. Opciones: `-NoWait` (dispara y vuelve), `-TimeoutSeconds`,
   `-OverrideWebconfig`, `-TaskName`.
 
+  Mientras publica, `Request-Publish` va volcando el log de la tarea en tu
+  consola (prefijado con `|`): la tarea corre en su propio proceso y su salida va
+  al transcript, no a tu terminal, asi que sin esto la consola se queda muda
+  durante todo el MSBuild y parece colgada. Con `-Quiet` se calla y solo devuelve
+  el resultado.
+
   Piezas sueltas, por si se quiere disparar a mano o desde otro lenguaje:
   `Write-PublishOrder` deja `%ProgramData%\PublishToIIS\publish-order.json`
   (`{"environment":"...","branch":"...","execute":true}`), `schtasks /run /tn

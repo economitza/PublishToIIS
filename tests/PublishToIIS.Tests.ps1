@@ -258,6 +258,45 @@ Describe 'Wait-PublishResult' {
         (Wait-PublishResult -DataDir $script:dataDir -RunId 'bbbb' -TimeoutSeconds 5).message | Should -Be 'la mía'
     }
 
+    It 'vuelca solo lo nuevo del log, no lo que ya estaba' {
+        $log = Join-Path $script:dataDir 'publish-order.log'
+        'RESTOS DE AYER' | Set-Content $log -Encoding UTF8
+
+        $salida = InModuleScope PublishToIIS -Parameters @{ log = $log } {
+            param($log)
+            # tal como arranca Wait-PublishResult: posición y marca del log actual
+            $pos = (Get-Item $log).Length
+            $st = (Get-Item $log).CreationTimeUtc
+            Add-Content $log 'LINEA DE ESTA EJECUCION' -Encoding UTF8
+            (Write-PublishLogTail -Path $log -Position $pos -Stamp ([ref]$st) 6>&1) | Out-String
+        }
+        $salida | Should -Match 'LINEA DE ESTA EJECUCION'
+        $salida | Should -Not -Match 'RESTOS DE AYER'
+    }
+
+    It 'si la tarea recrea el transcript, lo lee desde el principio' {
+        $log = Join-Path $script:dataDir 'publish-order.log'
+        'RESTOS DE AYER, un log largo que ocupa mucho mas que el nuevo' | Set-Content $log -Encoding UTF8
+
+        $salida = InModuleScope PublishToIIS -Parameters @{ log = $log } {
+            param($log)
+            $pos = (Get-Item $log).Length
+            $st = (Get-Item $log).CreationTimeUtc
+            'NUEVO' | Set-Content $log -Encoding UTF8   # transcript recreado, mas corto
+            (Write-PublishLogTail -Path $log -Position $pos -Stamp ([ref]$st) 6>&1) | Out-String
+        }
+        $salida | Should -Match 'NUEVO'
+    }
+
+    It 'con -Quiet no vuelca el log' {
+        'no deberia verse' | Set-Content (Join-Path $script:dataDir 'publish-order.log') -Encoding UTF8
+        '{"status":"ok","runId":"dddd"}' |
+            Set-Content (Join-Path $script:dataDir 'publish-order.result.json') -Encoding UTF8
+
+        $salida = Wait-PublishResult -DataDir $script:dataDir -RunId 'dddd' -TimeoutSeconds 5 -Quiet 6>&1
+        ($salida | Out-String) | Should -Not -Match 'no deberia verse'
+    }
+
     It 'con -Since ignora el resultado de una ejecución anterior' {
         # El proceso sin privilegios no siempre puede borrar el result.json que
         # escribió la tarea elevada: hay que descartarlo por fecha, no por borrado.
