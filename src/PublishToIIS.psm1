@@ -669,6 +669,65 @@ function Request-Publish {
     return $result
 }
 
+function Get-PublishToIISRepo {
+    <#
+    .SYNOPSIS
+        Resuelve la ruta de la copia de trabajo git del módulo, sin tener que saberla.
+
+    .DESCRIPTION
+        Por orden: el parámetro -RepoPath, la variable PUBLISHTOIIS_REPO que deja
+        Install.ps1 (de proceso o de máquina) y, si el módulo se ha importado
+        directamente desde el repo, su propia carpeta. Si no hay nada, el error
+        dice qué hacer en vez de dejar al usuario adivinando.
+    #>
+    [CmdletBinding()]
+    param([string]$RepoPath)
+
+    $candidates = @(
+        $RepoPath
+        $env:PUBLISHTOIIS_REPO
+        [Environment]::GetEnvironmentVariable('PUBLISHTOIIS_REPO', 'Machine')
+        # $PSScriptRoot es <repo>\src cuando se importa desde la copia de trabajo
+        (Split-Path $PSScriptRoot -Parent)
+    )
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path (Join-Path $c '.git'))) { return (Resolve-Path $c).Path }
+    }
+
+    throw ("No se encontró la copia de trabajo git del módulo. Pásala con -RepoPath, " +
+           "o ejecuta Install.ps1 desde el repo una vez para fijar PUBLISHTOIIS_REPO.")
+}
+
+function Register-PublishTask {
+    <#
+    .SYNOPSIS
+        Registra la tarea elevada 'Publish Local' sin tener que saber dónde está el repo.
+
+    .DESCRIPTION
+        Envoltorio de tools\Register-PublishLocalTask.ps1: localiza la copia de
+        trabajo con Get-PublishToIISRepo y le pasa los argumentos. Es el único
+        paso del flujo que necesita privilegios (el script se auto-eleva).
+
+    .EXAMPLE
+        Register-PublishTask -Unattended   # servidor: corre sin sesión iniciada
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$RepoPath,
+        [string]$TaskName = 'Publish Local',
+        [switch]$Unattended
+    )
+
+    $repo = Get-PublishToIISRepo -RepoPath $RepoPath
+    $script = Join-Path $repo 'tools\Register-PublishLocalTask.ps1'
+    if (-not (Test-Path $script)) {
+        throw "No se encontró $script. ¿La copia de trabajo está en una rama sin tools\?"
+    }
+
+    & $script -TaskName $TaskName -Unattended:$Unattended
+}
+
 function Update-PublishToIIS {
     <#
     .SYNOPSIS
@@ -692,23 +751,8 @@ function Update-PublishToIIS {
 
     $ErrorActionPreference = "Stop"
 
-    # Resolver la ruta del repo: parámetro explícito o variable de entorno guardada en la instalación
-    if (-not $RepoPath) {
-        $RepoPath = $env:PUBLISHTOIIS_REPO
-        if (-not $RepoPath) {
-            $RepoPath = [Environment]::GetEnvironmentVariable('PUBLISHTOIIS_REPO', 'Machine')
-        }
-    }
-
-    if (-not $RepoPath) {
-        throw "No se encontró la ruta del repo. Pásala con -RepoPath o reinstala con Install.ps1 para fijar PUBLISHTOIIS_REPO."
-    }
-    if (-not (Test-Path $RepoPath)) {
-        throw "La ruta del repo no existe: $RepoPath"
-    }
-    if (-not (Test-Path (Join-Path $RepoPath '.git'))) {
-        throw "La ruta '$RepoPath' no es una copia de trabajo git (falta .git)."
-    }
+    # Parámetro explícito, PUBLISHTOIIS_REPO o el propio repo si se importó de él
+    $RepoPath = Get-PublishToIISRepo -RepoPath $RepoPath
 
     $git = Get-Command git -ErrorAction SilentlyContinue
     if (-not $git) { throw "git no está en el PATH." }
@@ -734,4 +778,4 @@ function Update-PublishToIIS {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask -Alias Publish-Update

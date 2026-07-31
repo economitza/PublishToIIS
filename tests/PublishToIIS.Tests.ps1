@@ -296,6 +296,51 @@ Describe 'Request-Publish' {
     }
 }
 
+Describe 'Get-PublishToIISRepo' {
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_repo_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $script:tmp '.git') -Force | Out-Null
+        $script:prevEnv = $env:PUBLISHTOIIS_REPO
+    }
+
+    AfterEach {
+        $env:PUBLISHTOIIS_REPO = $script:prevEnv
+        Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'usa -RepoPath cuando se le pasa' {
+        Get-PublishToIISRepo -RepoPath $script:tmp | Should -Be (Resolve-Path $script:tmp).Path
+    }
+
+    It 'usa PUBLISHTOIIS_REPO si no se le pasa ruta' {
+        $env:PUBLISHTOIIS_REPO = $script:tmp
+        Get-PublishToIISRepo | Should -Be (Resolve-Path $script:tmp).Path
+    }
+
+    It 'cae en el propio repo del módulo si no hay variable' {
+        $env:PUBLISHTOIIS_REPO = $null
+        # Los tests corren sobre la copia de trabajo, así que debe resolverla
+        Get-PublishToIISRepo | Should -Match 'PublishToIIS$'
+    }
+
+    It 'rechaza una ruta que no es copia de trabajo git' {
+        $noRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_norepo_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $noRepo | Out-Null
+        try {
+            # Sin .git no la acepta: cae al siguiente candidato, nunca la devuelve
+            Get-PublishToIISRepo -RepoPath $noRepo | Should -Not -Be $noRepo
+        }
+        finally { Remove-Item $noRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'Register-PublishTask' {
+    It 'falla con mensaje accionable si no encuentra el repo' {
+        Mock -ModuleName PublishToIIS Get-PublishToIISRepo { throw 'No se encontró la copia de trabajo git del módulo.' }
+        { Register-PublishTask } | Should -Throw '*copia de trabajo git*'
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

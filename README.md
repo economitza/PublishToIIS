@@ -32,8 +32,11 @@ Uso rápido:
 - Publish sin privilegios (tarea 'Publish Local'). El único paso que necesita
   elevación es registrar la tarea, UNA vez por máquina:
 
-      tools\Register-PublishLocalTask.ps1              # equipo de desarrollo
-      tools\Register-PublishLocalTask.ps1 -Unattended  # servidor
+      Register-PublishTask              # equipo de desarrollo
+      Register-PublishTask -Unattended  # servidor
+
+  (`Register-PublishTask` es el envoltorio del script `tools\Register-PublishLocalTask.ps1`;
+  localiza el repo solo, sin que haya que saber la ruta.)
 
   `-Unattended` registra la tarea con LogonType **S4U**: se ejecuta aunque nadie
   tenga sesión iniciada (imprescindible si la llamada llega de fuera) y sin
@@ -64,6 +67,14 @@ Uso rápido:
   — se comía el resultado de la ejecución anterior. Por eso cada orden lleva un
   `runId` que la tarea devuelve en el resultado y `Wait-PublishResult` exige que
   coincida (`-RunId`). El registro además da permiso de Modify sobre la carpeta.
+
+- Nada de rutas: `Get-PublishToIISRepo` localiza la copia de trabajo git por
+  `-RepoPath`, por la variable `PUBLISHTOIIS_REPO` que deja `Install.ps1` o, si el
+  módulo se importó desde el propio repo, por su carpeta. `Update-PublishToIIS` y
+  `Register-PublishTask` la usan. *Ojo al arranque en una máquina nueva:* hasta
+  que no se ejecuta `Install.ps1` UNA vez desde el repo, `PUBLISHTOIIS_REPO` no
+  existe y un `Import-Module PublishToIIS` a secas carga la copia instalada, que
+  puede ser vieja — comprobable con `(Get-Module PublishToIIS).Path`.
 
 Estructura relevante:
 
