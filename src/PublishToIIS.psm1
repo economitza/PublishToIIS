@@ -126,26 +126,32 @@ function New-DeployInfo {
         [string]$Environment
     )
 
-    $branch = $null; $commit = $null; $commitDate = $null
+    $branch = $null; $commit = $null; $commitFull = $null; $commitDate = $null
 
     $git = Get-Command git -ErrorAction SilentlyContinue
     if ($git) {
         $insideRepo = (& git -C $ProjectPath rev-parse --is-inside-work-tree 2>$null)
         if ($LASTEXITCODE -eq 0 -and "$insideRepo".Trim() -eq 'true') {
             $branch = ("$(& git -C $ProjectPath rev-parse --abbrev-ref HEAD 2>$null)").Trim()
-            $commit = ("$(& git -C $ProjectPath rev-parse --short HEAD 2>$null)").Trim()
+            # Convención de git: las abreviaturas son PREFIJOS del SHA completo.
+            # Se guarda el SHA completo (comparable con cualquier herramienta) y
+            # un corto de longitud FIJA (9) para mostrar — --short a secas varía
+            # de longitud según el repo y provoca "discrepancias" aparentes.
+            $commitFull = ("$(& git -C $ProjectPath rev-parse HEAD 2>$null)").Trim()
+            $commit = ("$(& git -C $ProjectPath rev-parse --short=9 HEAD 2>$null)").Trim()
             $commitDate = ("$(& git -C $ProjectPath show -s --format=%cI HEAD 2>$null)").Trim()
         }
     }
 
     if (-not $commit) {
         Write-Warning "New-DeployInfo: '$ProjectPath' no es una copia de trabajo git (o git no está disponible); se escribe el sello sin rama/commit."
-        $branch = $null; $commit = $null; $commitDate = $null
+        $branch = $null; $commit = $null; $commitFull = $null; $commitDate = $null
     }
 
     $info = [pscustomobject]@{
         branch      = $branch
         commit      = $commit
+        commitFull  = $commitFull
         commitDate  = $commitDate
         publishDate = (Get-Date).ToString('o')
         environment = $Environment
