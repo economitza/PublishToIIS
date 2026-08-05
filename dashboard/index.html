@@ -132,7 +132,9 @@ async function refreshAll() {
     const row = document.createElement('tr');
     row.innerHTML = `
       <td><b>${esc(env.name)}</b><div class="muted">${esc(env.destination)}</div></td>
-      <td>${esc(env.serverName) || '<span class="muted">—</span>'}</td>
+      <td>${env.siteUrl
+        ? `<a href="${esc(env.siteUrl)}" target="_blank" rel="noopener">${esc(env.siteUrl.replace(/^https?:\/\//, ''))}</a>${env.serverName ? `<div class="muted">${esc(env.serverName)}</div>` : ''}`
+        : (esc(env.serverName) || '<span class="muted">—</span>')}</td>
       <td><input class="branch" list="branches" placeholder="buscar rama…"></td>
       <td><button class="pub" ${env.localOrigin ? '' : 'disabled title="origin no local: Fase 3"'}>Publish</button></td>
       <td class="online">…</td>
