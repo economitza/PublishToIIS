@@ -426,12 +426,25 @@ function Invoke-DeployOrder {
     }
 
     Write-Host "Checkout de '$Branch' en $repo..." -ForegroundColor Yellow
-    & git -C $repo fetch --prune
-    if ($LASTEXITCODE) { throw "git fetch falló (código $LASTEXITCODE)." }
-    & git -C $repo checkout $Branch
-    if ($LASTEXITCODE) { throw "git checkout falló (código $LASTEXITCODE)." }
-    & git -C $repo pull --ff-only
-    if ($LASTEXITCODE) { throw "git pull falló (código $LASTEXITCODE)." }
+    # La tarea programada corre -NonInteractive con stdin nulo: un prompt de git
+    # (host key SSH, credenciales, passphrase) se quedaría colgado para siempre y
+    # sin rastro. Se fuerza modo batch para que falle con error visible; el host
+    # key de un remoto nuevo se acepta a la primera (TOFU) y se persiste.
+    $gitEnvPrev = @{ GIT_TERMINAL_PROMPT = $env:GIT_TERMINAL_PROMPT; GIT_SSH_COMMAND = $env:GIT_SSH_COMMAND }
+    $env:GIT_TERMINAL_PROMPT = '0'
+    if (-not $env:GIT_SSH_COMMAND) { $env:GIT_SSH_COMMAND = 'ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new' }
+    try {
+        & git -C $repo fetch --prune
+        if ($LASTEXITCODE) { throw "git fetch falló (código $LASTEXITCODE). Si pide credenciales u host key, ejecuta 'git -C $repo fetch' una vez a mano con el mismo usuario." }
+        & git -C $repo checkout $Branch
+        if ($LASTEXITCODE) { throw "git checkout falló (código $LASTEXITCODE)." }
+        & git -C $repo pull --ff-only
+        if ($LASTEXITCODE) { throw "git pull falló (código $LASTEXITCODE)." }
+    }
+    finally {
+        $env:GIT_TERMINAL_PROMPT = $gitEnvPrev.GIT_TERMINAL_PROMPT
+        $env:GIT_SSH_COMMAND = $gitEnvPrev.GIT_SSH_COMMAND
+    }
 
     Publish @pubArgs
     return $plan
