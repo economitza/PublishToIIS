@@ -32,22 +32,30 @@
     "devecoesp1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoEsp1\\CentralCompresTest",
-      "siteUrl": "https://devecoesp1.economitza.com"
+      "siteUrl": "https://devecoesp1.economitza.com",
+      "serverName": "deployments-76",
+      "endpointUrl": "https://deployments-76.economitza.com"
     },
     "devecoand1": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoand1\\",
-      "siteUrl": "https://devecoand1.economitza.com"
+      "siteUrl": "https://devecoand1.economitza.com",
+      "serverName": "deployments-76",
+      "endpointUrl": "https://deployments-76.economitza.com"
     },
     "devecoesp2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoEsp2",
-      "siteUrl": "https://devecoesp2.economitza.com"
+      "siteUrl": "https://devecoesp2.economitza.com",
+      "serverName": "deployments-76",
+      "endpointUrl": "https://deployments-76.economitza.com"
     },
     "devecoand2": {
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoAnd2",
-      "siteUrl": "https://devecoand2.economitza.com"
+      "siteUrl": "https://devecoand2.economitza.com",
+      "serverName": "deployments-76",
+      "endpointUrl": "https://deployments-76.economitza.com"
     },
     "staging": {
       "origin": "C:\\path\\to\\project-source",
@@ -64,6 +72,13 @@
       "destination": "C:\\inetpub\\wwwroot\\economitza_espana",
       "appPool": "economitza_espana",
       "siteUrl": "https://esp.emkt.test",
+      "serverName": "localhost"
+    },
+    "dev-joaquim-local-esp2": {
+      "origin": "C:\\claude-worktrees\\central-de-compres\\prerelease-20260831\\CentralCompres\\",
+      "destination": "C:\\inetpub\\wwwroot\\esp2.emkt.test",
+      "appPool": "esp2.emkt.test",
+      "siteUrl": "https://esp2.emkt.test",
       "serverName": "localhost"
     },
     "dev-joaquim-local-rebranding": {
