@@ -37,8 +37,10 @@
 </table>
 <div class="muted" style="margin-top:.6rem">
   🟢 responde · ⚪ apagado/no alcanzable · 🔴 error — Detalles vía <code>/deploy-info.json</code>.
-  Publish disponible solo para entornos con origin local (el resto, Fase 3).
-  El Publish local necesita el dashboard <b>elevado</b>: arráncalo con <code>dashboard-admin.cmd</code>.
+  Publish disponible para entornos con origin local o con <code>endpointUrl</code> (despliegue
+  remoto por el endpoint del servidor). El Publish <b>local</b> necesita el dashboard
+  <b>elevado</b> (<code>dashboard-admin.cmd</code>); el <b>remoto</b> no, pero pide el token del
+  endpoint (<code>PUBLISHTOIIS_API_TOKEN</code> o <code>dashboard\remote-api-token.txt</code>).
 </div>
 
 <h1 style="margin-top:2rem">Entornos de test según Jira
@@ -113,7 +115,8 @@ async function refreshStatus(env, row) {
 async function doPublish(env, row, btn) {
   const branch = row.querySelector('input.branch').value.trim();
   if (!branch) { alert('Elige una rama'); return; }
-  if (!confirm(`Publicar la rama\n\n  ${branch}\n\nal entorno ${env.name}?`)) return;
+  const via = env.remote ? `\n\n(remoto, por ${env.endpointUrl})` : '';
+  if (!confirm(`Publicar la rama\n\n  ${branch}\n\nal entorno ${env.name}?${via}`)) return;
   btn.disabled = true; btn.classList.add('busy'); btn.textContent = 'Publicando…';
   log.style.display = 'block'; log.textContent = `[${env.name}] Publish ${branch} lanzado…`;
   try {
@@ -136,7 +139,7 @@ async function refreshAll() {
         ? `<a href="${esc(env.siteUrl)}" target="_blank" rel="noopener">${esc(env.siteUrl.replace(/^https?:\/\//, ''))}</a>${env.serverName ? `<div class="muted">${esc(env.serverName)}</div>` : ''}`
         : (esc(env.serverName) || '<span class="muted">—</span>')}</td>
       <td><input class="branch" list="branches" placeholder="buscar rama…"></td>
-      <td><button class="pub" ${env.localOrigin ? '' : 'disabled title="origin no local: Fase 3"'}>Publish</button></td>
+      <td><button class="pub" ${env.publishable ? '' : 'disabled title="ni origin local ni endpointUrl configurado"'}>Publish</button>${env.remote ? '<div class="muted">remoto</div>' : ''}</td>
       <td class="online">…</td>
       <td class="info">…</td>`;
     tbody.appendChild(row);

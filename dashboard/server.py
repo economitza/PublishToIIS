@@ -35,15 +35,39 @@ def load_environments():
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     envs = []
     for name, env in cfg.get("environments", {}).items():
+        endpoint_url = env.get("endpointUrl", "")
+        local_origin = Path(env.get("origin", "")).exists()
         envs.append({
             "name": name,
             "origin": env.get("origin", ""),
             "destination": env.get("destination", ""),
             "siteUrl": env.get("siteUrl", ""),
             "serverName": env.get("serverName", ""),
-            "localOrigin": Path(env.get("origin", "")).exists(),
+            "endpointUrl": endpoint_url,
+            "localOrigin": local_origin,
+            # Publicable de dos formas: en local (origin en esta máquina) o
+            # remoto (el entorno declara el endpoint HTTP de su servidor).
+            "remote": bool(endpoint_url),
+            "publishable": bool(endpoint_url) or local_origin,
         })
     return envs
+
+
+def resolve_api_token():
+    """Token del endpoint remoto, para el dashboard (que corre en el portátil).
+    Por orden: variable PUBLISHTOIIS_API_TOKEN o un fichero remote-api-token.txt
+    junto al dashboard. Es la misma credencial que se copió del servidor."""
+    tok = os.environ.get("PUBLISHTOIIS_API_TOKEN")
+    if tok:
+        return tok.strip()
+    for p in (ROOT / "remote-api-token.txt",
+              Path(os.environ.get("ProgramData", "")) / "PublishToIIS" / "remote-api-token.txt"):
+        try:
+            if p and p.exists():
+                return p.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return None
 
 
 def http_get(url):
@@ -114,24 +138,54 @@ def list_branches(repo):
 
 
 def publish(env_name, branch):
-    """Publish local: checkout de la rama en el origin y Publish del módulo.
-
-    Solo para entornos con origin accesible en esta máquina; el resto es Fase 3.
-    Requiere que este servidor corra en una consola con permisos de administrador
-    (el swap de IIS los necesita).
-    """
+    """Publica la rama en el entorno: remoto (por el endpoint HTTP del servidor)
+    si el entorno declara endpointUrl, o local (checkout + Publish del módulo) si
+    el origin está en esta máquina."""
     envs = {e["name"]: e for e in load_environments()}
     env = envs.get(env_name)
     if not env:
         return 404, {"error": f"entorno desconocido: {env_name}"}
-    if not env["localOrigin"]:
-        return 501, {"error": "origin no accesible desde esta máquina: disparo remoto pendiente (Fase 3)"}
 
     # Validar la rama ANTES de interpolarla en el comando (evita inyección en el
-    # borde Python->PowerShell; Invoke-DeployOrder revalida del lado PS).
+    # borde Python->PowerShell; el módulo revalida del lado PS).
     if not re.match(r"^[A-Za-z0-9._/+\-]+$", branch or ""):
         return 400, {"error": f"Rama con formato inválido: '{branch}'"}
 
+    if env["remote"]:
+        return publish_remote(env, branch)
+    if not env["localOrigin"]:
+        return 501, {"error": "origin no accesible y sin endpointUrl: configura endpointUrl "
+                              "para publicar por el endpoint remoto del servidor"}
+    return publish_local(env_name, branch)
+
+
+def publish_remote(env, branch):
+    """Dispara la publicación en el servidor por su endpoint HTTP. Reutiliza
+    Request-RemotePublish (encola en el endpoint y sondea el resultado); el token
+    viaja al proceso hijo por variable de entorno, no en la línea de comando."""
+    token = resolve_api_token()
+    if not token:
+        return 400, {"error": "sin token de API para el despliegue remoto: define "
+                              "PUBLISHTOIIS_API_TOKEN o crea dashboard\\remote-api-token.txt "
+                              "con el token que dio el servidor."}
+    module = str(ROOT.parent / "PublishToIIS.psd1")
+    url = env["endpointUrl"]
+    ps = (f"$ErrorActionPreference='Stop'; "
+          f"Import-Module '{module}' -Force; "
+          f"Request-RemotePublish -Url '{url}' -Environment '{env['name']}' -Branch '{branch}' -Execute")
+    child_env = {**os.environ, "PUBLISHTOIIS_API_TOKEN": token}
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       capture_output=True, text=True, timeout=1800, env=child_env)
+    out = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
+    if r.returncode != 0:
+        return 500, {"error": f"Despliegue remoto de '{env['name']}' falló",
+                     "detail": (out or "(el proceso no devolvió salida)")[-4000:]}
+    return 200, {"ok": True, "output": out[-4000:]}
+
+
+def publish_local(env_name, branch):
+    """Publish local: checkout de la rama en el origin y Publish del módulo.
+    Requiere que este servidor corra elevado (el swap de IIS lo necesita)."""
     module = str(ROOT.parent / "PublishToIIS.psd1")
     ps = (f"$ErrorActionPreference='Stop'; "
           f"Import-Module '{module}' -Force; "
