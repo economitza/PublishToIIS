@@ -11,6 +11,8 @@
   th, td { padding: .55rem .8rem; border-bottom: 1px solid #e3e5e8; text-align: left; font-size: .92rem; vertical-align: middle; }
   th { background: #2c3e50; color: #fff; font-weight: 600; }
   tr:hover td { background: #f0f4f8; }
+  tr.local td { background: #f3f3f1; }
+  tr.local:hover td { background: #ecebe7; }
   .sem { font-size: 1.2rem; }
   .muted { color: #888; font-size: .85rem; }
   input.branch { width: 230px; padding: .3rem .4rem; }
@@ -27,10 +29,10 @@
 </style>
 </head>
 <body>
-<h1>Dashboard de publicación <button id="refresh" onclick="refreshAll()">⟳ refrescar</button></h1>
+<h1>Dashboard de publicación <button id="refresh" onclick="refreshStatuses()">⟳ refrescar</button></h1>
 <table id="tbl">
   <thead><tr>
-    <th>Entorno</th><th>Servidor</th><th>Rama a publicar</th><th></th>
+    <th>Entorno</th><th>Responsable</th><th>Servidor</th><th>Rama a publicar</th><th></th>
     <th>Online</th><th>Desplegado</th>
   </tr></thead>
   <tbody></tbody>
@@ -128,23 +130,40 @@ async function doPublish(env, row, btn) {
   refreshStatus(env, row);
 }
 
-async function refreshAll() {
+function envRowHtml(env) {
+  return `
+    <td><b>${esc(env.name)}</b><div class="muted">${esc(env.destination)}</div></td>
+    <td>${esc(env.responsable) || '<span class="muted">—</span>'}</td>
+    <td>${env.siteUrl
+      ? `<a href="${esc(env.siteUrl)}" target="_blank" rel="noopener">${esc(env.siteUrl.replace(/^https?:\/\//, ''))}</a>${env.serverName ? `<div class="muted">${esc(env.serverName)}</div>` : ''}`
+      : (esc(env.serverName) || '<span class="muted">—</span>')}</td>
+    <td><input class="branch" list="branches" placeholder="buscar rama…"></td>
+    <td><button class="pub" ${env.publishable ? '' : 'disabled title="ni origin local ni endpointUrl configurado"'}>Publish</button>${env.remote ? '<div class="muted">remoto</div>' : '<div class="muted">local</div>'}</td>
+    <td class="online">…</td>
+    <td class="info">…</td>`;
+}
+
+// La tabla se construye UNA sola vez (al cargar). Los refrescos (periodico y ⟳)
+// solo actualizan Online/Desplegado sobre las filas existentes: asi no parpadea
+// ni se reinicia la rama que hayas seleccionado.
+async function buildTable() {
   const envs = await fetchJson('/api/environments');
+  envs.sort((a, b) => (a.remote === b.remote) ? 0 : (a.remote ? -1 : 1));  // remotos primero, locales al final
   tbody.innerHTML = '';
   for (const env of envs) {
     const row = document.createElement('tr');
-    row.innerHTML = `
-      <td><b>${esc(env.name)}</b><div class="muted">${esc(env.destination)}</div></td>
-      <td>${env.siteUrl
-        ? `<a href="${esc(env.siteUrl)}" target="_blank" rel="noopener">${esc(env.siteUrl.replace(/^https?:\/\//, ''))}</a>${env.serverName ? `<div class="muted">${esc(env.serverName)}</div>` : ''}`
-        : (esc(env.serverName) || '<span class="muted">—</span>')}</td>
-      <td><input class="branch" list="branches" placeholder="buscar rama…"></td>
-      <td><button class="pub" ${env.publishable ? '' : 'disabled title="ni origin local ni endpointUrl configurado"'}>Publish</button>${env.remote ? '<div class="muted">remoto</div>' : ''}</td>
-      <td class="online">…</td>
-      <td class="info">…</td>`;
+    if (!env.remote) row.classList.add('local');
+    row.innerHTML = envRowHtml(env);
     tbody.appendChild(row);
+    row._env = env;
     row.querySelector('button.pub').onclick = ev => doPublish(env, row, ev.target);
     refreshStatus(env, row);
+  }
+}
+
+function refreshStatuses() {
+  for (const row of tbody.querySelectorAll('tr')) {
+    if (row._env) refreshStatus(row._env, row);
   }
 }
 
@@ -227,9 +246,9 @@ async function refreshJiraEnvs(force = false) {
   } finally { btn.disabled = false; }
 }
 
-loadBranches().then(refreshAll);
+loadBranches().then(buildTable);
 refreshJiraEnvs();
-setInterval(refreshAll, 60000);
+setInterval(refreshStatuses, 60000);
 setInterval(refreshJiraEnvs, 600000);
 </script>
 </body>

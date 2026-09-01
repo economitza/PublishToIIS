@@ -43,6 +43,7 @@ def load_environments():
             "destination": env.get("destination", ""),
             "siteUrl": env.get("siteUrl", ""),
             "serverName": env.get("serverName", ""),
+            "responsable": env.get("responsable", ""),
             "endpointUrl": endpoint_url,
             "localOrigin": local_origin,
             # Publicable de dos formas: en local (origin en esta máquina) o
