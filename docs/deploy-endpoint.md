@@ -52,9 +52,11 @@ Requisitos: IIS con **URL Rewrite** + **ARR** (Application Request Routing) y el
 modulo PublishToIIS instalado (`Install.ps1`). La tarea elevada `Publish Local`
 ya debe estar registrada (`Register-PublishTask -Unattended`).
 
-1. **DNS** (Route 53 — la zona de `economitza.com` esta en AWS, no en
-   Webempresa): registro A `deployments-76.economitza.com` -> IP publica del
-   servidor.
+1. **DNS: en AWS Route 53.** La zona de `economitza.com` esta delegada en Route 53
+   (nameservers `awsdns-*`), asi que el registro se crea en la consola de AWS,
+   NO en el panel de Webempresa (un subdominio creado alli no resuelve, porque
+   nadie consulta esa zona). Registro **A** `deployments-76.economitza.com` -> IP
+   publica del servidor. Ya creado y resolviendo a `15.236.4.76`.
 
 2. **Listener + token + URL ACL** (elevado, una vez). Una sola instruccion, desde
    cualquier carpeta, con el modulo cargado:
