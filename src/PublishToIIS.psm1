@@ -1272,21 +1272,35 @@ function Start-DeployEndpoint {
 
     try {
         while ($listener.IsListening) {
-            $ctx = $listener.GetContext()
+            try { $ctx = $listener.GetContext() }
+            catch { if ($listener.IsListening) { continue } else { break } }
+
             $req = $ctx.Request
             $res = $ctx.Response
+            # Datos de auditoria capturados ANTES de cerrar la respuesta: sobre un
+            # contexto ya cerrado, RemoteEndPoint lanza (era lo que tumbaba el
+            # listener tras la primera peticion). La IP real llega en
+            # X-Forwarded-For (la pone ARR); en loopback, del RemoteEndPoint.
+            $method = $req.HttpMethod
+            $rawUrl = $req.RawUrl
+            $ip = [string]$req.Headers['X-Forwarded-For']
+            if (-not $ip) { try { $ip = $req.RemoteEndPoint.Address.ToString() } catch { $ip = '?' } }
+            $status = 500
+
+            # Ningun fallo de UNA peticion puede tumbar el listener: todo el manejo
+            # va en try/catch y el Close y la auditoria en el suyo.
             try {
                 try {
                     $body = ''
                     if ($req.HasEntityBody) {
-                        if ($req.ContentLength64 -gt 65536) { throw 'Cuerpo demasiado grande (máximo 64 KB).' }
+                        if ($req.ContentLength64 -gt 65536) { throw 'Cuerpo demasiado grande (maximo 64 KB).' }
                         $reader = New-Object IO.StreamReader($req.InputStream, [Text.Encoding]::UTF8)
                         try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
                     }
                     $query = @{}
                     foreach ($k in $req.QueryString.AllKeys) { if ($k) { $query[$k] = $req.QueryString[$k] } }
 
-                    $out = Invoke-DeployEndpointRequest -Method $req.HttpMethod -Path $req.Url.AbsolutePath `
+                    $out = Invoke-DeployEndpointRequest -Method $method -Path $req.Url.AbsolutePath `
                         -Query $query -Body $body -Token ([string]$req.Headers['X-Api-Token']) `
                         -ExpectedToken $token -DataDir $dir -TaskName $TaskName
                 }
@@ -1302,17 +1316,19 @@ function Start-DeployEndpoint {
                     $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $out.body -Depth 5))
                     $res.ContentType = 'application/json; charset=utf-8'
                 }
+                $status = $out.status
                 $res.StatusCode = $out.status
                 $res.ContentLength64 = $bytes.Length
                 $res.OutputStream.Write($bytes, 0, $bytes.Length)
             }
-            finally { $res.Close() }
+            catch { }
+            finally { try { $res.Close() } catch { } }
 
-            # Auditoría: la IP real del cliente llega en X-Forwarded-For (la pone ARR)
-            $ip = [string]$req.Headers['X-Forwarded-For']
-            if (-not $ip) { $ip = $req.RemoteEndPoint.Address.ToString() }
-            "$((Get-Date).ToString('s')) | $ip | $($req.HttpMethod) $($req.RawUrl) | $($out.status)" |
-                Add-Content $auditPath -Encoding UTF8
+            try {
+                "$((Get-Date).ToString('s')) | $ip | $method $rawUrl | $status" |
+                    Add-Content $auditPath -Encoding UTF8
+            }
+            catch { }
         }
     }
     finally {
