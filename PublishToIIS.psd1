@@ -1,6 +1,6 @@
 @{
     RootModule = 'src\PublishToIIS.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.4.0'
     GUID = 'd3f6d9b7-6c3a-4f0d-9a2b-123456789abc'
     Author = 'Economitza (it@economitza.com)'
     CompanyName = 'Economitza'
@@ -16,7 +16,7 @@
             Tags = @('IIS','deploy','build')
             LicenseUri = ''
             ProjectUri = ''
-            ReleaseNotes = 'Initial skeleton'
+            ReleaseNotes = 'Publish con swap seguro y web.config preservado; sello deploy-info.json; dashboard de publicacion; ordenes de despliegue via tarea Publish Local; endpoint HTTP de despliegue remoto con cola FIFO serializada; alta de entornos con Add-PublishEnvironment.'
         }
     }
 }
