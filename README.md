@@ -59,6 +59,20 @@ Uso rápido:
   durante todo el MSBuild y parece colgada. Con `-Quiet` se calla y solo devuelve
   el resultado.
 
+- Disparo REMOTO (por HTTP, desde otra maquina). Un endpoint que corre en el
+  servidor destino, escucha solo en loopback y se expone por un site de IIS con
+  reverse proxy (hostname + TLS). Es la misma mitad sin privilegios del flujo:
+  escribe la orden y dispara 'Publish Local'. Montaje completo del servidor en
+  `docs/deploy-endpoint.md`. Alta (elevado, una vez):
+
+      .\tools\Register-DeployEndpointTask.ps1 -Port 8770
+
+  y desde el cliente:
+
+      $env:PUBLISHTOIIS_API_TOKEN = '<token del servidor>'
+      Request-RemotePublish -Url https://deployments-76.economitza.com `
+          -Environment devecoesp1 -Branch main_deploy-20260901 -Execute
+
   Piezas sueltas, por si se quiere disparar a mano o desde otro lenguaje:
   `Write-PublishOrder` deja `%ProgramData%\PublishToIIS\publish-order.json`
   (`{"environment":"...","branch":"...","execute":true}`), `schtasks /run /tn
