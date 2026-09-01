@@ -862,6 +862,539 @@ function Update-PublishToIIS {
     Write-Host "Update completado." -ForegroundColor Green
 }
 
+# ─── Endpoint HTTP de despliegue (Fase 3: disparo remoto) ────────────────────
+# Un listener HTTP que corre EN el servidor destino, solo en 127.0.0.1, detrás
+# de un site de IIS que hace reverse proxy (ARR) con hostname + TLS propios
+# (p. ej. https://deployments-76.economitza.com). Es la mitad SIN privilegios
+# del flujo, la misma que Request-Publish: escribe la orden y dispara la tarea
+# elevada 'Publish Local'; todo el trabajo con privilegios lo hace la tarea.
+# Ver docs\deploy-endpoint.md para el montaje completo del servidor.
+
+function Get-DeployEndpointTokenPath {
+    param([string]$DataDir)
+    Join-Path (Get-PublishDataDir -DataDir $DataDir) 'api-token.txt'
+}
+
+function New-DeployEndpointToken {
+    <#
+    .SYNOPSIS
+        Genera el token de API del endpoint y lo deja en %ProgramData%\PublishToIIS\api-token.txt.
+
+    .DESCRIPTION
+        256 bits de RNG criptográfico en hexadecimal. El fichero es la única
+        credencial del endpoint: quien lo tenga puede ordenar despliegues, así
+        que se copia UNA vez al cliente (variable PUBLISHTOIIS_API_TOKEN o
+        remote-api-token.txt) y no viaja por ningún otro canal. Con -Force se
+        rota (el token anterior deja de valer en cuanto el listener se reinicia).
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$DataDir,
+        [switch]$Force
+    )
+    $ErrorActionPreference = 'Stop'
+    $path = Get-DeployEndpointTokenPath -DataDir $DataDir
+    if ((Test-Path $path) -and -not $Force) {
+        throw "Ya existe un token en '$path'. Repite con -Force para rotarlo."
+    }
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $bytes = New-Object byte[] 32
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    $token = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    Set-Content -Path $path -Value $token -Encoding Ascii -NoNewline
+    $token
+}
+
+function Get-DeployEndpointToken {
+    [CmdletBinding()]
+    param([string]$DataDir)
+    $path = Get-DeployEndpointTokenPath -DataDir $DataDir
+    if (-not (Test-Path $path)) {
+        throw "No hay token de API en '$path'. Genera uno con New-DeployEndpointToken."
+    }
+    (Get-Content $path -Raw).Trim()
+}
+
+function Test-DeployEndpointToken {
+    # Comparación en tiempo constante: se comparan los SHA-256 de ambos tokens
+    # byte a byte sin cortocircuito, de modo que el tiempo no dependa de en qué
+    # posición difieren.
+    param([string]$Presented, [string]$Expected)
+    if (-not $Presented -or -not $Expected) { return $false }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $a = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Presented))
+        $b = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Expected))
+    }
+    finally { $sha.Dispose() }
+    $diff = 0
+    for ($i = 0; $i -lt $a.Length; $i++) { $diff = $diff -bor ($a[$i] -bxor $b[$i]) }
+    $diff -eq 0
+}
+
+function Add-DeployQueueItem {
+    <#
+    .SYNOPSIS
+        Encola una orden de despliegue (no publica: la deja en la cola FIFO).
+
+    .DESCRIPTION
+        El endpoint nunca rechaza por "hay otra en marcha": mete cada orden en
+        %ProgramData%\PublishToIIS\queue como un fichero cuyo nombre empieza por
+        timestamp ordenable, de modo que el orden lexicográfico ES el orden de
+        llegada. El drenador (Invoke-DeployQueueDrain) las procesa de una en una.
+        Valida entorno (lista blanca) y rama con las mismas reglas del resto del
+        flujo antes de encolar nada.
+
+    .OUTPUTS
+        PSCustomObject con `runId`, `position` (1 = primera de la cola) y `path`.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Branch,
+        [switch]$Execute,
+        [switch]$OverrideWebconfig,
+        [string[]]$AllowedEnvironments,
+        [string]$DataDir,
+        [string]$RunId = [Guid]::NewGuid().ToString()
+    )
+    $ErrorActionPreference = 'Stop'
+
+    $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+    if ($Environment -notin $allowed) {
+        throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+    }
+    if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
+        throw "Rama con formato inválido: '$Branch'"
+    }
+
+    $qdir = Join-Path (Get-PublishDataDir -DataDir $DataDir) 'queue'
+    if (-not (Test-Path $qdir)) { New-Item -ItemType Directory -Path $qdir -Force | Out-Null }
+    $ahead = @(Get-ChildItem $qdir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+
+    # Orden FIFO por contador persistente, no por reloj: la resolución de
+    # DateTime en Windows (~15 ms) haría colisionar dos altas seguidas y el
+    # tiebreak por runId (aleatorio) romperia el orden de llegada. El contador es
+    # monótono; el listener atiende las peticiones en serie, asi que no compiten.
+    $seqFile = Join-Path $qdir '.seq'
+    $seq = 0
+    if (Test-Path $seqFile) { [void][int]::TryParse((Get-Content $seqFile -Raw).Trim(), [ref]$seq) }
+    $seq++
+    Set-Content $seqFile -Value $seq -Encoding Ascii
+    # El prefijo cero-rellenado ordena lexicográficamente igual que numéricamente.
+    $file = Join-Path $qdir ('{0:000000000000}-{1}.json' -f $seq, $RunId)
+    [pscustomobject]@{
+        environment       = [string]$Environment
+        branch            = [string]$Branch
+        execute           = [bool]$Execute
+        overrideWebconfig = [bool]$OverrideWebconfig
+        runId             = $RunId
+        queuedAt          = (Get-Date).ToString('o')
+        requestedBy       = "$env:USERNAME@$env:COMPUTERNAME"
+    } | ConvertTo-Json -Compress | Set-Content $file -Encoding UTF8
+
+    [pscustomobject]@{ runId = $RunId; position = $ahead + 1; path = $file }
+}
+
+function Get-DeployQueue {
+    # Cola pendiente, en orden de proceso (position 1 = la siguiente en salir).
+    [CmdletBinding()]
+    param([string]$DataDir)
+    $qdir = Join-Path (Get-PublishDataDir -DataDir $DataDir) 'queue'
+    if (-not (Test-Path $qdir)) { return @() }
+    $i = 0
+    Get-ChildItem $qdir -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
+        try { $o = Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return }
+        $i++
+        [pscustomobject]@{
+            position = $i; runId = $o.runId; environment = $o.environment
+            branch = $o.branch; execute = [bool]$o.execute; queuedAt = $o.queuedAt
+        }
+    }
+}
+
+function Get-DeployResult {
+    <#
+    .SYNOPSIS
+        Estado de un despliegue por runId: encolado, en marcha o terminado.
+
+    .DESCRIPTION
+        El drenador escribe results\<runId>.json (status running -> ok/error).
+        Si aún no existe, se busca el runId en la cola para devolver 'queued' con
+        su posición. Null si no se conoce ese runId (404 en el endpoint).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [string]$DataDir
+    )
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $resultFile = Join-Path $dir "results\$RunId.json"
+    if (Test-Path $resultFile) {
+        try { return Get-Content $resultFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+    foreach ($q in (Get-DeployQueue -DataDir $dir)) {
+        if ($q.runId -eq $RunId) {
+            return [pscustomobject]@{
+                status = 'queued'; runId = $RunId; position = $q.position
+                environment = $q.environment; branch = $q.branch
+            }
+        }
+    }
+    $null
+}
+
+function Invoke-DeployQueueDrain {
+    <#
+    .SYNOPSIS
+        Procesa la cola FIFO de despliegues, una orden a la vez.
+
+    .DESCRIPTION
+        Toma la orden más antigua, la marca 'running' en results\<runId>.json,
+        la publica con Request-Publish (que dispara la tarea elevada 'Publish
+        Local' y espera su resultado) y escribe el resultado final. Al ser el
+        único que llama a Request-Publish en la vía remota, serializa los
+        despliegues sin candados: nunca hay dos publicando a la vez. Una orden
+        ilegible se aparta a .bad para no atascar la cola. Poda los resultados
+        de más de 7 días.
+
+    .OUTPUTS
+        Número de órdenes procesadas en esta pasada.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$DataDir,
+        [string]$TaskName = 'Publish Local',
+        [int]$TimeoutSeconds = 1800,
+        # Tope de órdenes por pasada (0 = drenar hasta vaciar). Los tests lo usan.
+        [int]$MaxItems = 0
+    )
+    $ErrorActionPreference = 'Stop'
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $qdir = Join-Path $dir 'queue'
+    $rdir = Join-Path $dir 'results'
+    if (-not (Test-Path $qdir)) { return 0 }
+    if (-not (Test-Path $rdir)) { New-Item -ItemType Directory -Path $rdir -Force | Out-Null }
+
+    $processed = 0
+    while ($true) {
+        $next = Get-ChildItem $qdir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name | Select-Object -First 1
+        if (-not $next) { break }
+
+        try { $order = Get-Content $next.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }
+        catch {
+            Move-Item $next.FullName "$($next.FullName).bad" -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $resultFile = Join-Path $rdir ($order.runId + '.json')
+        [pscustomobject]@{
+            status = 'running'; runId = $order.runId
+            environment = $order.environment; branch = $order.branch
+            startedAt = (Get-Date).ToString('o')
+        } | ConvertTo-Json | Set-Content $resultFile -Encoding UTF8
+
+        try {
+            $res = Request-Publish -Environment ([string]$order.environment) -Branch ([string]$order.branch) `
+                -Execute:([bool]$order.execute) -OverrideWebconfig:([bool]$order.overrideWebconfig) `
+                -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
+            $final = [pscustomobject]@{
+                status = $res.status; message = $res.message; runId = $order.runId
+                environment = $order.environment; branch = $order.branch
+                execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
+            }
+        }
+        catch {
+            $final = [pscustomobject]@{
+                status = 'error'; message = $_.Exception.Message; runId = $order.runId
+                environment = $order.environment; branch = $order.branch
+                execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
+            }
+        }
+        $final | ConvertTo-Json | Set-Content $resultFile -Encoding UTF8
+        Remove-Item $next.FullName -Force -ErrorAction SilentlyContinue
+
+        $processed++
+        if ($MaxItems -gt 0 -and $processed -ge $MaxItems) { break }
+    }
+
+    Get-ChildItem $rdir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    $processed
+}
+
+function Invoke-DeployEndpointRequest {
+    <#
+    .SYNOPSIS
+        Atiende UNA petición del endpoint de despliegue y devuelve la respuesta.
+
+    .DESCRIPTION
+        Función pura (sin sockets) para poder probarla con Pester: recibe método,
+        ruta, query, cuerpo y token presentado, y devuelve un objeto con `status`
+        y `body` (JSON) o `text` (texto plano). Start-DeployEndpoint le pone el
+        HttpListener delante.
+
+        Rutas: GET /health (sin token) · GET /api/environments ·
+        POST /api/publish {environment, branch, execute, overrideWebconfig} →
+        202 con runId; la orden se ENCOLA (nunca se rechaza por otra en marcha) y
+        el drenador la publica cuando le toca · GET /api/result?runId=... (queued
+        / running / ok / error) · GET /api/queue (cola pendiente) ·
+        GET /api/log (cola del transcript de la publicación en curso).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][string]$Path,
+        [hashtable]$Query = @{},
+        [string]$Body = '',
+        [string]$Token = '',
+        [string]$ExpectedToken = '',
+        [string]$DataDir,
+        [string]$TaskName = 'Publish Local'
+    )
+    $ErrorActionPreference = 'Stop'
+    $Method = $Method.ToUpperInvariant()
+
+    if ($Method -eq 'GET' -and $Path -eq '/health') {
+        return [pscustomobject]@{ status = 200; body = @{ ok = $true } }
+    }
+    if (-not (Test-DeployEndpointToken -Presented $Token -Expected $ExpectedToken)) {
+        return [pscustomobject]@{ status = 401; body = @{ error = 'Token ausente o inválido (cabecera X-Api-Token).' } }
+    }
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $logPath = Join-Path $dir 'publish-order.log'
+
+    if ($Method -eq 'GET' -and $Path -eq '/api/environments') {
+        return [pscustomobject]@{ status = 200; body = @{ environments = @(Get-AllowedEnvironments) } }
+    }
+
+    if ($Method -eq 'GET' -and $Path -eq '/api/queue') {
+        return [pscustomobject]@{ status = 200; body = @{ queue = @(Get-DeployQueue -DataDir $dir) } }
+    }
+
+    if ($Method -eq 'POST' -and $Path -eq '/api/publish') {
+        try { $req = $Body | ConvertFrom-Json }
+        catch { return [pscustomobject]@{ status = 400; body = @{ error = 'Cuerpo JSON inválido.' } } }
+        if (-not $req -or -not $req.environment -or -not $req.branch) {
+            return [pscustomobject]@{ status = 400; body = @{ error = "Faltan 'environment' y/o 'branch' en la orden." } }
+        }
+        # Solo un booleano JSON de verdad ejecuta: un string "false" convertido a
+        # [bool] sería $true, así que cualquier otro tipo degrada a dry-run.
+        $execute = ($req.execute -is [bool]) -and $req.execute
+        $override = ($req.overrideWebconfig -is [bool]) -and $req.overrideWebconfig
+        try {
+            $item = Add-DeployQueueItem -Environment ([string]$req.environment) -Branch ([string]$req.branch) `
+                -Execute:$execute -OverrideWebconfig:$override -DataDir $dir
+        }
+        catch {
+            return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
+        }
+        # 202 sin publicar: la orden queda encolada y el drenador la coge cuando
+        # no haya otra en marcha. El cliente sigue el estado por /api/result.
+        return [pscustomobject]@{ status = 202; body = @{
+            status = 'queued'; runId = $item.runId; position = $item.position
+            environment = [string]$req.environment; branch = [string]$req.branch
+            execute = $execute; overrideWebconfig = $override
+            result = "/api/result?runId=$($item.runId)"
+        } }
+    }
+
+    if ($Method -eq 'GET' -and $Path -eq '/api/result') {
+        $runId = [string]$Query['runId']
+        if (-not $runId) {
+            return [pscustomobject]@{ status = 400; body = @{ error = "Falta el parámetro 'runId'." } }
+        }
+        $info = Get-DeployResult -RunId $runId -DataDir $dir
+        if ($null -eq $info) {
+            return [pscustomobject]@{ status = 404; body = @{ error = "runId desconocido: '$runId'." } }
+        }
+        return [pscustomobject]@{ status = 200; body = $info }
+    }
+
+    if ($Method -eq 'GET' -and $Path -eq '/api/log') {
+        if (-not (Test-Path $logPath)) {
+            return [pscustomobject]@{ status = 404; body = @{ error = 'Aún no hay transcript de publicación.' } }
+        }
+        # Mismo share que Write-PublishLogTail: el transcript puede estar abierto
+        # por la tarea en este momento.
+        $fs = [IO.File]::Open($logPath, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                              [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try {
+            $from = [Math]::Max(0, $fs.Length - 65536)
+            [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
+            $reader = New-Object IO.StreamReader($fs)
+            $tail = $reader.ReadToEnd()
+        }
+        finally { $fs.Dispose() }
+        return [pscustomobject]@{ status = 200; text = $tail }
+    }
+
+    [pscustomobject]@{ status = 404; body = @{ error = "Ruta desconocida: $Method $Path" } }
+}
+
+function Start-DeployEndpoint {
+    <#
+    .SYNOPSIS
+        Arranca el listener HTTP del endpoint de despliegue (bloqueante).
+
+    .DESCRIPTION
+        Escucha SOLO en 127.0.0.1: a internet se expone a través del site de IIS
+        que hace reverse proxy con hostname y TLS (ver docs\deploy-endpoint.md).
+        Corre sin privilegios a propósito — lo único que hace es escribir la
+        orden y disparar la tarea elevada 'Publish Local', igual que
+        Request-Publish. Cada petición queda auditada en endpoint.log (fecha,
+        IP de X-Forwarded-For, ruta, status).
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$Port = 8770,
+        [string]$DataDir,
+        [string]$TaskName = 'Publish Local'
+    )
+    $ErrorActionPreference = 'Stop'
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $token = Get-DeployEndpointToken -DataDir $dir
+    $auditPath = Join-Path $dir 'endpoint.log'
+
+    $listener = New-Object Net.HttpListener
+    $prefix = "http://127.0.0.1:$Port/"
+    $listener.Prefixes.Add($prefix)
+    $listener.Start()
+    Write-Host "Endpoint de despliegue escuchando en $prefix (tarea destino: '$TaskName')" -ForegroundColor Green
+
+    try {
+        while ($listener.IsListening) {
+            $ctx = $listener.GetContext()
+            $req = $ctx.Request
+            $res = $ctx.Response
+            try {
+                try {
+                    $body = ''
+                    if ($req.HasEntityBody) {
+                        if ($req.ContentLength64 -gt 65536) { throw 'Cuerpo demasiado grande (máximo 64 KB).' }
+                        $reader = New-Object IO.StreamReader($req.InputStream, [Text.Encoding]::UTF8)
+                        try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                    }
+                    $query = @{}
+                    foreach ($k in $req.QueryString.AllKeys) { if ($k) { $query[$k] = $req.QueryString[$k] } }
+
+                    $out = Invoke-DeployEndpointRequest -Method $req.HttpMethod -Path $req.Url.AbsolutePath `
+                        -Query $query -Body $body -Token ([string]$req.Headers['X-Api-Token']) `
+                        -ExpectedToken $token -DataDir $dir -TaskName $TaskName
+                }
+                catch {
+                    $out = [pscustomobject]@{ status = 500; body = @{ error = $_.Exception.Message } }
+                }
+
+                if ($out.PSObject.Properties['text'] -and $null -ne $out.text) {
+                    $bytes = [Text.Encoding]::UTF8.GetBytes([string]$out.text)
+                    $res.ContentType = 'text/plain; charset=utf-8'
+                }
+                else {
+                    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $out.body -Depth 5))
+                    $res.ContentType = 'application/json; charset=utf-8'
+                }
+                $res.StatusCode = $out.status
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+            finally { $res.Close() }
+
+            # Auditoría: la IP real del cliente llega en X-Forwarded-For (la pone ARR)
+            $ip = [string]$req.Headers['X-Forwarded-For']
+            if (-not $ip) { $ip = $req.RemoteEndPoint.Address.ToString() }
+            "$((Get-Date).ToString('s')) | $ip | $($req.HttpMethod) $($req.RawUrl) | $($out.status)" |
+                Add-Content $auditPath -Encoding UTF8
+        }
+    }
+    finally {
+        $listener.Stop()
+        $listener.Close()
+    }
+}
+
+function Request-RemotePublish {
+    <#
+    .SYNOPSIS
+        Pide una publicación a un servidor remoto a través de su endpoint HTTP.
+
+    .DESCRIPTION
+        Es el Request-Publish de larga distancia: POST a /api/publish del
+        endpoint (p. ej. https://deployments-76.economitza.com) y sondeo de
+        /api/result hasta el desenlace. El token sale de -Token o de la
+        variable de entorno PUBLISHTOIIS_API_TOKEN.
+
+    .EXAMPLE
+        Request-RemotePublish -Url https://deployments-76.economitza.com -Environment devecoesp1 -Branch main_deploy-20260901 -Execute
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Branch,
+        [switch]$Execute,
+        [switch]$OverrideWebconfig,
+        [string]$Token,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 1200,
+        [int]$PollSeconds = 5
+    )
+    $ErrorActionPreference = 'Stop'
+
+    if (-not $Token) { $Token = $env:PUBLISHTOIIS_API_TOKEN }
+    if (-not $Token) {
+        throw 'Sin token: pásalo con -Token o define PUBLISHTOIIS_API_TOKEN (es el api-token.txt del servidor).'
+    }
+    $Url = $Url.TrimEnd('/')
+    $headers = @{ 'X-Api-Token' = $Token }
+    $payload = @{
+        environment = $Environment; branch = $Branch
+        execute = [bool]$Execute; overrideWebconfig = [bool]$OverrideWebconfig
+    } | ConvertTo-Json -Compress
+
+    try {
+        $trig = Invoke-RestMethod -Method Post -Uri "$Url/api/publish" -Headers $headers `
+            -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($payload))
+    }
+    catch {
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "El endpoint rechazó la orden: $detail"
+    }
+    $pos = if ($trig.position -gt 1) { " (posición $($trig.position) en la cola)" } else { '' }
+    Write-Host "Orden encolada (runId $($trig.runId))$pos. La publicación corre en el servidor." -ForegroundColor Gray
+    if ($NoWait) { return $trig }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastStatus = ''
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $PollSeconds
+        try {
+            $result = Invoke-RestMethod -Method Get -Uri "$Url/api/result?runId=$($trig.runId)" -Headers $headers
+        }
+        catch { continue } # un poll fallido (red, proxy reciclando) no aborta la espera
+        if ($result.status -eq 'ok' -or $result.status -eq 'error') {
+            $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
+            Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
+            return $result
+        }
+        # queued / running: eco del cambio de estado sin spamear cada poll
+        if ($result.status -ne $lastStatus) {
+            $lastStatus = $result.status
+            $detalle = if ($result.status -eq 'queued') { " (posición $($result.position))" } else { '' }
+            Write-Host "  ...$($result.status)$detalle" -ForegroundColor DarkGray
+        }
+    }
+    throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $($trig.runId)). Mira $Url/api/log con el token."
+}
+
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain -Alias Publish-Update

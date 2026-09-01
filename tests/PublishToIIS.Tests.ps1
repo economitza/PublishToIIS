@@ -370,6 +370,206 @@ Describe 'Request-Publish' {
     }
 }
 
+Describe 'Endpoint de despliegue' {
+    BeforeEach {
+        $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_ep_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:dataDir | Out-Null
+        $script:token = 'a' * 64
+    }
+
+    AfterEach {
+        Remove-Item $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Context 'token' {
+        It 'genera un token de 64 hex y lo persiste' {
+            $t = New-DeployEndpointToken -DataDir $script:dataDir
+            $t | Should -Match '^[0-9a-f]{64}$'
+            (Get-DeployEndpointToken -DataDir $script:dataDir) | Should -Be $t
+        }
+
+        It 'no sobrescribe un token existente sin -Force' {
+            New-DeployEndpointToken -DataDir $script:dataDir | Out-Null
+            { New-DeployEndpointToken -DataDir $script:dataDir } | Should -Throw '*Ya existe*'
+        }
+
+        It 'con -Force rota el token' {
+            $a = New-DeployEndpointToken -DataDir $script:dataDir
+            $b = New-DeployEndpointToken -DataDir $script:dataDir -Force
+            $a | Should -Not -Be $b
+        }
+
+        It 'valida el token correcto y rechaza el incorrecto (y el vacío)' {
+            InModuleScope PublishToIIS {
+                (Test-DeployEndpointToken -Presented 'secreto' -Expected 'secreto') | Should -BeTrue
+                (Test-DeployEndpointToken -Presented 'malo' -Expected 'secreto') | Should -BeFalse
+                (Test-DeployEndpointToken -Presented '' -Expected 'secreto') | Should -BeFalse
+            }
+        }
+    }
+
+    Context 'Invoke-DeployEndpointRequest' {
+        It '/health responde 200 sin token' {
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/health' -DataDir $script:dataDir
+            $r.status | Should -Be 200
+            $r.body.ok | Should -BeTrue
+        }
+
+        It 'rechaza con 401 cualquier ruta protegida sin token válido' {
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/environments' `
+                -Token 'malo' -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 401
+        }
+
+        It 'lista los entornos permitidos con token válido' {
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/environments' `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 200
+            $r.body.environments | Should -Contain 'devecoesp1'
+            $r.body.environments | Should -Not -Contain 'prod'
+        }
+
+        It 'POST /api/publish encola, devuelve 202 queued con runId y posición 1' {
+            $body = '{"environment":"devecoesp1","branch":"main_deploy-20260901","execute":true}'
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 202
+            $r.body.status | Should -Be 'queued'
+            $r.body.runId | Should -Not -BeNullOrEmpty
+            $r.body.position | Should -Be 1
+            $r.body.execute | Should -BeTrue
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 1
+        }
+
+        It 'un execute que no es booleano degrada a dry-run' {
+            $body = '{"environment":"devecoesp1","branch":"main","execute":"true"}'
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.body.execute | Should -BeFalse
+            (Get-DeployQueue -DataDir $script:dataDir)[0].execute | Should -BeFalse
+        }
+
+        It 'rechaza con 400 una rama con formato inválido, sin encolar nada' {
+            $body = '{"environment":"devecoesp1","branch":"main;otra"}'
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 400
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 0
+        }
+
+        It 'rechaza con 400 un entorno fuera de la lista blanca (prod), sin encolar' {
+            $body = '{"environment":"prod","branch":"main"}'
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 400
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 0
+        }
+
+        It 'una segunda orden NO se rechaza: se encola en posición 2' {
+            $body = '{"environment":"devecoesp1","branch":"main"}'
+            Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir | Out-Null
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 202
+            $r.body.position | Should -Be 2
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 2
+        }
+
+        It '/api/queue lista la cola pendiente en orden' {
+            Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'rama-a' -DataDir $script:dataDir | Out-Null
+            Add-DeployQueueItem -Environment 'devecoand1' -Branch 'rama-b' -DataDir $script:dataDir | Out-Null
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/queue' `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 200
+            $r.body.queue[0].branch | Should -Be 'rama-a'
+            $r.body.queue[1].branch | Should -Be 'rama-b'
+        }
+
+        It '/api/result devuelve el resultado terminado por runId' {
+            New-Item -ItemType Directory -Path (Join-Path $script:dataDir 'results') -Force | Out-Null
+            '{"status":"ok","runId":"xyz","message":"hecho"}' |
+                Set-Content (Join-Path $script:dataDir 'results\xyz.json') -Encoding UTF8
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/result' -Query @{ runId = 'xyz' } `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 200
+            $r.body.message | Should -Be 'hecho'
+        }
+
+        It '/api/result devuelve queued si la orden sigue en la cola' {
+            $item = Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'main' -DataDir $script:dataDir
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/result' -Query @{ runId = $item.runId } `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 200
+            $r.body.status | Should -Be 'queued'
+            $r.body.position | Should -Be 1
+        }
+
+        It '/api/result devuelve 404 para un runId desconocido' {
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/result' -Query @{ runId = 'nada' } `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 404
+        }
+
+        It 'una ruta desconocida devuelve 404' {
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/loquesea' `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 404
+        }
+    }
+
+    Context 'cola FIFO (Add / Get / Drain)' {
+        It 'Add valida entorno y rama antes de encolar' {
+            { Add-DeployQueueItem -Environment 'prod' -Branch 'main' -DataDir $script:dataDir } | Should -Throw '*no permitido*'
+            { Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'main;otra' -DataDir $script:dataDir } | Should -Throw '*inválido*'
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 0
+        }
+
+        It 'conserva el orden de llegada (FIFO) aunque se encolen seguidas' {
+            foreach ($b in 'a', 'b', 'c', 'd', 'e') {
+                Add-DeployQueueItem -Environment 'devecoesp1' -Branch $b -DataDir $script:dataDir | Out-Null
+            }
+            (Get-DeployQueue -DataDir $script:dataDir).branch | Should -Be @('a', 'b', 'c', 'd', 'e')
+        }
+
+        It 'Drain procesa la cola de una en una, escribe resultados y la vacía' {
+            Mock -ModuleName PublishToIIS Request-Publish { [pscustomobject]@{ status = 'ok'; message = 'mock' } }
+            $ids = @()
+            foreach ($b in 'uno', 'dos', 'tres') {
+                $ids += (Add-DeployQueueItem -Environment 'devecoesp1' -Branch $b -Execute -DataDir $script:dataDir).runId
+            }
+            $n = Invoke-DeployQueueDrain -DataDir $script:dataDir
+            $n | Should -Be 3
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 0
+            Should -Invoke -ModuleName PublishToIIS Request-Publish -Times 3
+            foreach ($id in $ids) {
+                (Get-DeployResult -RunId $id -DataDir $script:dataDir).status | Should -Be 'ok'
+            }
+        }
+
+        It 'Drain marca error el runId si la publicación lanza, y sigue con el resto' {
+            Mock -ModuleName PublishToIIS Request-Publish { throw 'boom' }
+            $id = (Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'x' -Execute -DataDir $script:dataDir).runId
+            Invoke-DeployQueueDrain -DataDir $script:dataDir | Out-Null
+            $res = Get-DeployResult -RunId $id -DataDir $script:dataDir
+            $res.status | Should -Be 'error'
+            $res.message | Should -Be 'boom'
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 0
+        }
+
+        It 'Drain aparta una orden ilegible a .bad sin atascarse' {
+            Mock -ModuleName PublishToIIS Request-Publish { [pscustomobject]@{ status = 'ok'; message = 'mock' } }
+            $qdir = Join-Path $script:dataDir 'queue'
+            New-Item -ItemType Directory -Path $qdir -Force | Out-Null
+            'esto no es json' | Set-Content (Join-Path $qdir '000000000001-corrupta.json') -Encoding UTF8
+            $good = (Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'buena' -Execute -DataDir $script:dataDir).runId
+            Invoke-DeployQueueDrain -DataDir $script:dataDir | Out-Null
+            (Get-ChildItem $qdir -Filter '*.bad').Count | Should -Be 1
+            (Get-DeployResult -RunId $good -DataDir $script:dataDir).status | Should -Be 'ok'
+        }
+    }
+}
+
 Describe 'Get-PublishToIISRepo' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_repo_" + [Guid]::NewGuid())
