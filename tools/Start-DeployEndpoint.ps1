@@ -6,7 +6,8 @@
 [CmdletBinding()]
 param(
     [int]$Port = 8770,
-    [string]$TaskName = 'Publish Local'
+    [string]$TaskName = 'Publish Local',
+    [string]$DrainerTaskName = 'Publish Queue Drainer'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -15,7 +16,7 @@ $auditPath = Join-Path (Join-Path $env:ProgramData 'PublishToIIS') 'endpoint.log
 
 while ($true) {
     try {
-        Start-DeployEndpoint -Port $Port -TaskName $TaskName
+        Start-DeployEndpoint -Port $Port -TaskName $TaskName -DrainerTaskName $DrainerTaskName
         "$((Get-Date).ToString('s')) | - | listener termino sin error; relanzando" |
             Add-Content $auditPath -Encoding UTF8 -ErrorAction SilentlyContinue
     }

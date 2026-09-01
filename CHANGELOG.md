@@ -6,6 +6,13 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.4.5] - 2026-09-01
+
+### Fixed
+- `Start-DeployEndpoint.ps1` (el script de la tarea) no aceptaba `-DrainerTaskName`,
+  que la tarea sí le pasaba desde 0.4.4: el proceso salía con código 1 y el endpoint
+  no arrancaba (task en Ready, puerto rechazado). Ahora lo declara y lo reenvía.
+
 ## [0.4.4] - 2026-09-01
 
 ### Added
