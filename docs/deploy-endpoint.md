@@ -76,21 +76,32 @@ ya debe estar registrada (`Register-PublishTask -Unattended`).
 
    Comprobacion: `Test-DeployEndpoint` -> `Endpoint OK en http://127.0.0.1:8770/health`.
 
-3. **Site de IIS + reverse proxy** (a mano en IIS Manager o por `appcmd`):
-   - Site nuevo con binding **http** `deployments-76.economitza.com:80` (lo pide
-     win-acme para validar) y **https** `deployments-76.economitza.com:443` con
-     **SNI activado**.
-   - Certificado: `wacs.exe` (win-acme) para ese hostname; configura el binding
-     443 y la renovacion.
-   - Regla de URL Rewrite en ese site: reenviar todo a
-     `http://127.0.0.1:8770/{R:1}`, con ARR proxy activado. La IP real del
-     cliente llega en `X-Forwarded-For` (ARR la añade) — es lo que el listener
-     apunta en `endpoint.log`.
+3. **Site de IIS + reverse proxy**, tambien en una instruccion (elevado, requiere
+   URL Rewrite + ARR instalados):
 
-4. **Autenticacion en el borde**: ademas del token, restringir por IP en ese
-   site (IIS -> IP Address and Domain Restrictions) a la IP de origen del
-   despliegue si es estable. El firewall no sirve para esto porque 443 esta
-   abierto en global.
+   ```powershell
+   Register-DeployProxySite -HostName deployments-76.economitza.com
+   # con restriccion por IP y copiando el cert de otro site:
+   Register-DeployProxySite -HostName deployments-76.economitza.com -RestrictToIp <tu-ip> -FromSite devecoesp1
+   ```
+
+   Habilita el proxy de ARR, deja el `web.config` con la regla que reenvia todo a
+   `http://127.0.0.1:8770/{R:1}`, crea el site con binding http:80 y **reusa el
+   certificado** que ya cubra el host para el https:443 (ver punto siguiente).
+   `-DryRun` muestra el plan sin tocar IIS. La IP real del cliente llega en
+   `X-Forwarded-For` (ARR la añade) — es lo que el listener apunta en `endpoint.log`.
+
+4. **Certificado: se reusa el que ya tienes, no hace falta uno nuevo.** Si en el
+   servidor ya sirve un **wildcard `*.economitza.com`** (el que usan
+   `devecoesp1.economitza.com` y compania), cubre `deployments-76.economitza.com`
+   y `Register-DeployProxySite` lo enlaza solo al binding https:443. Un cert de un
+   solo host (p. ej. solo `devecoesp1`) NO cubre `deployments-76`: ahi si haria
+   falta un wildcard o uno que incluya el host (via win-acme, que el script indica
+   como fallback si no encuentra ninguno que sirva).
+
+5. **Autenticacion en el borde**: ademas del token, `-RestrictToIp` limita el site
+   a la IP de origen del despliegue (IIS IP Address and Domain Restrictions). El
+   firewall no sirve para esto porque 443 esta abierto en global.
 
 ## Uso desde el cliente
 

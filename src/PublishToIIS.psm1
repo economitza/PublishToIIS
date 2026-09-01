@@ -1454,6 +1454,48 @@ function Test-DeployEndpoint {
     }
 }
 
+function Register-DeployProxySite {
+    <#
+    .SYNOPSIS
+        Crea el site IIS reverse-proxy que expone el endpoint, en una llamada.
+
+    .DESCRIPTION
+        Envoltorio de tools\Register-DeployProxySite.ps1 (localiza el repo con
+        Get-PublishToIISRepo y se auto-eleva por UAC): habilita ARR, deja el
+        web.config con la regla de reescritura al listener y el site con binding
+        http:80, y **reusa el certificado** que ya cubra el host (el wildcard
+        *.economitza.com que ya sirve otros sites) para el https:443 — no saca uno
+        nuevo. Requiere URL Rewrite + ARR instalados.
+
+    .EXAMPLE
+        Register-DeployProxySite -HostName deployments-76.economitza.com
+    .EXAMPLE
+        Register-DeployProxySite -HostName deployments-76.economitza.com -FromSite devecoesp1 -RestrictToIp 88.1.2.3
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [int]$Port = 8770,
+        [string]$SiteName = 'deployments-endpoint',
+        [string]$RestrictToIp,
+        [string]$CertThumbprint,
+        [string]$FromSite,
+        [switch]$DryRun,
+        [string]$RepoPath
+    )
+    $repo = Get-PublishToIISRepo -RepoPath $RepoPath
+    $script = Join-Path $repo 'tools\Register-DeployProxySite.ps1'
+    if (-not (Test-Path $script)) {
+        throw "No se encontró $script. Actualiza el repo (Update-PublishToIIS) para traer las tools del endpoint."
+    }
+    $splat = @{ HostName = $HostName; Port = $Port; SiteName = $SiteName }
+    if ($RestrictToIp)   { $splat.RestrictToIp = $RestrictToIp }
+    if ($CertThumbprint) { $splat.CertThumbprint = $CertThumbprint }
+    if ($FromSite)       { $splat.FromSite = $FromSite }
+    if ($DryRun)         { $splat.DryRun = $true }
+    & $script @splat
+}
+
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite -Alias Publish-Update

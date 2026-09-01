@@ -643,6 +643,32 @@ Describe 'Register-DeployEndpoint' {
     }
 }
 
+Describe 'Register-DeployProxySite' {
+    It 'localiza el repo y ejecuta el script del site pasando el hostname' {
+        $fakeRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_ps_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $fakeRepo 'tools') -Force | Out-Null
+        $marker = Join-Path $fakeRepo 'called.txt'
+        Set-Content (Join-Path $fakeRepo 'tools\Register-DeployProxySite.ps1') `
+            "param([string]`$HostName,[int]`$Port,[string]`$SiteName,[string]`$RestrictToIp,[string]`$CertThumbprint,[string]`$FromSite,[switch]`$DryRun,[switch]`$NonInteractive) `$HostName + '|' + `$Port | Set-Content '$marker'"
+        try {
+            Mock -ModuleName PublishToIIS Get-PublishToIISRepo { $fakeRepo }
+            Register-DeployProxySite -HostName 'deployments-76.economitza.com' -DryRun
+            (Get-Content $marker -Raw).Trim() | Should -Be 'deployments-76.economitza.com|8770'
+        }
+        finally { Remove-Item $fakeRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'falla con mensaje accionable si el repo no trae el script del site' {
+        $bareRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_ps_bare_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $bareRepo -Force | Out-Null
+        try {
+            Mock -ModuleName PublishToIIS Get-PublishToIISRepo { $bareRepo }
+            { Register-DeployProxySite -HostName 'x.economitza.com' } | Should -Throw '*Update-PublishToIIS*'
+        }
+        finally { Remove-Item $bareRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

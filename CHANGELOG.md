@@ -6,6 +6,17 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.4.2] - 2026-09-01
+
+### Added
+- `Register-DeployProxySite`: crea el site IIS reverse-proxy del endpoint en una
+  llamada (ARR + web.config con la regla de reescritura + binding http:80) y
+  **reusa el certificado** que ya cubra el host (el wildcard `*.economitza.com`)
+  para el https:443, sin sacar uno nuevo; `-FromSite`/`-CertThumbprint`/`-RestrictToIp`/`-DryRun`.
+
+### Fixed
+- docs: aclarado que el DNS del endpoint va en AWS Route 53, no en Webempresa.
+
 ## [0.4.1] - 2026-09-01
 
 ### Added
