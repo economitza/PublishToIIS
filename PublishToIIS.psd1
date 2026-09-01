@@ -6,7 +6,7 @@
     CompanyName = 'Economitza'
     Copyright = '(c) 2026 Economitza'
     Description = 'PublishToIIS - helper module to publish .NET projects to IIS with safe swap'
-    FunctionsToExport = @('Publish','Get-MSBuild','Get-PublishConfig','Update-PublishToIIS','Protect-ProductionWebConfig','New-DeployInfo','Invoke-DeployOrder','Read-PublishOrder','Write-PublishOrder','Wait-PublishResult','Request-Publish','Get-PublishToIISRepo','Register-PublishTask','New-DeployEndpointToken','Get-DeployEndpointToken','Invoke-DeployEndpointRequest','Start-DeployEndpoint','Request-RemotePublish','Add-DeployQueueItem','Get-DeployQueue','Get-DeployResult','Invoke-DeployQueueDrain','Register-DeployEndpoint','Test-DeployEndpoint','Register-DeployProxySite')
+    FunctionsToExport = @('Publish','Get-MSBuild','Get-PublishConfig','Update-PublishToIIS','Protect-ProductionWebConfig','New-DeployInfo','Invoke-DeployOrder','Read-PublishOrder','Write-PublishOrder','Wait-PublishResult','Request-Publish','Get-PublishToIISRepo','Register-PublishTask','New-DeployEndpointToken','Get-DeployEndpointToken','Invoke-DeployEndpointRequest','Start-DeployEndpoint','Request-RemotePublish','Add-DeployQueueItem','Get-DeployQueue','Get-DeployResult','Invoke-DeployQueueDrain','Register-DeployEndpoint','Test-DeployEndpoint','Register-DeployProxySite','Set-DeployToken','Get-DeployToken','Get-DeployServerUrl','Register-Dashboard')
     CmdletsToExport = @()
     VariablesToExport = @()
     AliasesToExport = @('Publish-Update')

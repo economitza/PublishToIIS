@@ -33,31 +33,46 @@ _ssl_ctx.verify_mode = ssl.CERT_NONE  # entornos de test con certificados intern
 
 def load_environments():
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    servers = cfg.get("servers", {})
     envs = []
     for name, env in cfg.get("environments", {}).items():
-        endpoint_url = env.get("endpointUrl", "")
+        server = env.get("server", "")
+        # endpointUrl se resuelve del servidor referenciado (o el legacy por entorno).
+        endpoint_url = env.get("endpointUrl", "") or servers.get(server, {}).get("endpointUrl", "")
         local_origin = Path(env.get("origin", "")).exists()
+        is_local = endpoint_url.startswith("http://127.0.0.1") or endpoint_url.startswith("http://localhost")
         envs.append({
             "name": name,
             "origin": env.get("origin", ""),
             "destination": env.get("destination", ""),
             "siteUrl": env.get("siteUrl", ""),
-            "serverName": env.get("serverName", ""),
+            "server": server,
+            "serverName": env.get("serverName", "") or server,
             "responsable": env.get("responsable", ""),
             "endpointUrl": endpoint_url,
             "localOrigin": local_origin,
-            # Publicable de dos formas: en local (origin en esta máquina) o
-            # remoto (el entorno declara el endpoint HTTP de su servidor).
-            "remote": bool(endpoint_url),
-            "publishable": bool(endpoint_url) or local_origin,
+            # Todo se publica por endpoint (el dashboard es cliente puro, sin
+            # privilegios). 'local' = el endpoint del propio equipo (loopback);
+            # 'remote' = un servidor de test. Solo distingue orden y estilo en la UI.
+            "local": is_local,
+            "remote": bool(endpoint_url) and not is_local,
+            "publishable": bool(endpoint_url),
         })
     return envs
 
 
-def resolve_api_token():
-    """Token del endpoint remoto, para el dashboard (que corre en el portátil).
-    Por orden: variable PUBLISHTOIIS_API_TOKEN o un fichero remote-api-token.txt
-    junto al dashboard. Es la misma credencial que se copió del servidor."""
+def resolve_api_token(server):
+    """Token del endpoint del servidor `server`, del registro por servidor en
+    %ProgramData%\\PublishToIIS\\tokens\\<server>.txt. Compat: variable de entorno
+    y fichero legacy remote-api-token.txt (token único)."""
+    store = Path(os.environ.get("ProgramData", "")) / "PublishToIIS" / "tokens" / f"{server}.txt"
+    try:
+        if store.exists():
+            t = store.read_text(encoding="utf-8").strip()
+            if t:
+                return t
+    except Exception:
+        pass
     tok = os.environ.get("PUBLISHTOIIS_API_TOKEN")
     if tok:
         return tok.strip()
@@ -139,9 +154,9 @@ def list_branches(repo):
 
 
 def publish(env_name, branch):
-    """Publica la rama en el entorno: remoto (por el endpoint HTTP del servidor)
-    si el entorno declara endpointUrl, o local (checkout + Publish del módulo) si
-    el origin está en esta máquina."""
+    """Publica la rama en el entorno SIEMPRE por el endpoint HTTP de su servidor:
+    el dashboard es un cliente sin privilegios: no hace checkout ni swap, solo pide
+    al endpoint (local del propio equipo o remoto) que lo haga."""
     envs = {e["name"]: e for e in load_environments()}
     env = envs.get(env_name)
     if not env:
@@ -152,23 +167,21 @@ def publish(env_name, branch):
     if not re.match(r"^[A-Za-z0-9._/+\-]+$", branch or ""):
         return 400, {"error": f"Rama con formato inválido: '{branch}'"}
 
-    if env["remote"]:
-        return publish_remote(env, branch)
-    if not env["localOrigin"]:
-        return 501, {"error": "origin no accesible y sin endpointUrl: configura endpointUrl "
-                              "para publicar por el endpoint remoto del servidor"}
-    return publish_local(env_name, branch)
+    if not env["endpointUrl"]:
+        return 501, {"error": f"El entorno '{env_name}' no tiene servidor/endpoint configurado: "
+                              "revisa su 'server' y la sección 'servers' del config."}
+    return publish_via_endpoint(env, branch)
 
 
-def publish_remote(env, branch):
-    """Dispara la publicación en el servidor por su endpoint HTTP. Reutiliza
-    Request-RemotePublish (encola en el endpoint y sondea el resultado); el token
-    viaja al proceso hijo por variable de entorno, no en la línea de comando."""
-    token = resolve_api_token()
+def publish_via_endpoint(env, branch):
+    """POST al endpoint del servidor del entorno (encola y sondea) vía
+    Request-RemotePublish. El token —el del servidor referenciado, del registro por
+    servidor— viaja al proceso hijo por variable de entorno, no en la línea de comando."""
+    server = env["server"]
+    token = resolve_api_token(server)
     if not token:
-        return 400, {"error": "sin token de API para el despliegue remoto: define "
-                              "PUBLISHTOIIS_API_TOKEN o crea dashboard\\remote-api-token.txt "
-                              "con el token que dio el servidor."}
+        return 400, {"error": f"Sin token para el servidor '{server}'. Regístralo con: "
+                              f"Set-DeployToken -Server {server}"}
     module = str(ROOT.parent / "PublishToIIS.psd1")
     url = env["endpointUrl"]
     ps = (f"$ErrorActionPreference='Stop'; "
@@ -179,34 +192,8 @@ def publish_remote(env, branch):
                        capture_output=True, text=True, timeout=1800, env=child_env)
     out = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
     if r.returncode != 0:
-        return 500, {"error": f"Despliegue remoto de '{env['name']}' falló",
+        return 500, {"error": f"Publish de '{env['name']}' (servidor '{server}') falló",
                      "detail": (out or "(el proceso no devolvió salida)")[-4000:]}
-    return 200, {"ok": True, "output": out[-4000:]}
-
-
-def publish_local(env_name, branch):
-    """Publish local: checkout de la rama en el origin y Publish del módulo.
-    Requiere que este servidor corra elevado (el swap de IIS lo necesita)."""
-    module = str(ROOT.parent / "PublishToIIS.psd1")
-    ps = (f"$ErrorActionPreference='Stop'; "
-          f"Import-Module '{module}' -Force; "
-          f"Invoke-DeployOrder -Environment '{env_name}' -Branch '{branch}' -Execute")
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                       capture_output=True, text=True, timeout=1800)
-    out = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
-
-    if r.returncode != 0:
-        detail = out or "(el proceso no devolvió salida)"
-        low = detail.lower()
-        if "administrator" in low or "administrador" in low:
-            detail += ("\n\n>>> ACCIÓN: el publish necesita privilegios de administrador "
-                       "(parar el app pool y swap de IIS) y el dashboard corre sin elevar. "
-                       "Arranca el servidor desde una consola 'Ejecutar como administrador', "
-                       "o configura la tarea 'Publish Dashboard' con privilegios elevados.")
-        elif "did not match" in low or "no fast-forward" in low or "ff-only" in low:
-            detail += ("\n\n>>> ACCIÓN: la rama local del repo diverge del remoto; "
-                       "resuélvela a mano (o elige otra rama) antes de reintentar.")
-        return 500, {"error": f"Publish de '{env_name}' falló", "detail": detail[-4000:]}
     return 200, {"ok": True, "output": out[-4000:]}
 
 

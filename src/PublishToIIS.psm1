@@ -1256,7 +1256,11 @@ function Start-DeployEndpoint {
     param(
         [int]$Port = 8770,
         [string]$DataDir,
-        [string]$TaskName = 'Publish Local'
+        [string]$TaskName = 'Publish Local',
+        # Tarea que drena la cola: se dispara al encolar (bajo demanda), en vez de
+        # tener un proceso sondeando. Consumo en reposo: solo este listener,
+        # bloqueado en GetContext (~0 CPU).
+        [string]$DrainerTaskName = 'Publish Queue Drainer'
     )
     $ErrorActionPreference = 'Stop'
 
@@ -1329,12 +1333,91 @@ function Start-DeployEndpoint {
                     Add-Content $auditPath -Encoding UTF8
             }
             catch { }
+
+            # Orden encolada (202): disparar el drenador bajo demanda. No hay proceso
+            # sondeando; el drenador procesa y termina. Su MultipleInstances=Queue
+            # cubre las órdenes que lleguen mientras drena.
+            if ($status -eq 202) {
+                try { Start-PublishTask -TaskName $DrainerTaskName -DataDir $dir }
+                catch {
+                    "$((Get-Date).ToString('s')) | - | no se pudo disparar el drenador '$DrainerTaskName': $($_.Exception.Message)" |
+                        Add-Content $auditPath -Encoding UTF8 -ErrorAction SilentlyContinue
+                }
+            }
         }
     }
     finally {
         $listener.Stop()
         $listener.Close()
     }
+}
+
+function Get-DeployTokenStorePath {
+    param([Parameter(Mandatory)][string]$Server, [string]$DataDir)
+    Join-Path (Join-Path (Get-PublishDataDir -DataDir $DataDir) 'tokens') ($Server + '.txt')
+}
+
+function Set-DeployToken {
+    <#
+    .SYNOPSIS
+        Guarda el token del endpoint de un servidor de publicación, por su nombre.
+
+    .DESCRIPTION
+        Registro del CLIENTE en %ProgramData%\PublishToIIS\tokens\<server>.txt
+        (fuera de git). Con N servidores, cada uno tiene su token: el dashboard y
+        Request-RemotePublish lo resuelven por el `server` de cada entorno. Sin
+        -Token se pide por consola.
+
+    .EXAMPLE
+        Set-DeployToken -Server deployments-76 -Token 1a2b...
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Server,
+        [string]$Token,
+        [string]$DataDir
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not $Token) { $Token = (Read-Host "Token del endpoint de '$Server'").Trim() }
+    if (-not $Token) { throw 'Token vacío.' }
+    $path = Get-DeployTokenStorePath -Server $Server -DataDir $DataDir
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -Path $path -Value $Token -Encoding Ascii -NoNewline
+    Write-Host "Token de '$Server' guardado en $path" -ForegroundColor Green
+}
+
+function Get-DeployToken {
+    <#
+    .SYNOPSIS
+        Token del endpoint de un servidor (del registro por servidor).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Server, [string]$DataDir)
+    $path = Get-DeployTokenStorePath -Server $Server -DataDir $DataDir
+    if (Test-Path $path) {
+        $t = (Get-Content $path -Raw).Trim()
+        if ($t) { return $t }
+    }
+    # Compat: token único legacy en la variable de entorno.
+    if ($env:PUBLISHTOIIS_API_TOKEN) { return $env:PUBLISHTOIIS_API_TOKEN.Trim() }
+    $null
+}
+
+function Get-DeployServerUrl {
+    <#
+    .SYNOPSIS
+        endpointUrl de un servidor, leído de la sección `servers` de environments.json.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Server)
+    $cfgFile = Join-Path $PSScriptRoot '..\config\environments.json'
+    $cfg = Get-Content $cfgFile -Raw | ConvertFrom-Json
+    $srv = $cfg.servers.$Server
+    if (-not $srv -or -not $srv.endpointUrl) {
+        throw "El servidor '$Server' no está en la sección 'servers' de environments.json."
+    }
+    $srv.endpointUrl
 }
 
 function Request-RemotePublish {
@@ -1353,7 +1436,10 @@ function Request-RemotePublish {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Url,
+        # Servidor de publicación (sección `servers` del config): de él se resuelven
+        # la URL del endpoint y el token registrado. Alternativa a pasar -Url/-Token.
+        [string]$Server,
+        [string]$Url,
         [Parameter(Mandatory)][string]$Environment,
         [Parameter(Mandatory)][string]$Branch,
         [switch]$Execute,
@@ -1365,9 +1451,14 @@ function Request-RemotePublish {
     )
     $ErrorActionPreference = 'Stop'
 
+    if ($Server) {
+        if (-not $Url)   { $Url = Get-DeployServerUrl -Server $Server }
+        if (-not $Token) { $Token = Get-DeployToken -Server $Server }
+    }
+    if (-not $Url) { throw 'Falta -Url o -Server (para resolver la URL del endpoint).' }
     if (-not $Token) { $Token = $env:PUBLISHTOIIS_API_TOKEN }
     if (-not $Token) {
-        throw 'Sin token: pásalo con -Token o define PUBLISHTOIIS_API_TOKEN (es el api-token.txt del servidor).'
+        throw "Sin token: pásalo con -Token, o usa -Server <nombre> con el token registrado (Set-DeployToken -Server <nombre>), o define PUBLISHTOIIS_API_TOKEN."
     }
     $Url = $Url.TrimEnd('/')
     $headers = @{ 'X-Api-Token' = $Token }
@@ -1512,6 +1603,31 @@ function Register-DeployProxySite {
     & $script @splat
 }
 
+function Register-Dashboard {
+    <#
+    .SYNOPSIS
+        Registra el dashboard como servicio: tarea 'Publish Dashboard', cliente
+        SIN privilegios, headless (pythonw, sin consola), que arranca con Windows.
+
+    .DESCRIPTION
+        Envoltorio de tools\Register-DashboardTask.ps1 (localiza el repo y se
+        auto-eleva por UAC solo para registrar). Quita la dependencia de tener una
+        consola PowerShell abierta: el dashboard pasa a ser un cliente que solo
+        toca los endpoints, sin elevación.
+
+    .EXAMPLE
+        Register-Dashboard
+    #>
+    [CmdletBinding()]
+    param([int]$Port = 8765, [string]$RepoPath)
+    $repo = Get-PublishToIISRepo -RepoPath $RepoPath
+    $script = Join-Path $repo 'tools\Register-DashboardTask.ps1'
+    if (-not (Test-Path $script)) {
+        throw "No se encontró $script. Actualiza el repo (Update-PublishToIIS)."
+    }
+    & $script -Port $Port
+}
+
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard -Alias Publish-Update

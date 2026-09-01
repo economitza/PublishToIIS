@@ -669,6 +669,62 @@ Describe 'Register-DeployProxySite' {
     }
 }
 
+Describe 'Tokens por servidor y Get-DeployServerUrl' {
+    BeforeEach {
+        $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_tok_" + [Guid]::NewGuid())
+    }
+    AfterEach { Remove-Item $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'Set/Get-DeployToken guarda y lee cada token por nombre de servidor' {
+        Set-DeployToken -Server 'srvA' -Token 'tok-A' -DataDir $script:dataDir
+        Set-DeployToken -Server 'srvB' -Token 'tok-B' -DataDir $script:dataDir
+        Get-DeployToken -Server 'srvA' -DataDir $script:dataDir | Should -Be 'tok-A'
+        Get-DeployToken -Server 'srvB' -DataDir $script:dataDir | Should -Be 'tok-B'
+    }
+
+    It 'Get-DeployToken sin registro y sin variable devuelve null' {
+        $prev = $env:PUBLISHTOIIS_API_TOKEN
+        $env:PUBLISHTOIIS_API_TOKEN = $null
+        try { Get-DeployToken -Server 'noexiste' -DataDir $script:dataDir | Should -BeNullOrEmpty }
+        finally { $env:PUBLISHTOIIS_API_TOKEN = $prev }
+    }
+
+    It 'Get-DeployServerUrl resuelve el endpointUrl del config' {
+        Get-DeployServerUrl -Server 'deployments-76' | Should -Be 'https://deployments-76.economitza.com'
+        Get-DeployServerUrl -Server 'portatil' | Should -Be 'http://127.0.0.1:8770'
+    }
+
+    It 'Get-DeployServerUrl falla si el servidor no existe en el config' {
+        { Get-DeployServerUrl -Server 'inventado' } | Should -Throw '*no está en la sección*'
+    }
+}
+
+Describe 'Register-Dashboard' {
+    It 'localiza el repo y ejecuta el script de registro del dashboard' {
+        $fakeRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_dash_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $fakeRepo 'tools') -Force | Out-Null
+        $marker = Join-Path $fakeRepo 'called.txt'
+        Set-Content (Join-Path $fakeRepo 'tools\Register-DashboardTask.ps1') `
+            "param([int]`$Port,[string]`$TaskName,[string]`$PythonExe) 'called ' + `$Port | Set-Content '$marker'"
+        try {
+            Mock -ModuleName PublishToIIS Get-PublishToIISRepo { $fakeRepo }
+            Register-Dashboard -Port 8799
+            (Get-Content $marker -Raw).Trim() | Should -Be 'called 8799'
+        }
+        finally { Remove-Item $fakeRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'falla con mensaje accionable si el repo no trae el script del dashboard' {
+        $bareRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_dash_bare_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $bareRepo -Force | Out-Null
+        try {
+            Mock -ModuleName PublishToIIS Get-PublishToIISRepo { $bareRepo }
+            { Register-Dashboard } | Should -Throw '*Update-PublishToIIS*'
+        }
+        finally { Remove-Item $bareRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

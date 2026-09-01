@@ -6,6 +6,34 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.4.4] - 2026-09-01
+
+### Added
+- Registro de tokens **por servidor** (`Set-DeployToken` / `Get-DeployToken`) y
+  sección `servers` en `environments.json`: cada entorno referencia su servidor de
+  publicación por nombre, y `endpointUrl` + token se resuelven por servidor. Sirve
+  para N servidores sin repetir datos ni tener un token único.
+- `Register-Dashboard`: el dashboard como tarea `Publish Dashboard` **sin
+  privilegios**, headless (pythonw, sin consola) y arrancando con Windows. Deja de
+  depender de una ventana de PowerShell abierta.
+
+### Changed
+- El dashboard publica **siempre por endpoint** (cliente puro, sin elevación): los
+  entornos locales van al endpoint del propio equipo (servidor `portatil`,
+  `http://127.0.0.1:8770`). Se retira el camino de publish local elevado del dashboard.
+- Drenador de la cola **bajo demanda**: lo dispara el endpoint al encolar, procesa
+  y termina, en vez de un proceso sondeando. En reposo solo corre el listener del
+  endpoint (bloqueado en GetContext) → consumo imperceptible.
+
+## [0.4.3] - 2026-09-01
+
+### Fixed
+- El listener del endpoint ya no muere tras la primera petición: la auditoría
+  quedaba fuera del try/finally y leía `RemoteEndPoint` sobre un contexto ya
+  cerrado (lanzaba con `ErrorActionPreference=Stop` y tumbaba el bucle, dejando la
+  tarea en Ready y el puerto sin nadie → 502). Ahora cada petición y la auditoría
+  van en su try/catch y el listener se relanza si cae.
+
 ## [0.4.2] - 2026-09-01
 
 ### Added

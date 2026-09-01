@@ -57,31 +57,33 @@ else {
 # delega en el helper Set-DeployEndpointUrlAcl para mantener este script legible.
 & (Join-Path $PSScriptRoot 'Set-DeployEndpointUrlAcl.ps1') -Port $Port -User "$($env:USERDOMAIN)\$($env:USERNAME)"
 
-# Trigger, principal y settings compartidos por las dos tareas de fondo.
-$trigger = New-ScheduledTaskTrigger -AtStartup
 # S4U: corren aunque nadie tenga sesion iniciada, sin guardar contraseña.
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
     -LogonType S4U -RunLevel Limited
-# Sin limite de ejecucion (son servicios) y relanzadas por el Programador si mueren.
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
 
-# Tarea 1: el listener HTTP (acepta y encola).
+# Tarea 1: el listener HTTP (acepta y encola). Arranca con Windows y se relanza
+# si muere. En reposo esta bloqueado en GetContext -> consumo imperceptible.
+$endpointTrigger = New-ScheduledTaskTrigger -AtStartup
+$endpointSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
 $endpointScript = Join-Path $PSScriptRoot 'Start-DeployEndpoint.ps1'
 $endpointAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$endpointScript`" -Port $Port -TaskName `"$PublishTaskName`""
-Register-ScheduledTask -TaskName $TaskName -Action $endpointAction -Trigger $trigger -Principal $principal `
-    -Settings $settings -Description "PublishToIIS: endpoint HTTP de despliegue en 127.0.0.1 puerto $Port (ver docs\deploy-endpoint.md)" -Force | Out-Null
+    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$endpointScript`" -Port $Port -TaskName `"$PublishTaskName`" -DrainerTaskName `"$DrainerTaskName`""
+Register-ScheduledTask -TaskName $TaskName -Action $endpointAction -Trigger $endpointTrigger -Principal $principal `
+    -Settings $endpointSettings -Description "PublishToIIS: endpoint HTTP de despliegue en 127.0.0.1 puerto $Port (ver docs\deploy-endpoint.md)" -Force | Out-Null
 Write-Host "Tarea '$TaskName' registrada (al arranque, sin privilegios, puerto $Port)." -ForegroundColor Green
 
-# Tarea 2: el drenador de la cola (serializa las publicaciones, una a una).
+# Tarea 2: el drenador de la cola. BAJO DEMANDA (sin trigger): el endpoint la
+# dispara al encolar y termina al vaciar; en reposo no corre. MultipleInstances
+# Queue: un disparo que caiga mientras drena queda encolado (no se pierde).
+$drainerSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances Queue
 $drainerScript = Join-Path $PSScriptRoot 'Start-DeployQueueDrainer.ps1'
 $drainerAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$drainerScript`" -TaskName `"$PublishTaskName`""
-Register-ScheduledTask -TaskName $DrainerTaskName -Action $drainerAction -Trigger $trigger -Principal $principal `
-    -Settings $settings -Description 'PublishToIIS: drena la cola FIFO de despliegue llamando a la tarea Publish Local (ver docs\deploy-endpoint.md)' -Force | Out-Null
-Write-Host "Tarea '$DrainerTaskName' registrada (al arranque, sin privilegios)." -ForegroundColor Green
+Register-ScheduledTask -TaskName $DrainerTaskName -Action $drainerAction -Principal $principal `
+    -Settings $drainerSettings -Description 'PublishToIIS: drena la cola FIFO bajo demanda llamando a la tarea Publish Local (ver docs\deploy-endpoint.md)' -Force | Out-Null
+Write-Host "Tarea '$DrainerTaskName' registrada (bajo demanda, sin privilegios)." -ForegroundColor Green
 
 Start-ScheduledTask -TaskName $TaskName
-Start-ScheduledTask -TaskName $DrainerTaskName
-Write-Host "Tareas arrancadas. Prueba: Invoke-RestMethod http://127.0.0.1:$Port/health" -ForegroundColor Gray
+Write-Host "Endpoint arrancado. Prueba: Invoke-RestMethod http://127.0.0.1:$Port/health" -ForegroundColor Gray
