@@ -10,3 +10,7 @@ _ReSharper*/
 
 __pycache__/
 *.pyc
+
+# Token del endpoint de despliegue: credencial, nunca al repo
+remote-api-token.txt
+api-token.txt
