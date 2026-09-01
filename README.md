@@ -88,6 +88,15 @@ Uso rápido:
   `runId` que la tarea devuelve en el resultado y `Wait-PublishResult` exige que
   coincida (`-RunId`). El registro además da permiso de Modify sobre la carpeta.
 
+- Alta de un entorno sin editar el JSON a mano: `tools\Add-PublishEnvironment.ps1`
+  pregunta los campos por consola (Name obligatorio; Origin/Destination/AppPool/
+  SiteUrl/ServerName/EndpointUrl opcionales), inserta la entrada preservando el
+  formato del fichero y, al confirmar, **commitea y pushea** a origin para que el
+  entorno quede disponible en todas las maquinas con un `git pull` /
+  `Update-PublishToIIS`. Con `EndpointUrl` el entorno se publica en remoto por el
+  endpoint; sin el, en local. Acepta los campos por parametro (`-NonInteractive`)
+  para scripting, y `-NoPush` para solo modificar el fichero local.
+
 - Nada de rutas: `Get-PublishToIISRepo` localiza la copia de trabajo git por
   `-RepoPath`, por la variable `PUBLISHTOIIS_REPO` que deja `Install.ps1` o, si el
   módulo se importó desde el propio repo, por su carpeta. `Update-PublishToIIS` y
