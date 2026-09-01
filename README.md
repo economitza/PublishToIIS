@@ -88,6 +88,12 @@ Uso rápido:
   `runId` que la tarea devuelve en el resultado y `Wait-PublishResult` exige que
   coincida (`-RunId`). El registro además da permiso de Modify sobre la carpeta.
 
+- Versionado por push: los push de este repo van por `tools\Push-Release.ps1`,
+  que **sube el `ModuleVersion` en +1 el tercer dígito** (patch), commitea
+  `chore(release): vX.Y.Z` y pushea en un paso. `-Minor`/`-Major` suben ese nivel
+  reiniciando los de abajo; `-DryRun` solo muestra el salto. Commitea tu trabajo
+  primero y luego lanza el helper (sube tu trabajo y el bump juntos).
+
 - Alta de un entorno sin editar el JSON a mano: `tools\Add-PublishEnvironment.ps1`
   pregunta los campos por consola (Name obligatorio; Origin/Destination/AppPool/
   SiteUrl/ServerName/EndpointUrl opcionales), inserta la entrada preservando el
