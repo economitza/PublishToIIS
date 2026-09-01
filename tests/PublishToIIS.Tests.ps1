@@ -615,6 +615,34 @@ Describe 'Register-PublishTask' {
     }
 }
 
+Describe 'Register-DeployEndpoint' {
+    It 'localiza el repo y ejecuta el script de registro del endpoint' {
+        $fakeRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_ep_reg_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $fakeRepo 'tools') -Force | Out-Null
+        # Un script sonda que solo escribe que lo llamaron (no eleva ni registra nada).
+        $marker = Join-Path $fakeRepo 'called.txt'
+        Set-Content (Join-Path $fakeRepo 'tools\Register-DeployEndpointTask.ps1') `
+            "param([int]`$Port,[string]`$TaskName,[string]`$DrainerTaskName,[string]`$PublishTaskName) 'called ' + `$Port | Set-Content '$marker'"
+        try {
+            Mock -ModuleName PublishToIIS Get-PublishToIISRepo { $fakeRepo }
+            Register-DeployEndpoint -Port 8799
+            Test-Path $marker | Should -BeTrue
+            (Get-Content $marker -Raw).Trim() | Should -Be 'called 8799'
+        }
+        finally { Remove-Item $fakeRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'falla con mensaje accionable si el repo no trae las tools del endpoint' {
+        $bareRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_ep_bare_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $bareRepo -Force | Out-Null
+        try {
+            Mock -ModuleName PublishToIIS Get-PublishToIISRepo { $bareRepo }
+            { Register-DeployEndpoint } | Should -Throw '*Update-PublishToIIS*'
+        }
+        finally { Remove-Item $bareRepo -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

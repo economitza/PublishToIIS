@@ -1395,6 +1395,65 @@ function Request-RemotePublish {
     throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $($trig.runId)). Mira $Url/api/log con el token."
 }
 
+function Register-DeployEndpoint {
+    <#
+    .SYNOPSIS
+        Prepara el servidor para el despliegue remoto, sin tener que saber dónde
+        está el repo ni ejecutar scripts desde una carpeta concreta.
+
+    .DESCRIPTION
+        Localiza la copia de trabajo con Get-PublishToIISRepo y ejecuta
+        tools\Register-DeployEndpointTask.ps1: genera el token de API, reserva la
+        URL ACL del loopback y registra + arranca las tareas 'Publish Endpoint' y
+        'Publish Queue Drainer'. El script se auto-eleva por UAC. Tras importar el
+        módulo, basta `Register-DeployEndpoint` desde cualquier ruta.
+
+    .EXAMPLE
+        Register-DeployEndpoint
+    .EXAMPLE
+        Register-DeployEndpoint -Port 8771
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$Port = 8770,
+        [string]$RepoPath
+    )
+    $repo = Get-PublishToIISRepo -RepoPath $RepoPath
+    $script = Join-Path $repo 'tools\Register-DeployEndpointTask.ps1'
+    if (-not (Test-Path $script)) {
+        throw "No se encontró $script. Actualiza el repo (Update-PublishToIIS) para traer las tools del endpoint."
+    }
+    & $script -Port $Port
+}
+
+function Test-DeployEndpoint {
+    <#
+    .SYNOPSIS
+        Comprueba que el listener del endpoint responde (GET /health en loopback).
+
+    .DESCRIPTION
+        Devuelve $true si el endpoint está vivo. Es la comprobación rápida tras
+        Register-DeployEndpoint. No pasa por IIS: prueba directamente el loopback,
+        así aísla "el listener corre" de "el reverse proxy está bien montado".
+    #>
+    [CmdletBinding()]
+    param([int]$Port = 8770)
+    $url = "http://127.0.0.1:$Port/health"
+    try {
+        $r = Invoke-RestMethod -Uri $url -TimeoutSec 5
+        if ($r.ok) {
+            Write-Host "Endpoint OK en $url" -ForegroundColor Green
+            return $true
+        }
+        Write-Warning "Respuesta inesperada de $url."
+        return $false
+    }
+    catch {
+        Write-Warning "El endpoint no responde en $url ($($_.Exception.Message)). ¿Arrancó la tarea 'Publish Endpoint'?"
+        return $false
+    }
+}
+
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint -Alias Publish-Update

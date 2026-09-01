@@ -56,19 +56,23 @@ ya debe estar registrada (`Register-PublishTask -Unattended`).
    Webempresa): registro A `deployments-76.economitza.com` -> IP publica del
    servidor.
 
-2. **Listener + token + URL ACL** (elevado, una vez):
+2. **Listener + token + URL ACL** (elevado, una vez). Una sola instruccion, desde
+   cualquier carpeta, con el modulo cargado:
 
    ```powershell
-   .\tools\Register-DeployEndpointTask.ps1 -Port 8770
+   Import-Module PublishToIIS
+   Register-DeployEndpoint            # -Port 8770 por defecto
    ```
 
-   Genera el token de API (`%ProgramData%\PublishToIIS\api-token.txt`, se
-   muestra UNA vez — copialo al cliente), reserva la URL ACL del loopback para
-   que el listener escuche sin privilegios, y registra las dos tareas de fondo
-   `Publish Endpoint` y `Publish Queue Drainer` (al arranque, S4U, relanzadas si
-   mueren). Las deja arrancadas.
+   (`Register-DeployEndpoint` es el envoltorio de
+   `tools\Register-DeployEndpointTask.ps1`: localiza el repo solo y se auto-eleva
+   por UAC.) Genera el token de API (`%ProgramData%\PublishToIIS\api-token.txt`,
+   se muestra UNA vez — copialo al cliente), reserva la URL ACL del loopback para
+   que el listener escuche sin privilegios, y registra + arranca las dos tareas de
+   fondo `Publish Endpoint` y `Publish Queue Drainer` (al arranque, S4U,
+   relanzadas si mueren).
 
-   Comprobacion: `Invoke-RestMethod http://127.0.0.1:8770/health` -> `{ ok = True }`.
+   Comprobacion: `Test-DeployEndpoint` -> `Endpoint OK en http://127.0.0.1:8770/health`.
 
 3. **Site de IIS + reverse proxy** (a mano en IIS Manager o por `appcmd`):
    - Site nuevo con binding **http** `deployments-76.economitza.com:80` (lo pide
