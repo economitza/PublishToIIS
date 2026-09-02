@@ -28,6 +28,7 @@ function Write-Result {
         environment = $order.environment
         branch      = $order.branch
         execute     = if ($order) { [bool]$order.execute } else { $false }
+        requestedBy = $order.requestedBy
         startedAt   = $startedAt.ToString('o')
         finishedAt  = (Get-Date).ToString('o')
         ranBy       = "$env:USERNAME@$env:COMPUTERNAME"
@@ -43,7 +44,8 @@ try {
     Move-Item -Path $orderPath -Destination "$orderPath.consumed" -Force
 
     Invoke-DeployOrder -Environment $order.environment -Branch $order.branch `
-        -Execute:$order.execute -OverrideWebconfig:$order.overrideWebconfig
+        -Execute:$order.execute -OverrideWebconfig:$order.overrideWebconfig `
+        -RequestedBy $order.requestedBy
 
     Write-Host 'RESULT: OK'
     $done = if ($order.execute) { "Publicado $($order.branch) en $($order.environment)." }

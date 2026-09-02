@@ -80,7 +80,17 @@ Describe 'New-DeployInfo' {
         $json.publishDate | Should -Not -BeNullOrEmpty
         $json.environment | Should -Be 'devecoand2'
         $json.publishedBy | Should -Be "$env:USERNAME@$env:COMPUTERNAME"
+        # Sin -RequestedBy (publicación a mano) pide y ejecuta el mismo
+        $json.requestedBy | Should -Be "$env:COMPUTERNAME\$env:USERNAME"
         $info.commit | Should -Be $json.commit
+    }
+
+    It 'anota en requestedBy quién pidió el deploy cuando viene de la orden' {
+        $json = New-DeployInfo -ProjectPath $script:repoDir -OutputDir $script:outDir -Environment 'e' -RequestedBy 'PC-ANA\ana'
+        $json.requestedBy | Should -Be 'PC-ANA\ana'
+        (Get-Content (Join-Path $script:outDir 'deploy-info.json') -Raw | ConvertFrom-Json).requestedBy | Should -Be 'PC-ANA\ana'
+        # publishedBy sigue siendo quien ejecuta: son dos hechos distintos
+        $json.publishedBy | Should -Be "$env:USERNAME@$env:COMPUTERNAME"
     }
 
     It 'resolves git info from a subdirectory of the working copy (project inside repo)' {
@@ -136,18 +146,24 @@ Describe 'Read-PublishOrder' {
     }
 
     It 'lee una orden completa' {
-        '{"environment":"dev-joaquim-local","branch":"main_deploy-20260720a","execute":true,"overrideWebconfig":false}' |
+        '{"environment":"dev-joaquim-local","branch":"main_deploy-20260720a","execute":true,"overrideWebconfig":false,"requestedBy":"PC-ANA\\ana"}' |
             Set-Content $script:orderPath -Encoding UTF8
         $order = Read-PublishOrder -Path $script:orderPath
         $order.environment | Should -Be 'dev-joaquim-local'
         $order.branch | Should -Be 'main_deploy-20260720a'
         $order.execute | Should -BeTrue
         $order.overrideWebconfig | Should -BeFalse
+        $order.requestedBy | Should -Be 'PC-ANA\ana'
     }
 
     It 'execute es false (dry-run) si la orden no lo indica' {
         '{"environment":"dev-joaquim-local","branch":"main"}' | Set-Content $script:orderPath -Encoding UTF8
         (Read-PublishOrder -Path $script:orderPath).execute | Should -BeFalse
+    }
+
+    It 'requestedBy queda vacío si la orden no lo trae (orden de una versión anterior)' {
+        '{"environment":"dev-joaquim-local","branch":"main"}' | Set-Content $script:orderPath -Encoding UTF8
+        (Read-PublishOrder -Path $script:orderPath).requestedBy | Should -BeNullOrEmpty
     }
 
     It 'rechaza órdenes sin environment o sin branch' {
@@ -184,6 +200,13 @@ Describe 'Write-PublishOrder' {
         $order.branch | Should -Be 'main_deploy-20260730'
         $order.execute | Should -BeTrue
         $order.runId | Should -Be $written.runId
+    }
+
+    It 'conserva -RequestedBy en la orden; sin él anota EQUIPO\usuario del proceso' {
+        $w = Write-PublishOrder -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir -RequestedBy 'PC-ANA\ana'
+        (Read-PublishOrder -Path $w.path).requestedBy | Should -Be 'PC-ANA\ana'
+        $w = Write-PublishOrder -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir
+        (Read-PublishOrder -Path $w.path).requestedBy | Should -Be "$env:COMPUTERNAME\$env:USERNAME"
     }
 
     It 'da un runId distinto a cada orden' {
@@ -441,6 +464,21 @@ Describe 'Endpoint de despliegue' {
             @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 1
         }
 
+        It 'POST /api/publish conserva requestedBy en la orden encolada, saneado a texto plano' {
+            $body = '{"environment":"devecoesp1","branch":"main","execute":true,"requestedBy":"PC-ANA\\ana<script>"}'
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 202
+            (Get-DeployQueue -DataDir $script:dataDir)[0].requestedBy | Should -Be 'PC-ANA\anascript'
+        }
+
+        It 'POST /api/publish sin requestedBy encola con la cuenta del proceso' {
+            $body = '{"environment":"devecoesp1","branch":"main","execute":true}'
+            Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir | Out-Null
+            (Get-DeployQueue -DataDir $script:dataDir)[0].requestedBy | Should -Be "$env:COMPUTERNAME\$env:USERNAME"
+        }
+
         It 'un execute que no es booleano degrada a dry-run' {
             $body = '{"environment":"devecoesp1","branch":"main","execute":"true"}'
             $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/publish' -Body $body `
@@ -547,6 +585,14 @@ Describe 'Endpoint de despliegue' {
             }
         }
 
+        It 'Drain pasa el requestedBy de la orden a Request-Publish y lo deja en el resultado' {
+            Mock -ModuleName PublishToIIS Request-Publish { [pscustomobject]@{ status = 'ok'; message = 'mock' } }
+            $id = (Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'main' -Execute -RequestedBy 'PC-ANA\ana' -DataDir $script:dataDir).runId
+            Invoke-DeployQueueDrain -DataDir $script:dataDir | Out-Null
+            Should -Invoke -ModuleName PublishToIIS Request-Publish -Times 1 -ParameterFilter { $RequestedBy -eq 'PC-ANA\ana' }
+            (Get-DeployResult -RunId $id -DataDir $script:dataDir).requestedBy | Should -Be 'PC-ANA\ana'
+        }
+
         It 'Drain marca error el runId si la publicación lanza, y sigue con el resto' {
             Mock -ModuleName PublishToIIS Request-Publish { throw 'boom' }
             $id = (Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'x' -Execute -DataDir $script:dataDir).runId
@@ -566,6 +612,21 @@ Describe 'Endpoint de despliegue' {
             Invoke-DeployQueueDrain -DataDir $script:dataDir | Out-Null
             (Get-ChildItem $qdir -Filter '*.bad').Count | Should -Be 1
             (Get-DeployResult -RunId $good -DataDir $script:dataDir).status | Should -Be 'ok'
+        }
+    }
+}
+
+Describe 'Request-RemotePublish' {
+    It 'manda requestedBy en la orden: el indicado, o EQUIPO\usuario del proceso' {
+        Mock -ModuleName PublishToIIS Invoke-RestMethod { [pscustomobject]@{ runId = 'r1'; position = 1 } }
+        Request-RemotePublish -Url 'http://ep.test' -Token 't' -Environment 'devecoesp1' -Branch 'main' -NoWait -RequestedBy 'PC-ANA\ana' | Out-Null
+        Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+            $Method -eq 'Post' -and ([Text.Encoding]::UTF8.GetString($Body) -like '*"requestedBy":"PC-ANA\\ana"*')
+        }
+        Request-RemotePublish -Url 'http://ep.test' -Token 't' -Environment 'devecoesp1' -Branch 'main' -NoWait | Out-Null
+        $propio = "$env:COMPUTERNAME\\$env:USERNAME"
+        Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+            $Method -eq 'Post' -and ([Text.Encoding]::UTF8.GetString($Body) -like "*`"requestedBy`":`"$propio`"*")
         }
     }
 }

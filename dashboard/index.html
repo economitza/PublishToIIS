@@ -109,7 +109,7 @@ async function refreshStatus(env, row) {
     cellOnline.innerHTML = `<span class="sem" title="${esc(st.error || ('HTTP ' + st.httpStatus))}">${semaforo(st.online)}</span>`;
     const di = st.deployInfo;
     cellInfo.innerHTML = di
-      ? `<code>${esc(di.branch)}</code>@<code>${esc(di.commit)}</code><div class="muted">${esc((di.publishDate||'').slice(0,16))} · ${esc(di.publishedBy||'')}</div>`
+      ? `<code>${esc(di.branch)}</code>@<code>${esc(di.commit)}</code><div class="muted">${esc((di.publishDate||'').slice(0,16))} · ${esc(di.requestedBy || di.publishedBy || '')}</div>`
       : `<span class="muted">${env.siteUrl ? 'sin deploy-info.json (versión anterior a fase 1)' : 'configura siteUrl en environments.json'}</span>`;
   } catch (e) { cellOnline.textContent = '⚠'; cellInfo.innerHTML = `<span class="muted">${esc(e.message)}</span>`; }
 }
@@ -209,7 +209,7 @@ function renderJiraRows() {
   for (const e of rows) {
     const sirviendo = e.sirviendo
       ? `<code>${esc(e.sirviendo.branch)}</code>@<code>${esc(e.sirviendo.commit)}</code>
-         <div class="muted">${esc((e.sirviendo.publishDate || '').slice(0, 16))} · ${esc(e.sirviendo.publishedBy || '')}</div>`
+         <div class="muted">${esc((e.sirviendo.publishDate || '').slice(0, 16))} · ${esc(e.sirviendo.requestedBy || e.sirviendo.publishedBy || '')}</div>`
       : '<span class="muted">—</span>';
     tb.insertAdjacentHTML('beforeend', `<tr>
       <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>

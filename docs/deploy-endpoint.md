@@ -136,7 +136,7 @@ Todas menos `/health` exigen la cabecera `X-Api-Token`.
 |---|---|---|
 | GET | `/health` | Sonda sin token: `{ok:true}`. |
 | GET | `/api/environments` | Entornos desplegables (lista blanca, sin prod/staging). |
-| POST | `/api/publish` | Cuerpo `{environment, branch, execute, overrideWebconfig}`. **Encola** y responde **202** con `runId` y `position`. No publica en la request. |
+| POST | `/api/publish` | Cuerpo `{environment, branch, execute, overrideWebconfig, requestedBy}`. **Encola** y responde **202** con `runId` y `position`. No publica en la request. |
 | GET | `/api/result?runId=...` | `queued` (con posicion) / `running` / `ok` / `error`; 404 si el runId no existe. |
 | GET | `/api/queue` | Cola pendiente, en orden de proceso. |
 | GET | `/api/log` | Cola del transcript de la publicacion en curso. |
@@ -152,6 +152,11 @@ Notas de diseño:
   en Windows tiene resolucion de ~15 ms.
 - `execute` solo dispara con un booleano JSON de verdad; cualquier otro valor
   degrada a dry-run (un `"false"` string convertido a `[bool]` seria `$true`).
+- `requestedBy` (`EQUIPO\usuario` de quien pide) lo declara el cliente y viaja por
+  la cola y la orden hasta el `deploy-info.json` del site, junto a `publishedBy`
+  (la cuenta que ejecuto el swap: en un deploy por endpoint, la del listener). Si
+  no viene, se anota la cuenta del proceso que encola. Es **atribucion, no
+  autenticacion**: con el token compartido cualquiera puede declarar cualquier nombre.
 - Cada peticion queda en `%ProgramData%\PublishToIIS\endpoint.log`
   (fecha | IP de X-Forwarded-For | metodo ruta | status); el drenador deja su
   rastro en `drainer.log`.

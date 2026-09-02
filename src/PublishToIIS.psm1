@@ -104,7 +104,7 @@ function Protect-ProductionWebConfig {
 function New-DeployInfo {
     <#
     .SYNOPSIS
-        Escribe deploy-info.json (rama, commit, fechas, entorno) en el directorio publicado.
+        Escribe deploy-info.json (rama, commit, fechas, entorno, quién lo pidió) en el directorio publicado.
 
     .DESCRIPTION
         Sello de versión del despliegue (Fase 1 del dashboard de publicación): toma
@@ -123,7 +123,10 @@ function New-DeployInfo {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
         [Parameter(Mandatory)][string]$OutputDir,
-        [string]$Environment
+        [string]$Environment,
+        # EQUIPO\usuario que pidió la publicación (viene de la orden). Sin él, el
+        # del proceso actual: en una publicación a mano pide y ejecuta el mismo.
+        [string]$RequestedBy
     )
 
     $branch = $null; $commit = $null; $commitFull = $null; $commitDate = $null
@@ -155,7 +158,10 @@ function New-DeployInfo {
         commitDate  = $commitDate
         publishDate = (Get-Date).ToString('o')
         environment = $Environment
+        # publishedBy = cuenta que ejecutó el swap; requestedBy = quien lo pidió.
+        # En un despliegue por endpoint son distintos (listener vs. quien hizo clic).
         publishedBy = "$env:USERNAME@$env:COMPUTERNAME"
+        requestedBy = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
     }
 
     $file = Join-Path $OutputDir 'deploy-info.json'
@@ -172,7 +178,8 @@ function Publish {
         [string]$Configuration = "Release",
         [hashtable]$MSBuildProperties = @{},
         [switch]$KeepPrevious,
-        [switch]$OverrideWebconfig
+        [switch]$OverrideWebconfig,
+        [string]$RequestedBy
     )
 
     # Check for admin privileges
@@ -280,7 +287,7 @@ function Publish {
 
         # Sello de versión del despliegue: viaja dentro de releasing/ y por tanto con el swap
         $deployInfoEnv = if ($Environment) { $Environment } else { $siteName }
-        $deployInfo = New-DeployInfo -ProjectPath $ProjectPath -OutputDir $releasingDir -Environment $deployInfoEnv
+        $deployInfo = New-DeployInfo -ProjectPath $ProjectPath -OutputDir $releasingDir -Environment $deployInfoEnv -RequestedBy $RequestedBy
         if ($deployInfo.commit) {
             Write-Host "deploy-info.json stamped: $($deployInfo.branch)@$($deployInfo.commit) -> $deployInfoEnv" -ForegroundColor Green
         }
@@ -369,7 +376,8 @@ function Invoke-DeployOrder {
         [string[]]$AllowedEnvironments,
         [switch]$OverrideWebconfig,
         [string]$Configuration,
-        [switch]$Execute
+        [switch]$Execute,
+        [string]$RequestedBy
     )
 
     $ErrorActionPreference = 'Stop'
@@ -405,10 +413,12 @@ function Invoke-DeployOrder {
     $pubArgs = @{ Environment = $Environment }
     if ($OverrideWebconfig) { $pubArgs.OverrideWebconfig = $true }
     if ($Configuration) { $pubArgs.Configuration = $Configuration }
+    if ($RequestedBy) { $pubArgs.RequestedBy = $RequestedBy }
 
     $plan = [pscustomobject]@{
         environment       = $Environment
         branch            = $Branch
+        requestedBy       = $RequestedBy
         repo              = $repo
         origin            = $cfg.origin
         destination       = $cfg.destination
@@ -484,7 +494,15 @@ function Read-PublishOrder {
         execute           = [bool]$raw.execute
         overrideWebconfig = [bool]$raw.overrideWebconfig
         runId             = [string]$raw.runId
+        requestedBy       = [string]$raw.requestedBy
     }
+}
+
+function Get-RequesterIdentity {
+    # Quién pide la publicación, como EQUIPO\usuario del proceso actual. Es el
+    # valor por defecto de -RequestedBy en toda la cadena: quien lo recibe de
+    # fuera (endpoint, cola, orden) conserva el recibido y solo cae aquí si falta.
+    "$env:COMPUTERNAME\$env:USERNAME"
 }
 
 function Get-PublishDataDir {
@@ -527,7 +545,8 @@ function Write-PublishOrder {
         [switch]$OverrideWebconfig,
         [string[]]$AllowedEnvironments,
         [string]$DataDir,
-        [string]$RunId = [Guid]::NewGuid().ToString()
+        [string]$RunId = [Guid]::NewGuid().ToString(),
+        [string]$RequestedBy
     )
 
     $ErrorActionPreference = 'Stop'
@@ -556,7 +575,7 @@ function Write-PublishOrder {
         execute           = [bool]$Execute
         overrideWebconfig = [bool]$OverrideWebconfig
         runId             = $RunId
-        requestedBy       = "$env:USERNAME@$env:COMPUTERNAME"
+        requestedBy       = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
         requestedAt       = (Get-Date).ToString('o')
     } | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
 
@@ -724,14 +743,15 @@ function Request-Publish {
         [int]$TimeoutSeconds = 900,
         # Por defecto se va volcando el log de la tarea mientras publica, para no
         # dejar la consola muda durante minutos
-        [switch]$Quiet
+        [switch]$Quiet,
+        [string]$RequestedBy
     )
 
     $ErrorActionPreference = 'Stop'
 
     $order = Write-PublishOrder -Environment $Environment -Branch $Branch `
         -Execute:$Execute -OverrideWebconfig:$OverrideWebconfig `
-        -AllowedEnvironments $AllowedEnvironments -DataDir $DataDir
+        -AllowedEnvironments $AllowedEnvironments -DataDir $DataDir -RequestedBy $RequestedBy
 
     $dir = Get-PublishDataDir -DataDir $DataDir
     Write-Host "Orden escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
@@ -959,7 +979,8 @@ function Add-DeployQueueItem {
         [switch]$OverrideWebconfig,
         [string[]]$AllowedEnvironments,
         [string]$DataDir,
-        [string]$RunId = [Guid]::NewGuid().ToString()
+        [string]$RunId = [Guid]::NewGuid().ToString(),
+        [string]$RequestedBy
     )
     $ErrorActionPreference = 'Stop'
 
@@ -993,7 +1014,7 @@ function Add-DeployQueueItem {
         overrideWebconfig = [bool]$OverrideWebconfig
         runId             = $RunId
         queuedAt          = (Get-Date).ToString('o')
-        requestedBy       = "$env:USERNAME@$env:COMPUTERNAME"
+        requestedBy       = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
     } | ConvertTo-Json -Compress | Set-Content $file -Encoding UTF8
 
     [pscustomobject]@{ runId = $RunId; position = $ahead + 1; path = $file }
@@ -1012,6 +1033,7 @@ function Get-DeployQueue {
         [pscustomobject]@{
             position = $i; runId = $o.runId; environment = $o.environment
             branch = $o.branch; execute = [bool]$o.execute; queuedAt = $o.queuedAt
+            requestedBy = $o.requestedBy
         }
     }
 }
@@ -1092,26 +1114,27 @@ function Invoke-DeployQueueDrain {
         }
 
         $resultFile = Join-Path $rdir ($order.runId + '.json')
+        $requestedBy = [string]$order.requestedBy
         [pscustomobject]@{
             status = 'running'; runId = $order.runId
             environment = $order.environment; branch = $order.branch
-            startedAt = (Get-Date).ToString('o')
+            requestedBy = $requestedBy; startedAt = (Get-Date).ToString('o')
         } | ConvertTo-Json | Set-Content $resultFile -Encoding UTF8
 
         try {
             $res = Request-Publish -Environment ([string]$order.environment) -Branch ([string]$order.branch) `
                 -Execute:([bool]$order.execute) -OverrideWebconfig:([bool]$order.overrideWebconfig) `
-                -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
+                -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
             $final = [pscustomobject]@{
                 status = $res.status; message = $res.message; runId = $order.runId
-                environment = $order.environment; branch = $order.branch
+                environment = $order.environment; branch = $order.branch; requestedBy = $requestedBy
                 execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
             }
         }
         catch {
             $final = [pscustomobject]@{
                 status = 'error'; message = $_.Exception.Message; runId = $order.runId
-                environment = $order.environment; branch = $order.branch
+                environment = $order.environment; branch = $order.branch; requestedBy = $requestedBy
                 execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
             }
         }
@@ -1189,9 +1212,13 @@ function Invoke-DeployEndpointRequest {
         # [bool] sería $true, así que cualquier otro tipo degrada a dry-run.
         $execute = ($req.execute -is [bool]) -and $req.execute
         $override = ($req.overrideWebconfig -is [bool]) -and $req.overrideWebconfig
+        # Quién lo pidió lo declara el cliente (EQUIPO\usuario del que hizo clic).
+        # Acaba en JSON y en deploy-info.json: se deja solo texto plano y corto.
+        $requestedBy = (([string]$req.requestedBy) -replace '[^\p{L}\p{N}_.@\\\- ]', '').Trim()
+        if ($requestedBy.Length -gt 128) { $requestedBy = $requestedBy.Substring(0, 128) }
         try {
             $item = Add-DeployQueueItem -Environment ([string]$req.environment) -Branch ([string]$req.branch) `
-                -Execute:$execute -OverrideWebconfig:$override -DataDir $dir
+                -Execute:$execute -OverrideWebconfig:$override -RequestedBy $requestedBy -DataDir $dir
         }
         catch {
             return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
@@ -1447,7 +1474,10 @@ function Request-RemotePublish {
         [string]$Token,
         [switch]$NoWait,
         [int]$TimeoutSeconds = 1200,
-        [int]$PollSeconds = 5
+        [int]$PollSeconds = 5,
+        # Quién pide: por defecto EQUIPO\usuario de este proceso. Viaja en la orden
+        # hasta deploy-info.json (requestedBy) para saber quién disparó cada deploy.
+        [string]$RequestedBy = (Get-RequesterIdentity)
     )
     $ErrorActionPreference = 'Stop'
 
@@ -1465,6 +1495,7 @@ function Request-RemotePublish {
     $payload = @{
         environment = $Environment; branch = $Branch
         execute = [bool]$Execute; overrideWebconfig = [bool]$OverrideWebconfig
+        requestedBy = $RequestedBy
     } | ConvertTo-Json -Compress
 
     try {
