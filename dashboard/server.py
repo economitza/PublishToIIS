@@ -3,8 +3,9 @@
 
 Mini servidor local sin dependencias: sirve la UI y expone una API que
 sondea cada entorno por HTTP (deploy-info.json + home) y lista las ramas
-del repo ordenadas por fecha de commit. El Publish solo funciona para
-entornos cuyo `origin` existe en esta máquina (el disparo remoto es Fase 3).
+del repo ordenadas por fecha de commit. El Publish es un cliente HTTP puro
+del endpoint del servidor de cada entorno (local o remoto): encola la orden
+y sondea el resultado, sin procesos hijos ni privilegios.
 
 Uso:  python server.py [puerto]   (por defecto 8765)
 """
@@ -14,6 +15,8 @@ import re
 import ssl
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -173,28 +176,71 @@ def publish(env_name, branch):
     return publish_via_endpoint(env, branch)
 
 
+PUBLISH_TIMEOUT = 1200  # segundos de espera al resultado (una publicación tarda minutos)
+PUBLISH_POLL = 5
+
+
+def requester_identity():
+    """EQUIPO\\usuario del proceso del dashboard. Corre en el portátil de quien
+    hace clic, así que identifica a quien pide la publicación; viaja en la orden
+    hasta el deploy-info.json del site (campo requestedBy)."""
+    return f"{os.environ.get('COMPUTERNAME', '')}\\{os.environ.get('USERNAME', '')}"
+
+
+def endpoint_json(method, url, token, body=None, timeout=60):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "X-Api-Token": token, "User-Agent": "publish-dashboard",
+        "Content-Type": "application/json; charset=utf-8"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as r:
+        return json.loads(r.read().decode("utf-8-sig") or "{}")
+
+
 def publish_via_endpoint(env, branch):
-    """POST al endpoint del servidor del entorno (encola y sondea) vía
-    Request-RemotePublish. El token —el del servidor referenciado, del registro por
-    servidor— viaja al proceso hijo por variable de entorno, no en la línea de comando."""
+    """POST a /api/publish del servidor del entorno y sondeo de /api/result hasta
+    el desenlace: la misma conversación que Request-RemotePublish, en HTTP puro.
+    (Antes se delegaba en un powershell hijo, que abría una consola en el
+    escritorio del usuario en cada clic.)"""
     server = env["server"]
     token = resolve_api_token(server)
     if not token:
         return 400, {"error": f"Sin token para el servidor '{server}'. Regístralo con: "
                               f"Set-DeployToken -Server {server}"}
-    module = str(ROOT.parent / "PublishToIIS.psd1")
-    url = env["endpointUrl"]
-    ps = (f"$ErrorActionPreference='Stop'; "
-          f"Import-Module '{module}' -Force; "
-          f"Request-RemotePublish -Url '{url}' -Environment '{env['name']}' -Branch '{branch}' -Execute")
-    child_env = {**os.environ, "PUBLISHTOIIS_API_TOKEN": token}
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                       capture_output=True, text=True, timeout=1800, env=child_env)
-    out = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
-    if r.returncode != 0:
-        return 500, {"error": f"Publish de '{env['name']}' (servidor '{server}') falló",
-                     "detail": (out or "(el proceso no devolvió salida)")[-4000:]}
-    return 200, {"ok": True, "output": out[-4000:]}
+    url = env["endpointUrl"].rstrip("/")
+    order = {"environment": env["name"], "branch": branch, "execute": True,
+             "overrideWebconfig": False, "requestedBy": requester_identity()}
+    try:
+        trig = endpoint_json("POST", url + "/api/publish", token, order)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[-4000:]
+        return 500, {"error": f"El endpoint de '{server}' rechazó la orden (HTTP {e.code})", "detail": detail}
+    except Exception as e:
+        return 500, {"error": f"No se pudo contactar el endpoint de '{server}' ({url})", "detail": str(e)}
+
+    run_id = trig.get("runId", "")
+    lines = [f"Orden encolada (runId {run_id}, posición {trig.get('position')}) por {order['requestedBy']}. "
+             "La publicación corre en el servidor."]
+    last = ""
+    deadline = time.monotonic() + PUBLISH_TIMEOUT
+    while time.monotonic() < deadline:
+        time.sleep(PUBLISH_POLL)
+        try:
+            res = endpoint_json("GET", f"{url}/api/result?runId={run_id}", token)
+        except Exception:
+            continue  # un poll fallido (red, proxy reciclando) no aborta la espera
+        status = res.get("status", "")
+        if status in ("ok", "error"):
+            lines.append(f"RESULT: {status} {res.get('message', '')}")
+            out = "\n".join(lines)[-4000:]
+            if status == "ok":
+                return 200, {"ok": True, "output": out}
+            return 500, {"error": f"Publish de '{env['name']}' (servidor '{server}') falló", "detail": out}
+        if status != last:  # eco del cambio de estado sin repetir cada poll
+            last = status
+            pos = f" (posición {res.get('position')})" if status == "queued" else ""
+            lines.append(f"  ...{status}{pos}")
+    return 504, {"error": f"Timeout de {PUBLISH_TIMEOUT} s esperando el resultado (runId {run_id})",
+                 "detail": "\n".join(lines)[-4000:]}
 
 
 class Handler(BaseHTTPRequestHandler):
