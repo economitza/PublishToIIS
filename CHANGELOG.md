@@ -6,6 +6,18 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.4.7] - 2026-09-02
+
+### Added
+- Entornos **ad hoc** para worktrees efímeros: `Request-Publish -EnvironmentFile
+  <ruta.json>` acepta un fichero con la misma forma que una entrada de
+  `environments.json` más su `name` (convención: `.publish-env.json` en la raíz
+  del worktree). La definición viaja DENTRO de la orden (`environmentDef`), la
+  tarea elevada la usa en lugar de la config central y `Publish` recibe las rutas
+  explícitas — la config central queda solo para los entornos estables. Guardas:
+  `name`/`origin`/`destination` obligatorios, sin colisión con entornos centrales
+  y nunca `prod`/`staging`. Nueva función exportada `Read-AdHocEnvironment`.
+
 ## [0.4.6] - 2026-09-02
 
 ### Added

@@ -43,9 +43,16 @@ try {
     $order = Read-PublishOrder -Path $orderPath
     Move-Item -Path $orderPath -Destination "$orderPath.consumed" -Force
 
-    Invoke-DeployOrder -Environment $order.environment -Branch $order.branch `
-        -Execute:$order.execute -OverrideWebconfig:$order.overrideWebconfig `
-        -RequestedBy $order.requestedBy
+    $deployArgs = @{
+        Environment       = $order.environment
+        Branch            = $order.branch
+        Execute           = [bool]$order.execute
+        OverrideWebconfig = [bool]$order.overrideWebconfig
+        RequestedBy       = $order.requestedBy
+    }
+    # Entorno ad hoc (worktree efimero): la definicion viaja en la propia orden
+    if ($order.environmentDef) { $deployArgs.EnvironmentDef = $order.environmentDef }
+    Invoke-DeployOrder @deployArgs
 
     Write-Host 'RESULT: OK'
     $done = if ($order.execute) { "Publicado $($order.branch) en $($order.environment)." }

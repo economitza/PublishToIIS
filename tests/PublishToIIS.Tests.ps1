@@ -246,6 +246,86 @@ Describe 'Write-PublishOrder' {
     }
 }
 
+Describe 'Entornos ad hoc (worktrees efimeros)' {
+    BeforeEach {
+        $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_adhoc_" + [Guid]::NewGuid())
+        $script:envFile = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_env_" + [Guid]::NewGuid() + ".json")
+        @{
+            name        = 'wt-prueba-esp'
+            origin      = 'C:\claude-worktrees\repo\wt\CentralCompres\'
+            destination = 'C:\inetpub\wwwroot\economitza_espana'
+            appPool     = 'economitza_espana'
+            siteUrl     = 'https://esp.emkt.test'
+        } | ConvertTo-Json | Set-Content $script:envFile -Encoding UTF8
+    }
+
+    AfterEach {
+        Remove-Item $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $script:envFile -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'Read-AdHocEnvironment lee una definición válida' {
+        $def = Read-AdHocEnvironment -Path $script:envFile
+        $def.name | Should -Be 'wt-prueba-esp'
+        $def.origin | Should -Be 'C:\claude-worktrees\repo\wt\CentralCompres\'
+    }
+
+    It 'Read-AdHocEnvironment exige name, origin y destination' {
+        '{"name":"x","origin":"C:\\a"}' | Set-Content $script:envFile -Encoding UTF8
+        { Read-AdHocEnvironment -Path $script:envFile } | Should -Throw "*destination*"
+    }
+
+    It 'Read-AdHocEnvironment rechaza nombres que colisionan con la config central' {
+        '{"name":"devecoand1","origin":"C:\\a","destination":"C:\\b"}' | Set-Content $script:envFile -Encoding UTF8
+        { Read-AdHocEnvironment -Path $script:envFile } | Should -Throw '*colisiona*'
+    }
+
+    It 'Read-AdHocEnvironment rechaza prod/staging' {
+        '{"name":"prod","origin":"C:\\a","destination":"C:\\b"}' | Set-Content $script:envFile -Encoding UTF8
+        { Read-AdHocEnvironment -Path $script:envFile } | Should -Throw '*no permitido*'
+    }
+
+    It 'la orden lleva environmentDef y sobrevive al roundtrip con Read-PublishOrder' {
+        $w = Write-PublishOrder -EnvironmentFile $script:envFile -Branch 'main_rebranding' -Execute -DataDir $script:dataDir
+        $order = Read-PublishOrder -Path $w.path
+        $order.environment | Should -Be 'wt-prueba-esp'
+        $order.environmentDef.origin | Should -Be 'C:\claude-worktrees\repo\wt\CentralCompres\'
+        $order.environmentDef.destination | Should -Be 'C:\inetpub\wwwroot\economitza_espana'
+    }
+
+    It 'Write-PublishOrder rechaza -Environment que no coincide con el name del fichero' {
+        { Write-PublishOrder -Environment 'otro' -EnvironmentFile $script:envFile -Branch 'main' -DataDir $script:dataDir } |
+            Should -Throw '*no coincide*'
+    }
+
+    It 'Write-PublishOrder sin -Environment ni -EnvironmentFile falla con mensaje claro' {
+        { Write-PublishOrder -Branch 'main' -DataDir $script:dataDir } | Should -Throw '*-EnvironmentFile*'
+    }
+
+    It 'Read-PublishOrder rechaza environmentDef incompleto o incoherente' {
+        $orderPath = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_order_" + [Guid]::NewGuid() + ".json")
+        try {
+            '{"environment":"x","branch":"main","environmentDef":{"name":"x","origin":"C:\\a"}}' | Set-Content $orderPath -Encoding UTF8
+            { Read-PublishOrder -Path $orderPath } | Should -Throw "*destination*"
+            '{"environment":"x","branch":"main","environmentDef":{"name":"y","origin":"C:\\a","destination":"C:\\b"}}' | Set-Content $orderPath -Encoding UTF8
+            { Read-PublishOrder -Path $orderPath } | Should -Throw '*incoherente*'
+        } finally { Remove-Item $orderPath -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'Invoke-DeployOrder (dry-run) resuelve el plan desde la definición ad hoc' {
+        $def = Read-AdHocEnvironment -Path $script:envFile
+        $plan = Invoke-DeployOrder -Environment 'wt-prueba-esp' -Branch 'main_rebranding' -EnvironmentDef $def
+        $plan.origin | Should -Be 'C:\claude-worktrees\repo\wt\CentralCompres\'
+        $plan.destination | Should -Be 'C:\inetpub\wwwroot\economitza_espana'
+        $plan.mode | Should -Be 'DRY-RUN'
+    }
+
+    It 'Invoke-DeployOrder rechaza una definición ad hoc que colisiona con la config central' {
+        $def = [pscustomobject]@{ name = 'devecoand1'; origin = 'C:\a'; destination = 'C:\b' }
+        { Invoke-DeployOrder -Environment 'devecoand1' -Branch 'main' -EnvironmentDef $def } | Should -Throw '*colisiona*'
+    }
+}
+
 Describe 'Wait-PublishResult' {
     BeforeEach {
         $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_wr_" + [Guid]::NewGuid())

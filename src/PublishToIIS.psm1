@@ -377,7 +377,11 @@ function Invoke-DeployOrder {
         [switch]$OverrideWebconfig,
         [string]$Configuration,
         [switch]$Execute,
-        [string]$RequestedBy
+        [string]$RequestedBy,
+        # Definicion de entorno ad hoc (worktree efimero) que viaja en la orden:
+        # sustituye a la config central para ESTA ejecucion. Mismo dominio de
+        # confianza: quien escribe la orden tambien puede editar environments.json.
+        [psobject]$EnvironmentDef
     )
 
     $ErrorActionPreference = 'Stop'
@@ -387,10 +391,24 @@ function Invoke-DeployOrder {
         if (Test-Path $maybeCfg) { . $maybeCfg }
     }
 
-    $AllowedEnvironments = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
-
-    if ($Environment -notin $AllowedEnvironments) {
-        throw "Entorno no permitido: '$Environment'. Permitidos: $($AllowedEnvironments -join ', ')"
+    if ($EnvironmentDef) {
+        foreach ($campo in 'name', 'origin', 'destination') {
+            if (-not $EnvironmentDef.$campo) { throw "EnvironmentDef sin '$campo'." }
+        }
+        if ($EnvironmentDef.name -ne $Environment) {
+            throw "Environment '$Environment' no coincide con EnvironmentDef.name '$($EnvironmentDef.name)'."
+        }
+        if ($Environment -in @('prod', 'staging')) { throw "Nombre de entorno ad hoc no permitido: '$Environment'." }
+        $centrales = Get-AllowedEnvironments
+        if ($Environment -in $centrales) {
+            throw "El entorno ad hoc '$Environment' colisiona con uno de environments.json."
+        }
+    }
+    else {
+        $AllowedEnvironments = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+        if ($Environment -notin $AllowedEnvironments) {
+            throw "Entorno no permitido: '$Environment'. Permitidos: $($AllowedEnvironments -join ', ')"
+        }
     }
     if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
         throw "Rama con formato inválido: '$Branch'"
@@ -407,10 +425,17 @@ function Invoke-DeployOrder {
         }
     }
 
-    $cfg = Get-PublishConfig -Environment $Environment
+    $cfg = if ($EnvironmentDef) { $EnvironmentDef } else { Get-PublishConfig -Environment $Environment }
     $repo = Split-Path ($cfg.origin.TrimEnd('\', '/')) -Parent
 
     $pubArgs = @{ Environment = $Environment }
+    if ($EnvironmentDef) {
+        # Con entorno ad hoc, Publish recibe las rutas explicitas y no consulta
+        # la config central (donde este entorno no existe).
+        $pubArgs.ProjectPath = $cfg.origin
+        $pubArgs.Destination = $cfg.destination
+        if ($cfg.appPool) { $pubArgs.AppPoolName = $cfg.appPool }
+    }
     if ($OverrideWebconfig) { $pubArgs.OverrideWebconfig = $true }
     if ($Configuration) { $pubArgs.Configuration = $Configuration }
     if ($RequestedBy) { $pubArgs.RequestedBy = $RequestedBy }
@@ -488,6 +513,15 @@ function Read-PublishOrder {
         throw "Rama con formato inválido en la orden: '$($raw.branch)'"
     }
 
+    if ($raw.environmentDef) {
+        foreach ($campo in 'name', 'origin', 'destination') {
+            if (-not $raw.environmentDef.$campo) { throw "environmentDef sin '$campo' en la orden." }
+        }
+        if ($raw.environmentDef.name -ne $raw.environment) {
+            throw "La orden es incoherente: environment '$($raw.environment)' != environmentDef.name '$($raw.environmentDef.name)'."
+        }
+    }
+
     [pscustomobject]@{
         environment       = [string]$raw.environment
         branch            = [string]$raw.branch
@@ -495,6 +529,7 @@ function Read-PublishOrder {
         overrideWebconfig = [bool]$raw.overrideWebconfig
         runId             = [string]$raw.runId
         requestedBy       = [string]$raw.requestedBy
+        environmentDef    = $raw.environmentDef
     }
 }
 
@@ -523,6 +558,42 @@ function Get-AllowedEnvironments {
     @($names | Where-Object { $_ -notin @('prod', 'staging') })
 }
 
+function Read-AdHocEnvironment {
+    <#
+    .SYNOPSIS
+        Lee y valida un fichero de entorno ad hoc (worktrees efímeros).
+
+    .DESCRIPTION
+        Un entorno ad hoc es un JSON con la MISMA forma que una entrada de
+        environments.json más su `name`: sirve para publicar desde un worktree
+        efímero sin ensuciar la config central. Por convención el fichero vive en
+        la raíz del propio worktree (p. ej. `.publish-env.json`).
+
+        Reglas: `name`, `origin` y `destination` obligatorios; el nombre NO puede
+        coincidir con un entorno de environments.json (para eso está la config
+        central) ni ser prod/staging.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path $Path)) { throw "No existe el fichero de entorno ad hoc: '$Path'" }
+    $def = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+
+    foreach ($campo in 'name', 'origin', 'destination') {
+        if (-not $def.$campo) { throw "El entorno ad hoc '$Path' no define '$campo'." }
+    }
+    if ($def.name -in @('prod', 'staging')) { throw "Nombre de entorno ad hoc no permitido: '$($def.name)'." }
+
+    $cfgFile = Join-Path $PSScriptRoot '..\config\environments.json'
+    if (Test-Path $cfgFile) {
+        $centrales = (Get-Content $cfgFile -Raw | ConvertFrom-Json).environments.PSObject.Properties.Name
+        if ($def.name -in $centrales) {
+            throw "El entorno ad hoc '$($def.name)' colisiona con uno de environments.json: usa la config central o cambia el nombre."
+        }
+    }
+    return $def
+}
+
 function Write-PublishOrder {
     <#
     .SYNOPSIS
@@ -539,11 +610,14 @@ function Write-PublishOrder {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Environment,
+        [string]$Environment,
         [Parameter(Mandatory)][string]$Branch,
         [switch]$Execute,
         [switch]$OverrideWebconfig,
         [string[]]$AllowedEnvironments,
+        # Entorno ad hoc para worktrees efimeros (ver Read-AdHocEnvironment): la
+        # definicion viaja DENTRO de la orden y no toca environments.json.
+        [string]$EnvironmentFile,
         [string]$DataDir,
         [string]$RunId = [Guid]::NewGuid().ToString(),
         [string]$RequestedBy
@@ -551,9 +625,22 @@ function Write-PublishOrder {
 
     $ErrorActionPreference = 'Stop'
 
-    $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
-    if ($Environment -notin $allowed) {
-        throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+    $envDef = $null
+    if ($EnvironmentFile) {
+        $envDef = Read-AdHocEnvironment -Path $EnvironmentFile
+        if ($Environment -and $Environment -ne $envDef.name) {
+            throw "-Environment '$Environment' no coincide con el name '$($envDef.name)' de '$EnvironmentFile'."
+        }
+        $Environment = $envDef.name
+    }
+    elseif (-not $Environment) {
+        throw 'Indica -Environment (config central) o -EnvironmentFile (entorno ad hoc).'
+    }
+    else {
+        $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+        if ($Environment -notin $allowed) {
+            throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+        }
     }
     if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
         throw "Rama con formato inválido: '$Branch'"
@@ -569,7 +656,7 @@ function Write-PublishOrder {
     Remove-Item (Join-Path $dir 'publish-order.result.json') -Force -ErrorAction SilentlyContinue
 
     $orderPath = Join-Path $dir 'publish-order.json'
-    [pscustomobject]@{
+    $orden = [ordered]@{
         environment       = $Environment
         branch            = $Branch
         execute           = [bool]$Execute
@@ -577,7 +664,9 @@ function Write-PublishOrder {
         runId             = $RunId
         requestedBy       = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
         requestedAt       = (Get-Date).ToString('o')
-    } | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
+    }
+    if ($envDef) { $orden.environmentDef = $envDef }
+    [pscustomobject]$orden | ConvertTo-Json -Compress -Depth 6 | Set-Content $orderPath -Encoding UTF8
 
     [pscustomobject]@{ path = $orderPath; runId = $RunId }
 }
@@ -732,11 +821,14 @@ function Request-Publish {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Environment,
+        [string]$Environment,
         [Parameter(Mandatory)][string]$Branch,
         [switch]$Execute,
         [switch]$OverrideWebconfig,
         [string[]]$AllowedEnvironments,
+        # Fichero de entorno ad hoc para worktrees efimeros (convencion:
+        # `.publish-env.json` en la raiz del worktree). Ver Read-AdHocEnvironment.
+        [string]$EnvironmentFile,
         [string]$TaskName = 'Publish Local',
         [string]$DataDir,
         [switch]$NoWait,
@@ -751,7 +843,9 @@ function Request-Publish {
 
     $order = Write-PublishOrder -Environment $Environment -Branch $Branch `
         -Execute:$Execute -OverrideWebconfig:$OverrideWebconfig `
-        -AllowedEnvironments $AllowedEnvironments -DataDir $DataDir -RequestedBy $RequestedBy
+        -AllowedEnvironments $AllowedEnvironments -EnvironmentFile $EnvironmentFile `
+        -DataDir $DataDir -RequestedBy $RequestedBy
+    if (-not $Environment) { $Environment = (Get-Content $order.path -Raw | ConvertFrom-Json).environment }
 
     $dir = Get-PublishDataDir -DataDir $DataDir
     Write-Host "Orden escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
@@ -1661,4 +1755,4 @@ function Register-Dashboard {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard -Alias Publish-Update
