@@ -6,6 +6,21 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.4.6] - 2026-09-02
+
+### Added
+- `requestedBy` (`EQUIPO\usuario` de quien pide el deploy) viaja con la orden por
+  toda la cadena —`Request-RemotePublish` → endpoint → cola → drenador →
+  `Request-Publish` → orden → `Invoke-DeployOrder` → `Publish`— hasta el
+  `deploy-info.json` del site, junto a `publishedBy` (la cuenta que ejecutó el
+  swap). El dashboard lo muestra en el sello de cada entorno. Es atribución, no
+  autenticación: el nombre lo declara el cliente.
+
+### Fixed
+- El botón Publish del dashboard hace la petición HTTP al endpoint directamente
+  desde Python (encola y sondea `/api/result`), en vez de lanzar un `powershell`
+  hijo que abría una ventana de consola en el escritorio en cada clic.
+
 ## [0.4.5] - 2026-09-01
 
 ### Fixed
