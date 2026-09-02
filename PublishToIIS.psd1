@@ -1,6 +1,6 @@
 @{
     RootModule = 'src\PublishToIIS.psm1'
-    ModuleVersion = '0.4.5'
+    ModuleVersion = '0.4.6'
     GUID = 'd3f6d9b7-6c3a-4f0d-9a2b-123456789abc'
     Author = 'Economitza (it@economitza.com)'
     CompanyName = 'Economitza'
