@@ -137,6 +137,8 @@ Todas menos `/health` exigen la cabecera `X-Api-Token`.
 | GET | `/health` | Sonda sin token: `{ok:true}`. |
 | GET | `/api/environments` | Entornos desplegables (lista blanca, sin prod/staging). |
 | POST | `/api/publish` | Cuerpo `{environment, branch, execute, overrideWebconfig, requestedBy}`. **Encola** y responde **202** con `runId` y `position`. No publica en la request. |
+| POST | `/api/update` | Cuerpo opcional `{requestedBy}`. **Encola** la actualización del propio módulo (misma cola FIFO que los publish) y responde **202** con `runId`, `position` y la versión `current`. |
+| GET | `/api/version` | Versión del manifiesto, commit y rama del código que sirve el endpoint, y el host. |
 | GET | `/api/result?runId=...` | `queued` (con posicion) / `running` / `ok` / `error`; 404 si el runId no existe. |
 | GET | `/api/queue` | Cola pendiente, en orden de proceso. |
 | GET | `/api/log` | Cola del transcript de la publicacion en curso. |
@@ -160,6 +162,28 @@ Notas de diseño:
 - Cada peticion queda en `%ProgramData%\PublishToIIS\endpoint.log`
   (fecha | IP de X-Forwarded-For | metodo ruta | status); el drenador deja su
   rastro en `drainer.log`.
+
+## Actualizar el publicador del servidor a distancia
+
+```powershell
+Request-RemoteUpdate -Server deployments-76      # o -Url ... -Token ...
+Get-RemoteDeployVersion -Server deployments-76   # solo consultar
+```
+
+`POST /api/update` encola una orden `kind=update` en la misma cola FIFO que los
+despliegues, así que nunca se actualiza el módulo mientras hay un publish en
+marcha. El drenador la pasa a la tarea elevada 'Publish Local'
+(`tools\Run-PublishOrder.ps1`), que hace `Update-PublishToIIS` (git fetch/pull
+`--ff-only` del repo del módulo + `Install.ps1`), escribe el resultado y **reinicia
+la tarea 'Publish Endpoint'**: el listener es el único proceso largo y seguiría
+sirviendo el código viejo; el drenador y la propia 'Publish Local' importan el
+módulo en cada ejecución, así que ya van con la versión nueva. El cliente sondea
+`/api/result` tolerando el corte de unos segundos del reinicio y termina con
+`GET /api/version`.
+
+Primera vez: un servidor que aún corre una versión anterior a 0.5.0 no conoce
+`/api/update` (404) y esa actualización se hace por RDP con `Update-PublishToIIS`
++ `Restart-ScheduledTask 'Publish Endpoint'`. A partir de ahí, sin RDP.
 
 ## Rotar el token
 

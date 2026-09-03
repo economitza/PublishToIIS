@@ -1031,3 +1031,135 @@ Describe 'Aprovisionamiento de sites (Initialize-IisSite y piezas)' {
         $plan.provision | Should -Be '-'
     }
 }
+
+Describe 'Órdenes de actualización del módulo (kind=update)' {
+    BeforeEach {
+        $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_upd_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:dataDir | Out-Null
+        $script:token = 'b' * 64
+    }
+    AfterEach { Remove-Item $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    Context 'orden local' {
+        It 'Write-UpdateOrder escribe kind=update con runId y requestedBy, y Read-PublishOrder la lee sin exigir entorno ni rama' {
+            $o = Write-UpdateOrder -DataDir $script:dataDir -RequestedBy 'PC-ANA\ana'
+            $o.runId | Should -Not -BeNullOrEmpty
+            $raw = Get-Content $o.path -Raw | ConvertFrom-Json
+            $raw.kind | Should -Be 'update'
+            $raw.requestedBy | Should -Be 'PC-ANA\ana'
+
+            $leida = Read-PublishOrder -Path $o.path
+            $leida.kind | Should -Be 'update'
+            $leida.runId | Should -Be $o.runId
+            $leida.execute | Should -BeTrue
+            $leida.environment | Should -BeNullOrEmpty
+        }
+
+        It 'Read-PublishOrder sigue exigiendo entorno y rama en las órdenes de publicación y rechaza tipos desconocidos' {
+            $p = Join-Path $script:dataDir 'publish-order.json'
+            '{"kind":"publish","runId":"r"}' | Set-Content $p -Encoding UTF8
+            { Read-PublishOrder -Path $p } | Should -Throw "*'environment'*"
+            '{"kind":"reboot","runId":"r"}' | Set-Content $p -Encoding UTF8
+            { Read-PublishOrder -Path $p } | Should -Throw '*desconocido*'
+            '{"environment":"devecoesp1","branch":"main","runId":"r"}' | Set-Content $p -Encoding UTF8
+            (Read-PublishOrder -Path $p).kind | Should -Be 'publish'
+        }
+
+        It 'Request-ModuleUpdate deja la orden, dispara la tarea y devuelve el resultado con su runId' {
+            Mock -ModuleName PublishToIIS Start-PublishTask {
+                # simula la tarea elevada: consume la orden y deja el resultado
+                $orden = Get-Content (Join-Path $DataDir 'publish-order.json') -Raw | ConvertFrom-Json
+                [pscustomobject]@{ status = 'ok'; message = 'Módulo actualizado: 0.4.7 -> 0.5.0'; runId = $orden.runId; kind = $orden.kind } |
+                    ConvertTo-Json | Set-Content (Join-Path $DataDir 'publish-order.result.json') -Encoding UTF8
+            }
+            $res = Request-ModuleUpdate -DataDir $script:dataDir -TimeoutSeconds 10 -Quiet 6>$null
+            $res.status | Should -Be 'ok'
+            $res.kind | Should -Be 'update'
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 1 -ParameterFilter { $TaskName -eq 'Publish Local' }
+        }
+    }
+
+    Context 'cola y drenador' {
+        It 'Add-DeployQueueItem -Kind update encola sin entorno ni rama y la cola lo muestra' {
+            $item = Add-DeployQueueItem -Kind update -RequestedBy 'PC-ANA\ana' -DataDir $script:dataDir
+            $q = @(Get-DeployQueue -DataDir $script:dataDir)
+            $q.Count | Should -Be 1
+            $q[0].kind | Should -Be 'update'
+            $q[0].runId | Should -Be $item.runId
+            (Get-DeployResult -RunId $item.runId -DataDir $script:dataDir).kind | Should -Be 'update'
+        }
+
+        It 'una orden de publicación sin entorno o rama sigue rechazándose' {
+            { Add-DeployQueueItem -Environment 'devecoesp1' -DataDir $script:dataDir } | Should -Throw "*'environment' y 'branch'*"
+        }
+
+        It 'Drain ejecuta la actualización con Request-ModuleUpdate y las publicaciones con Request-Publish, en orden de llegada' {
+            Mock -ModuleName PublishToIIS Request-Publish { [pscustomobject]@{ status = 'ok'; message = 'pub' } }
+            Mock -ModuleName PublishToIIS Request-ModuleUpdate { [pscustomobject]@{ status = 'ok'; message = 'upd' } }
+            $pub = (Add-DeployQueueItem -Environment 'devecoesp1' -Branch 'main' -Execute -DataDir $script:dataDir).runId
+            $upd = (Add-DeployQueueItem -Kind update -DataDir $script:dataDir).runId
+            $n = Invoke-DeployQueueDrain -DataDir $script:dataDir
+            $n | Should -Be 2
+            Should -Invoke -ModuleName PublishToIIS Request-Publish -Times 1
+            Should -Invoke -ModuleName PublishToIIS Request-ModuleUpdate -Times 1
+            $r = Get-DeployResult -RunId $upd -DataDir $script:dataDir
+            $r.status | Should -Be 'ok'
+            $r.kind | Should -Be 'update'
+            $r.message | Should -Be 'upd'
+            (Get-DeployResult -RunId $pub -DataDir $script:dataDir).kind | Should -Be 'publish'
+        }
+    }
+
+    Context 'endpoint' {
+        It 'POST /api/update encola (202) con kind update, la versión actual y sin necesitar cuerpo' {
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/update' `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 202
+            $r.body.status | Should -Be 'queued'
+            $r.body.kind | Should -Be 'update'
+            $r.body.runId | Should -Not -BeNullOrEmpty
+            $r.body.current.version | Should -Match '^\d+\.\d+\.\d+$'
+            @(Get-DeployQueue -DataDir $script:dataDir)[0].kind | Should -Be 'update'
+        }
+
+        It 'POST /api/update conserva requestedBy saneado' {
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/update' -Body '{"requestedBy":"PC-ANA\\ana <x>"}' `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 202
+            @(Get-DeployQueue -DataDir $script:dataDir)[0].requestedBy | Should -Be 'PC-ANA\ana x'
+        }
+
+        It 'GET /api/version devuelve la versión del manifiesto y exige token' {
+            $sin = Invoke-DeployEndpointRequest -Method GET -Path '/api/version' -DataDir $script:dataDir
+            $sin.status | Should -Be 401
+            $r = Invoke-DeployEndpointRequest -Method GET -Path '/api/version' `
+                -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+            $r.status | Should -Be 200
+            $esperada = [regex]::Match((Get-Content (Join-Path $PSScriptRoot '..\PublishToIIS.psd1') -Raw), "ModuleVersion\s*=\s*'([^']+)'").Groups[1].Value
+            $r.body.version | Should -Be $esperada
+            $r.body.host | Should -Be $env:COMPUTERNAME
+        }
+    }
+
+    Context 'cliente remoto' {
+        It 'Request-RemoteUpdate hace POST a /api/update con requestedBy y con -NoWait devuelve el 202' {
+            Mock -ModuleName PublishToIIS Invoke-RestMethod {
+                [pscustomobject]@{ runId = 'u1'; position = 1; kind = 'update'; current = [pscustomobject]@{ version = '0.4.7'; commit = 'abc' } }
+            }
+            $r = Request-RemoteUpdate -Url 'http://ep.test' -Token 't' -NoWait -RequestedBy 'PC-ANA\ana' 6>$null
+            $r.runId | Should -Be 'u1'
+            Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+                $Method -eq 'Post' -and $Uri -eq 'http://ep.test/api/update' -and
+                ([Text.Encoding]::UTF8.GetString($Body) -like '*"requestedBy":"PC-ANA\\ana"*')
+            }
+        }
+
+        It 'Get-RemoteDeployVersion consulta /api/version con el token' {
+            Mock -ModuleName PublishToIIS Invoke-RestMethod { [pscustomobject]@{ version = '0.5.0' } }
+            (Get-RemoteDeployVersion -Url 'http://ep.test/' -Token 't').version | Should -Be '0.5.0'
+            Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+                $Uri -eq 'http://ep.test/api/version' -and $Headers['X-Api-Token'] -eq 't'
+            }
+        }
+    }
+}

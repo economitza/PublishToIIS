@@ -946,6 +946,22 @@ function Read-PublishOrder {
         throw "No hay orden de publicación en '$Path'."
     }
     $raw = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    # Tipo de orden: 'publish' (por defecto) o 'update' (actualizar el propio
+    # módulo en el servidor: git pull + reinstalar + reiniciar el listener).
+    $kind = if ($raw.kind) { [string]$raw.kind } else { 'publish' }
+    if ($kind -notin @('publish', 'update')) { throw "Tipo de orden desconocido: '$kind'." }
+    if ($kind -eq 'update') {
+        return [pscustomobject]@{
+            kind        = 'update'
+            environment = ''
+            branch      = ''
+            execute     = $true
+            overrideWebconfig = $false
+            runId       = [string]$raw.runId
+            requestedBy = [string]$raw.requestedBy
+            environmentDef = $null
+        }
+    }
     if (-not $raw.environment) { throw "La orden no indica 'environment'." }
     if (-not $raw.branch) { throw "La orden no indica 'branch'." }
     if ($raw.branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
@@ -962,6 +978,7 @@ function Read-PublishOrder {
     }
 
     [pscustomobject]@{
+        kind              = 'publish'
         environment       = [string]$raw.environment
         branch            = [string]$raw.branch
         execute           = [bool]$raw.execute
@@ -1106,6 +1123,40 @@ function Write-PublishOrder {
     }
     if ($envDef) { $orden.environmentDef = $envDef }
     [pscustomobject]$orden | ConvertTo-Json -Compress -Depth 6 | Set-Content $orderPath -Encoding UTF8
+
+    [pscustomobject]@{ path = $orderPath; runId = $RunId }
+}
+
+function Write-UpdateOrder {
+    <#
+    .SYNOPSIS
+        Deja escrita una orden de ACTUALIZACIÓN del módulo (publish-order.json, kind=update). Sin privilegios.
+
+    .DESCRIPTION
+        Misma mecánica que Write-PublishOrder, otro tipo de orden: la tarea
+        elevada 'Publish Local' la consume y, en vez de publicar, hace
+        Update-PublishToIIS (git pull + reinstalar) y reinicia el listener del
+        endpoint para que cargue el código nuevo. Es lo que permite actualizar el
+        publicador de un servidor sin entrar por RDP.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$DataDir,
+        [string]$RunId = [Guid]::NewGuid().ToString(),
+        [string]$RequestedBy
+    )
+    $ErrorActionPreference = 'Stop'
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Remove-Item (Join-Path $dir 'publish-order.result.json') -Force -ErrorAction SilentlyContinue
+
+    $orderPath = Join-Path $dir 'publish-order.json'
+    [pscustomobject]@{
+        kind        = 'update'
+        runId       = $RunId
+        requestedBy = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
+        requestedAt = (Get-Date).ToString('o')
+    } | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
 
     [pscustomobject]@{ path = $orderPath; runId = $RunId }
 }
@@ -1308,6 +1359,49 @@ function Request-Publish {
     return $result
 }
 
+function Request-ModuleUpdate {
+    <#
+    .SYNOPSIS
+        Pide, SIN privilegios, que la tarea elevada actualice el módulo en esta máquina.
+
+    .DESCRIPTION
+        Escribe la orden kind=update, dispara 'Publish Local' y espera el
+        resultado. La tarea hace git fetch/pull --ff-only del repo del módulo,
+        reinstala (Install.ps1) y reinicia la tarea 'Publish Endpoint' para que el
+        listener cargue el código nuevo; el drenador y la propia tarea importan el
+        módulo en cada ejecución, así que ya van con la versión nueva. Es la mitad
+        local de Request-RemoteUpdate.
+
+    .EXAMPLE
+        Request-ModuleUpdate
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$TaskName = 'Publish Local',
+        [string]$DataDir,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 600,
+        [switch]$Quiet,
+        [string]$RequestedBy
+    )
+    $ErrorActionPreference = 'Stop'
+
+    $order = Write-UpdateOrder -DataDir $DataDir -RequestedBy $RequestedBy
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    Write-Host "Orden de actualización escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
+    Write-Host "Disparando la tarea '$TaskName'..." -ForegroundColor Yellow
+    Start-PublishTask -TaskName $TaskName -DataDir $dir
+
+    if ($NoWait) {
+        return [pscustomobject]@{ status = 'triggered'; kind = 'update'; runId = $order.runId; orderPath = $order.path }
+    }
+
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
+    Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
+    return $result
+}
+
 function Get-PublishToIISRepo {
     <#
     .SYNOPSIS
@@ -1423,6 +1517,48 @@ function Update-PublishToIIS {
 # elevada 'Publish Local'; todo el trabajo con privilegios lo hace la tarea.
 # Ver docs\deploy-endpoint.md para el montaje completo del servidor.
 
+function Get-ManifestVersion {
+    # ModuleVersion del manifiesto leído como texto (mismo regex que
+    # tools\Push-Release.ps1): no depende de Import-PowerShellDataFile ni de
+    # evaluar el .psd1. $null si no se encuentra.
+    param([Parameter(Mandatory)][string]$ManifestPath)
+    if (-not (Test-Path $ManifestPath)) { return $null }
+    $m = [regex]::Match([IO.File]::ReadAllText($ManifestPath), "ModuleVersion\s*=\s*'(\d+\.\d+\.\d+)'")
+    if ($m.Success) { $m.Groups[1].Value } else { $null }
+}
+
+function Get-PublishToIISVersionInfo {
+    <#
+    .SYNOPSIS
+        Versión, commit y rama del código del módulo que está ejecutando esta sesión.
+
+    .DESCRIPTION
+        La versión se lee del manifiesto que acompaña a ESTE fichero (el que se ha
+        importado: la copia de trabajo si las tareas importan desde el repo, o la
+        copia instalada). El commit y la rama salen de la copia de trabajo git si
+        se localiza (Get-PublishToIISRepo). Es lo que devuelve GET /api/version y
+        lo que Request-RemoteUpdate compara antes y después de actualizar.
+    #>
+    [CmdletBinding()]
+    param([string]$RepoPath)
+    $codeRoot = Split-Path $PSScriptRoot -Parent
+    $version = Get-ManifestVersion -ManifestPath (Join-Path $codeRoot 'PublishToIIS.psd1')
+    $repo = $null; $commit = $null; $branch = $null
+    try { $repo = Get-PublishToIISRepo -RepoPath $RepoPath } catch { }
+    if ($repo -and (Get-Command git -ErrorAction SilentlyContinue)) {
+        $commit = [string](& git -C $repo rev-parse --short HEAD 2>$null)
+        $branch = [string](& git -C $repo rev-parse --abbrev-ref HEAD 2>$null)
+    }
+    [pscustomobject]@{
+        version  = $version
+        commit   = $commit
+        branch   = $branch
+        codeRoot = $codeRoot
+        repo     = $repo
+        host     = $env:COMPUTERNAME
+    }
+}
+
 function Get-DeployEndpointTokenPath {
     param([string]$DataDir)
     Join-Path (Get-PublishDataDir -DataDir $DataDir) 'api-token.txt'
@@ -1506,23 +1642,36 @@ function Add-DeployQueueItem {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Environment,
-        [Parameter(Mandatory)][string]$Branch,
+        [string]$Environment,
+        [string]$Branch,
         [switch]$Execute,
         [switch]$OverrideWebconfig,
         [string[]]$AllowedEnvironments,
         [string]$DataDir,
         [string]$RunId = [Guid]::NewGuid().ToString(),
-        [string]$RequestedBy
+        [string]$RequestedBy,
+        # 'publish' (entorno + rama) o 'update' (actualizar el módulo del
+        # servidor; sin entorno ni rama). Van por la MISMA cola: así nunca se
+        # actualiza el módulo a mitad de una publicación.
+        [ValidateSet('publish', 'update')][string]$Kind = 'publish'
     )
     $ErrorActionPreference = 'Stop'
 
-    $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
-    if ($Environment -notin $allowed) {
-        throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+    if ($Kind -eq 'publish') {
+        if (-not $Environment -or -not $Branch) { throw "Una orden de publicación necesita 'environment' y 'branch'." }
+        $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+        if ($Environment -notin $allowed) {
+            throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+        }
+        if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
+            throw "Rama con formato inválido: '$Branch'"
+        }
     }
-    if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
-        throw "Rama con formato inválido: '$Branch'"
+    else {
+        $Environment = ''
+        $Branch = ''
+        $Execute = $true
+        $OverrideWebconfig = $false
     }
 
     $qdir = Join-Path (Get-PublishDataDir -DataDir $DataDir) 'queue'
@@ -1541,6 +1690,7 @@ function Add-DeployQueueItem {
     # El prefijo cero-rellenado ordena lexicográficamente igual que numéricamente.
     $file = Join-Path $qdir ('{0:000000000000}-{1}.json' -f $seq, $RunId)
     [pscustomobject]@{
+        kind              = $Kind
         environment       = [string]$Environment
         branch            = [string]$Branch
         execute           = [bool]$Execute
@@ -1564,9 +1714,9 @@ function Get-DeployQueue {
         try { $o = Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return }
         $i++
         [pscustomobject]@{
-            position = $i; runId = $o.runId; environment = $o.environment
-            branch = $o.branch; execute = [bool]$o.execute; queuedAt = $o.queuedAt
-            requestedBy = $o.requestedBy
+            position = $i; runId = $o.runId; kind = $(if ($o.kind) { [string]$o.kind } else { 'publish' })
+            environment = $o.environment; branch = $o.branch; execute = [bool]$o.execute
+            queuedAt = $o.queuedAt; requestedBy = $o.requestedBy
         }
     }
 }
@@ -1594,7 +1744,7 @@ function Get-DeployResult {
     foreach ($q in (Get-DeployQueue -DataDir $dir)) {
         if ($q.runId -eq $RunId) {
             return [pscustomobject]@{
-                status = 'queued'; runId = $RunId; position = $q.position
+                status = 'queued'; runId = $RunId; position = $q.position; kind = $q.kind
                 environment = $q.environment; branch = $q.branch
             }
         }
@@ -1648,25 +1798,31 @@ function Invoke-DeployQueueDrain {
 
         $resultFile = Join-Path $rdir ($order.runId + '.json')
         $requestedBy = [string]$order.requestedBy
+        $kind = if ($order.kind) { [string]$order.kind } else { 'publish' }
         [pscustomobject]@{
-            status = 'running'; runId = $order.runId
+            status = 'running'; runId = $order.runId; kind = $kind
             environment = $order.environment; branch = $order.branch
             requestedBy = $requestedBy; startedAt = (Get-Date).ToString('o')
         } | ConvertTo-Json | Set-Content $resultFile -Encoding UTF8
 
         try {
-            $res = Request-Publish -Environment ([string]$order.environment) -Branch ([string]$order.branch) `
-                -Execute:([bool]$order.execute) -OverrideWebconfig:([bool]$order.overrideWebconfig) `
-                -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
+            if ($kind -eq 'update') {
+                $res = Request-ModuleUpdate -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
+            }
+            else {
+                $res = Request-Publish -Environment ([string]$order.environment) -Branch ([string]$order.branch) `
+                    -Execute:([bool]$order.execute) -OverrideWebconfig:([bool]$order.overrideWebconfig) `
+                    -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
+            }
             $final = [pscustomobject]@{
-                status = $res.status; message = $res.message; runId = $order.runId
+                status = $res.status; message = $res.message; runId = $order.runId; kind = $kind
                 environment = $order.environment; branch = $order.branch; requestedBy = $requestedBy
                 execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
             }
         }
         catch {
             $final = [pscustomobject]@{
-                status = 'error'; message = $_.Exception.Message; runId = $order.runId
+                status = 'error'; message = $_.Exception.Message; runId = $order.runId; kind = $kind
                 environment = $order.environment; branch = $order.branch; requestedBy = $requestedBy
                 execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
             }
@@ -1699,9 +1855,12 @@ function Invoke-DeployEndpointRequest {
         Rutas: GET /health (sin token) · GET /api/environments ·
         POST /api/publish {environment, branch, execute, overrideWebconfig} →
         202 con runId; la orden se ENCOLA (nunca se rechaza por otra en marcha) y
-        el drenador la publica cuando le toca · GET /api/result?runId=... (queued
-        / running / ok / error) · GET /api/queue (cola pendiente) ·
-        GET /api/log (cola del transcript de la publicación en curso).
+        el drenador la publica cuando le toca · POST /api/update {requestedBy} →
+        202 con runId; encola la actualización del propio módulo (git pull +
+        reinstalar + reiniciar el listener), por la MISMA cola que los publish ·
+        GET /api/version (versión, commit y rama del código que sirve el endpoint) ·
+        GET /api/result?runId=... (queued / running / ok / error) · GET /api/queue
+        (cola pendiente) · GET /api/log (cola del transcript de la publicación en curso).
     #>
     [CmdletBinding()]
     param(
@@ -1733,6 +1892,31 @@ function Invoke-DeployEndpointRequest {
 
     if ($Method -eq 'GET' -and $Path -eq '/api/queue') {
         return [pscustomobject]@{ status = 200; body = @{ queue = @(Get-DeployQueue -DataDir $dir) } }
+    }
+
+    if ($Method -eq 'GET' -and $Path -eq '/api/version') {
+        return [pscustomobject]@{ status = 200; body = (Get-PublishToIISVersionInfo) }
+    }
+
+    if ($Method -eq 'POST' -and $Path -eq '/api/update') {
+        $req = $null
+        if ($Body) {
+            try { $req = $Body | ConvertFrom-Json }
+            catch { return [pscustomobject]@{ status = 400; body = @{ error = 'Cuerpo JSON inválido.' } } }
+        }
+        $requestedBy = (([string]$req.requestedBy) -replace '[^\p{L}\p{N}_.@\\\- ]', '').Trim()
+        if ($requestedBy.Length -gt 128) { $requestedBy = $requestedBy.Substring(0, 128) }
+        try {
+            $item = Add-DeployQueueItem -Kind update -RequestedBy $requestedBy -DataDir $dir
+        }
+        catch {
+            return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
+        }
+        return [pscustomobject]@{ status = 202; body = @{
+            status = 'queued'; kind = 'update'; runId = $item.runId; position = $item.position
+            current = (Get-PublishToIISVersionInfo)
+            result = "/api/result?runId=$($item.runId)"
+        } }
     }
 
     if ($Method -eq 'POST' -and $Path -eq '/api/publish') {
@@ -2064,6 +2248,127 @@ function Request-RemotePublish {
         }
     }
     throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $($trig.runId)). Mira $Url/api/log con el token."
+}
+
+function Resolve-RemoteEndpoint {
+    # URL y token del endpoint a partir de -Server (sección `servers` + token
+    # registrado), de -Url/-Token explícitos o de PUBLISHTOIIS_API_TOKEN.
+    param([string]$Server, [string]$Url, [string]$Token)
+    if ($Server) {
+        if (-not $Url)   { $Url = Get-DeployServerUrl -Server $Server }
+        if (-not $Token) { $Token = Get-DeployToken -Server $Server }
+    }
+    if (-not $Url) { throw 'Falta -Url o -Server (para resolver la URL del endpoint).' }
+    if (-not $Token) { $Token = $env:PUBLISHTOIIS_API_TOKEN }
+    if (-not $Token) {
+        throw "Sin token: pásalo con -Token, o usa -Server <nombre> con el token registrado (Set-DeployToken -Server <nombre>), o define PUBLISHTOIIS_API_TOKEN."
+    }
+    [pscustomobject]@{ url = $Url.TrimEnd('/'); headers = @{ 'X-Api-Token' = $Token } }
+}
+
+function Get-RemoteDeployVersion {
+    <#
+    .SYNOPSIS
+        Versión, commit y rama del publicador que corre en un servidor remoto (GET /api/version).
+
+    .EXAMPLE
+        Get-RemoteDeployVersion -Server deployments-76
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Server,
+        [string]$Url,
+        [string]$Token,
+        [int]$TimeoutSec = 15
+    )
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    Invoke-RestMethod -Method Get -Uri "$($ep.url)/api/version" -Headers $ep.headers -TimeoutSec $TimeoutSec
+}
+
+function Request-RemoteUpdate {
+    <#
+    .SYNOPSIS
+        Actualiza el publicador de un servidor remoto a través de su endpoint HTTP, sin RDP.
+
+    .DESCRIPTION
+        POST a /api/update: el servidor encola la actualización en la misma cola
+        FIFO que los despliegues (nunca se actualiza a mitad de un publish), la
+        tarea elevada hace git pull --ff-only + reinstalación y reinicia el
+        listener del endpoint. Esta función sondea /api/result hasta el desenlace
+        —tolerando el corte de unos segundos del reinicio— y termina consultando
+        /api/version para enseñar el salto de versión.
+
+        Requisito único: que el servidor ya corra una versión con soporte de
+        /api/update (0.5.0 o superior). La primera vez se actualiza por RDP.
+
+    .EXAMPLE
+        Request-RemoteUpdate -Server deployments-76
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Server,
+        [string]$Url,
+        [string]$Token,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 600,
+        [int]$PollSeconds = 5,
+        [string]$RequestedBy = (Get-RequesterIdentity)
+    )
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+
+    $payload = @{ requestedBy = $RequestedBy } | ConvertTo-Json -Compress
+    try {
+        $trig = Invoke-RestMethod -Method Post -Uri "$($ep.url)/api/update" -Headers $ep.headers `
+            -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($payload))
+    }
+    catch {
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "El endpoint rechazó la orden de actualización: $detail (¿el servidor aún corre una versión sin /api/update? Entonces esta vez toca RDP + Update-PublishToIIS)."
+    }
+    $antes = if ($trig.current) { "$($trig.current.version) ($($trig.current.commit))" } else { '?' }
+    $pos = if ($trig.position -gt 1) { " (posición $($trig.position) en la cola)" } else { '' }
+    Write-Host "Actualización encolada (runId $($trig.runId))$pos. Versión actual del servidor: $antes." -ForegroundColor Gray
+    if ($NoWait) { return $trig }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastStatus = ''
+    $result = $null
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $PollSeconds
+        try {
+            $result = Invoke-RestMethod -Method Get -Uri "$($ep.url)/api/result?runId=$($trig.runId)" -Headers $ep.headers -TimeoutSec 15
+        }
+        catch { continue } # el listener se reinicia al final: unos polls fallidos son normales
+        if ($result.status -eq 'ok' -or $result.status -eq 'error') { break }
+        if ($result.status -ne $lastStatus) {
+            $lastStatus = $result.status
+            Write-Host "  ...$($result.status)" -ForegroundColor DarkGray
+        }
+        $result = $null
+    }
+    if (-not $result) { throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $($trig.runId))." }
+
+    $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
+    Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
+    if ($result.status -ne 'ok') { return $result }
+
+    # El listener acaba de reiniciarse con el código nuevo: darle unos segundos.
+    $despues = $null
+    $verDeadline = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $verDeadline) {
+        try { $despues = Get-RemoteDeployVersion -Url $ep.url -Token $ep.headers['X-Api-Token']; break }
+        catch { Start-Sleep -Seconds 3 }
+    }
+    if ($despues) {
+        Write-Host "Servidor $($despues.host): $antes -> $($despues.version) ($($despues.commit), rama $($despues.branch))" -ForegroundColor Green
+        $result | Add-Member -NotePropertyName version -NotePropertyValue $despues -Force
+    }
+    else {
+        Write-Warning "El endpoint no ha vuelto a responder en 90 s tras el reinicio; comprueba la tarea 'Publish Endpoint' en el servidor."
+    }
+    return $result
 }
 
 function Register-DeployEndpoint {
