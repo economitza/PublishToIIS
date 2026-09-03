@@ -82,6 +82,16 @@ const log = document.getElementById('log');
 let branchesCache = null;
 
 function esc(s) { return (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// Quién pidió el deploy (requestedBy: la cuenta que hizo clic). Los sellos
+// anteriores a 0.4.6 no lo traen, o traen la cuenta del swap: entonces se
+// enseña publishedBy marcado como tal, para no hacerlo pasar por quien pidió.
+function quien(di) {
+  const swap = (di.publishedBy || '').split('@');                 // "usuario@EQUIPO"
+  const cuentaSwap = swap.length === 2 ? `${swap[1]}\\${swap[0]}` : di.publishedBy;
+  const pidio = di.requestedBy || '';
+  if (pidio && pidio !== di.publishedBy && pidio !== cuentaSwap) return esc(pidio);
+  return `<span title="sello sin quién lo pidió: se muestra la cuenta que ejecutó el publish">${esc(di.publishedBy || '')} <em>(cuenta del publish)</em></span>`;
+}
 
 async function fetchJson(url, opts) {
   const r = await fetch(url, opts);
@@ -109,7 +119,7 @@ async function refreshStatus(env, row) {
     cellOnline.innerHTML = `<span class="sem" title="${esc(st.error || ('HTTP ' + st.httpStatus))}">${semaforo(st.online)}</span>`;
     const di = st.deployInfo;
     cellInfo.innerHTML = di
-      ? `<code>${esc(di.branch)}</code>@<code>${esc(di.commit)}</code><div class="muted">${esc((di.publishDate||'').slice(0,16))} · ${esc(di.requestedBy || di.publishedBy || '')}</div>`
+      ? `<code>${esc(di.branch)}</code>@<code>${esc(di.commit)}</code><div class="muted">${esc((di.publishDate||'').slice(0,16))} · ${quien(di)}</div>`
       : `<span class="muted">${env.siteUrl ? 'sin deploy-info.json (versión anterior a fase 1)' : 'configura siteUrl en environments.json'}</span>`;
   } catch (e) { cellOnline.textContent = '⚠'; cellInfo.innerHTML = `<span class="muted">${esc(e.message)}</span>`; }
 }
@@ -209,7 +219,7 @@ function renderJiraRows() {
   for (const e of rows) {
     const sirviendo = e.sirviendo
       ? `<code>${esc(e.sirviendo.branch)}</code>@<code>${esc(e.sirviendo.commit)}</code>
-         <div class="muted">${esc((e.sirviendo.publishDate || '').slice(0, 16))} · ${esc(e.sirviendo.requestedBy || e.sirviendo.publishedBy || '')}</div>`
+         <div class="muted">${esc((e.sirviendo.publishDate || '').slice(0, 16))} · ${quien(e.sirviendo)}</div>`
       : '<span class="muted">—</span>';
     tb.insertAdjacentHTML('beforeend', `<tr>
       <td><a href="${esc(e.env)}" target="_blank">${esc(e.env.replace(/^https?:\/\//, ''))}</a></td>
