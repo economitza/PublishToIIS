@@ -920,3 +920,114 @@ Describe 'Publish preserva connections.config como el web.config' {
         finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
+
+Describe 'Aprovisionamiento de sites (Initialize-IisSite y piezas)' {
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_prov_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:tmp | Out-Null
+    }
+    AfterEach { Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'Test-CertCoversHost acepta el nombre exacto y el wildcard de un nivel, y rechaza el resto' {
+        InModuleScope PublishToIIS {
+            (Test-CertCoversHost -DnsNames @('*.economitza.com') -Target 'devecoesp3.economitza.com') | Should -BeTrue
+            (Test-CertCoversHost -DnsNames @('devecoesp3.economitza.com') -Target 'devecoesp3.economitza.com') | Should -BeTrue
+            (Test-CertCoversHost -DnsNames @('*.economitza.com') -Target 'a.b.economitza.com') | Should -BeFalse
+            (Test-CertCoversHost -DnsNames @('*.emkt.test') -Target 'devecoesp3.economitza.com') | Should -BeFalse
+        }
+    }
+
+    Context 'Set-ConnectionStringCatalog' {
+        It 'cambia el catálogo en el connections.config al que apunta el Web.config por configSource' {
+            $web = Join-Path $script:tmp 'Web.config'
+            $conn = Join-Path $script:tmp 'connections.config'
+            '<configuration><connectionStrings configSource="connections.config"/></configuration>' | Set-Content $web -Encoding UTF8
+            @'
+<connectionStrings>
+  <add name="cc" connectionString="Data Source=localhost;Initial Catalog=CCEspana;Integrated Security=True" providerName="System.Data.SqlClient" />
+  <add name="otra" connectionString="Data Source=MBM\SQL2014;Initial Catalog=CCGenericos;User ID=u;Password=p" providerName="System.Data.SqlClient" />
+</connectionStrings>
+'@ | Set-Content $conn -Encoding UTF8
+
+            $n = Set-ConnectionStringCatalog -WebConfigPath $web -DatabaseMap @{ CCEspana = 'CCEspana_esp3' }
+            $n | Should -Be 1
+            $txt = Get-Content $conn -Raw
+            $txt | Should -Match 'Initial Catalog=CCEspana_esp3;Integrated'
+            $txt | Should -Match 'Initial Catalog=CCGenericos;'
+        }
+
+        It 'cambia el catálogo en un Web.config con las cadenas inline (Database= también) y no toca el resto' {
+            $web = Join-Path $script:tmp 'Web.config'
+            @'
+<configuration>
+  <connectionStrings>
+    <add name="a" connectionString="Server=.;Database=CCAndorra;Trusted_Connection=True" />
+    <add name="b" connectionString="Server=.;Database=Logs;Trusted_Connection=True" />
+  </connectionStrings>
+</configuration>
+'@ | Set-Content $web -Encoding UTF8
+            (Set-ConnectionStringCatalog -WebConfigPath $web -DatabaseMap @{ ccandorra = 'CCAndorra_and3' }) | Should -Be 1
+            $txt = Get-Content $web -Raw
+            $txt | Should -Match 'Database=CCAndorra_and3;'
+            $txt | Should -Match 'Database=Logs;'
+        }
+
+        It 'devuelve 0 si el mapa no casa con ninguna cadena o no hay fichero' {
+            $web = Join-Path $script:tmp 'Web.config'
+            '<configuration><connectionStrings><add name="a" connectionString="Server=.;Database=X" /></connectionStrings></configuration>' | Set-Content $web -Encoding UTF8
+            (Set-ConnectionStringCatalog -WebConfigPath $web -DatabaseMap @{ Y = 'Z' }) | Should -Be 0
+            (Set-ConnectionStringCatalog -WebConfigPath (Join-Path $script:tmp 'no.config') -DatabaseMap @{ Y = 'Z' }) | Should -Be 0
+        }
+    }
+
+    It 'Get-LocalIntegratedSqlServers sigue el configSource y solo devuelve instancias locales con Integrated Security' {
+        $web = Join-Path $script:tmp 'Web.config'
+        $conn = Join-Path $script:tmp 'connections.config'
+        '<configuration><connectionStrings configSource="connections.config"/></configuration>' | Set-Content $web -Encoding UTF8
+        @'
+<connectionStrings>
+  <add name="local" connectionString="Data Source=localhost;Initial Catalog=CCEspana;Integrated Security=True" />
+  <add name="remota" connectionString="Data Source=MBM\SQL2014;Initial Catalog=CCGenericos;User ID=u;Password=p" />
+  <add name="localsql" connectionString="Data Source=.\SQLEXPRESS;Initial Catalog=X;User ID=u;Password=p" />
+</connectionStrings>
+'@ | Set-Content $conn -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ web = $web } {
+            $srv = Get-LocalIntegratedSqlServers -WebConfigPath $web
+            @($srv) | Should -Be @('localhost')
+        }
+    }
+
+    It 'ConvertTo-DatabaseMap acepta hashtable y PSCustomObject (del JSON) y devuelve null si está vacío' {
+        InModuleScope PublishToIIS {
+            $h = ConvertTo-DatabaseMap ([pscustomobject]@{ CCEspana = 'CCEspana_esp3' })
+            $h | Should -BeOfType [hashtable]
+            $h['CCEspana'] | Should -Be 'CCEspana_esp3'
+            (ConvertTo-DatabaseMap @{ a = 'b' })['a'] | Should -Be 'b'
+            ConvertTo-DatabaseMap $null | Should -BeNullOrEmpty
+            ConvertTo-DatabaseMap ([pscustomobject]@{}) | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'Initialize-IisSite exige administrador (o IIS): sin elevación lanza antes de tocar nada' {
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($isAdmin) { Set-ItResult -Skipped -Because 'la sesión de tests está elevada' ; return }
+        { Initialize-IisSite -Name 'p2iis-test' -Destination (Join-Path $script:tmp 'site') -HostName 'p2iis.test' } |
+            Should -Throw '*administrador*'
+        Test-Path (Join-Path $script:tmp 'site') | Should -BeFalse
+    }
+
+    It 'Invoke-DeployOrder (dry-run) con entorno ad hoc que declara templateSite lo refleja en el plan sin tocar IIS' {
+        $def = [pscustomobject]@{
+            name = 'p2iis-adhoc-prov'; origin = 'C:\x\repo\Proj'; destination = 'C:\x\www\site'
+            siteUrl = 'https://p2iis-adhoc.test'; templateSite = 'devecoesp1'; databaseMap = [pscustomobject]@{ CCEspana = 'CCEspana_x' }
+        }
+        $plan = Invoke-DeployOrder -Environment 'p2iis-adhoc-prov' -Branch 'main' -EnvironmentDef $def 6>$null
+        $plan.provision | Should -Match "plantilla 'devecoesp1'"
+        $plan.mode | Should -Be 'DRY-RUN'
+    }
+
+    It 'Invoke-DeployOrder (dry-run) sin templateSite deja provision en "-"' {
+        $plan = Invoke-DeployOrder -Environment 'devecoesp1' -Branch 'main' 6>$null
+        $plan.provision | Should -Be '-'
+    }
+}

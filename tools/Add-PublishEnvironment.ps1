@@ -9,8 +9,10 @@
 #       -EndpointUrl https://deployments-76.economitza.com   # no interactivo
 #
 # Campos: Name (obligatorio, unico). Origin/Destination/AppPool/SiteUrl/ServerName/
-# EndpointUrl opcionales - solo se escriben los que se rellenen. Con EndpointUrl el
-# entorno se publica en remoto por el endpoint; sin el, en local (origin en la maquina).
+# EndpointUrl/TemplateSite opcionales - solo se escriben los que se rellenen. Con
+# EndpointUrl el entorno se publica en remoto por el endpoint; sin el, en local
+# (origin en la maquina). Con TemplateSite, el primer publish crea el site de IIS
+# clonando ese site (Initialize-IisSite) si no existe.
 [CmdletBinding()]
 param(
     [string]$Name,
@@ -20,6 +22,7 @@ param(
     [string]$SiteUrl,
     [string]$ServerName,
     [string]$EndpointUrl,
+    [string]$TemplateSite,
     # No commitear/pushear (solo modificar el fichero local).
     [switch]$NoPush,
     # No preguntar (falla si falta algo obligatorio); util para scripts.
@@ -54,6 +57,7 @@ $AppPool     = Read-Field -Prompt 'AppPool'     -Current $AppPool
 $SiteUrl     = Read-Field -Prompt 'SiteUrl'     -Current $SiteUrl
 $ServerName  = Read-Field -Prompt 'ServerName'  -Current $ServerName
 $EndpointUrl = Read-Field -Prompt 'EndpointUrl' -Current $EndpointUrl
+$TemplateSite = Read-Field -Prompt 'TemplateSite' -Current $TemplateSite
 
 if ($Name -notmatch '^[A-Za-z0-9._-]+$') {
     throw "Nombre de entorno con caracteres no permitidos: '$Name' (usa letras, digitos, . _ -)."
@@ -77,6 +81,7 @@ $fields = [ordered]@{
     siteUrl     = $SiteUrl
     serverName  = $ServerName
     endpointUrl = $EndpointUrl
+    templateSite = $TemplateSite
 }
 $fieldLines = foreach ($k in $fields.Keys) {
     if ($fields[$k]) {

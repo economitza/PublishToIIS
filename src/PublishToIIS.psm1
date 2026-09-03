@@ -101,6 +101,395 @@ function Protect-ProductionWebConfig {
     return 'preserved'
 }
 
+# ─── Aprovisionamiento de sites IIS desde una plantilla ─────────────────────
+# Lo que hacía tools\New-LocalIisSite.ps1 en su fase elevada, ahora en el módulo
+# para que Publish pueda crear el site la primera vez que publica en un entorno
+# nuevo (entrada con `templateSite` en environments.json). Idempotente: lo que ya
+# existe se respeta y solo se crea lo que falta.
+
+function Test-CertCoversHost {
+    # ¿Alguno de los nombres DNS del certificado (con soporte wildcard de un
+    # solo nivel, como hacen los navegadores) cubre el hostname?
+    param([string[]]$DnsNames, [string]$Target)
+    foreach ($n in $DnsNames) {
+        if ($n -ieq $Target) { return $true }
+        if ($n.StartsWith('*.')) {
+            $suffix = $n.Substring(1) # ".emkt.test"
+            if ($Target.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase) -and
+                $Target.Split('.').Count -eq $n.Split('.').Count) { return $true }
+        }
+    }
+    return $false
+}
+
+function Find-SiteCertificate {
+    # Certificado para el binding https: primero el del site plantilla si cubre
+    # el hostname; si no, el primero de LocalMachine\My vigente que lo cubra.
+    param($TemplateHttpsBinding, [string]$Target)
+
+    if ($TemplateHttpsBinding -and $TemplateHttpsBinding.certificateHash) {
+        $store = if ($TemplateHttpsBinding.certificateStoreName) { $TemplateHttpsBinding.certificateStoreName } else { 'My' }
+        $cert = Get-ChildItem "Cert:\LocalMachine\$store" |
+            Where-Object Thumbprint -eq $TemplateHttpsBinding.certificateHash | Select-Object -First 1
+        if ($cert -and (Test-CertCoversHost -DnsNames @($cert.DnsNameList | ForEach-Object Unicode) -Target $Target)) {
+            return [pscustomobject]@{ cert = $cert; store = $store; source = 'site plantilla' }
+        }
+    }
+
+    $cert = Get-ChildItem Cert:\LocalMachine\My |
+        Where-Object { $_.NotAfter -gt (Get-Date) -and (Test-CertCoversHost -DnsNames @($_.DnsNameList | ForEach-Object Unicode) -Target $Target) } |
+        Sort-Object NotAfter -Descending | Select-Object -First 1
+    if ($cert) { return [pscustomobject]@{ cert = $cert; store = 'My'; source = 'LocalMachine\My' } }
+
+    throw ("No hay ningún certificado en LocalMachine\My que cubra '$Target'. " +
+           "Genera uno (p.ej. mkcert '*.$(($Target -split '\.', 2)[1])') e impórtalo, o indica otro site plantilla.")
+}
+
+function Get-ConnectionStringNodes {
+    # Nodos <add> de connectionStrings de un Web.config, siguiendo configSource
+    # si la sección vive en otro fichero (connections.config). Devuelve pares
+    # (fichero, nodo) para poder guardar cada documento tocado.
+    param([string]$WebConfigPath)
+    if (-not (Test-Path $WebConfigPath)) { return @() }
+    $xml = New-Object Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.Load($WebConfigPath)
+    $section = $xml.SelectSingleNode('/configuration/connectionStrings')
+    if (-not $section) { return @() }
+    $source = $section.GetAttribute('configSource')
+    if ($source) {
+        $ext = Join-Path (Split-Path $WebConfigPath -Parent) $source
+        if (-not (Test-Path $ext)) { return @() }
+        $xml = New-Object Xml.XmlDocument
+        $xml.PreserveWhitespace = $true
+        $xml.Load($ext)
+        $section = $xml.SelectSingleNode('/connectionStrings')
+        if (-not $section) { return @() }
+        return @($section.SelectNodes('add') | ForEach-Object { [pscustomobject]@{ path = $ext; doc = $xml; node = $_ } })
+    }
+    @($section.SelectNodes('add') | ForEach-Object { [pscustomobject]@{ path = $WebConfigPath; doc = $xml; node = $_ } })
+}
+
+function Set-ConnectionStringCatalog {
+    <#
+    .SYNOPSIS
+        Cambia la base de datos (Initial Catalog / Database) de las cadenas de conexión de un config.
+
+    .DESCRIPTION
+        Recorre los <add> de connectionStrings del Web.config indicado (o del
+        connections.config al que apunte por configSource) y, para cada cadena
+        cuyo catálogo aparezca como clave del mapa, lo sustituye por el valor. Las
+        demás cadenas no se tocan. Es lo que permite que un site aprovisionado
+        desde una plantilla nazca apuntando a SU base de datos y no a la de la
+        plantilla. Devuelve el número de cadenas modificadas.
+
+    .EXAMPLE
+        Set-ConnectionStringCatalog -WebConfigPath E:\wwwrootDevecoEsp3\Web.config -DatabaseMap @{ CCEspana = 'CCEspana_esp3' }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WebConfigPath,
+        [Parameter(Mandatory)][hashtable]$DatabaseMap
+    )
+    $entries = Get-ConnectionStringNodes -WebConfigPath $WebConfigPath
+    $changed = 0
+    $docs = @{}
+    foreach ($e in $entries) {
+        $cs = $e.node.GetAttribute('connectionString')
+        $new = [regex]::Replace($cs, '(?i)(Initial Catalog|Database)\s*=\s*([^;]+)', {
+            param($m)
+            $db = $m.Groups[2].Value.Trim()
+            if ($DatabaseMap.ContainsKey($db)) { "$($m.Groups[1].Value)=$($DatabaseMap[$db])" } else { $m.Value }
+        }.GetNewClosure())
+        if ($new -ne $cs) {
+            $e.node.SetAttribute('connectionString', $new)
+            $docs[$e.path] = $e.doc
+            $changed++
+        }
+    }
+    foreach ($p in $docs.Keys) { $docs[$p].Save($p) }
+    $changed
+}
+
+function Get-LocalIntegratedSqlServers {
+    # Data Sources del Web.config que apuntan a la instancia LOCAL con
+    # Integrated Security: son los que autentican con la identidad del app pool.
+    param([string]$WebConfigPath)
+    $servers = @()
+    foreach ($e in (Get-ConnectionStringNodes -WebConfigPath $WebConfigPath)) {
+        $cs = [string]$e.node.GetAttribute('connectionString')
+        if ($cs -match '(?i)Integrated Security\s*=\s*(True|SSPI)' -and $cs -match '(?i)Data Source\s*=\s*([^;]+)') {
+            $ds = $Matches[1].Trim()
+            $machine = ($ds -split '[\\,]')[0].Trim()
+            if ($machine -in @('localhost', '.', '(local)', '127.0.0.1', $env:COMPUTERNAME)) { $servers += $ds }
+        }
+    }
+    return @($servers | Select-Object -Unique)
+}
+
+function Copy-AppPoolSqlAccess {
+    # Replica en $Server el acceso del login del pool plantilla al del pool
+    # nuevo: crea el login de Windows si falta y, en cada BD donde la plantilla
+    # tiene usuario, crea el usuario y lo mete en los mismos roles. Idempotente.
+    param([string]$Server, [string]$TemplateLogin, [string]$NewLogin)
+
+    function Escape-SqlName([string]$n) { '[' + ($n -replace '\]', ']]') + ']' }
+
+    Add-Type -AssemblyName System.Data
+    $cn = New-Object System.Data.SqlClient.SqlConnection("Data Source=$Server;Initial Catalog=master;Integrated Security=True;Encrypt=False")
+    $cn.Open()
+    try {
+        $cmd = $cn.CreateCommand()
+        $cmd.CommandText = 'SELECT COUNT(*) FROM sys.server_principals WHERE name = @n'
+        [void]$cmd.Parameters.AddWithValue('@n', $TemplateLogin)
+        if ([int]$cmd.ExecuteScalar() -eq 0) { return "el pool plantilla no tiene login '$TemplateLogin' en $Server; nada que replicar" }
+
+        $cmd.Parameters['@n'].Value = $NewLogin
+        if ([int]$cmd.ExecuteScalar() -eq 0) {
+            $cmd.Parameters.Clear()
+            $cmd.CommandText = "CREATE LOGIN $(Escape-SqlName $NewLogin) FROM WINDOWS"
+            [void]$cmd.ExecuteNonQuery()
+        }
+
+        $cmd.Parameters.Clear()
+        $cmd.CommandText = "SELECT name FROM sys.databases WHERE state = 0 AND name NOT IN ('master','tempdb','model','msdb')"
+        $rd = $cmd.ExecuteReader()
+        $dbs = @(); while ($rd.Read()) { $dbs += $rd[0] }
+        $rd.Close()
+
+        $replicated = @()
+        foreach ($db in $dbs) {
+            $dbCmd = $cn.CreateCommand()
+            $dbCmd.CommandText = "USE $(Escape-SqlName $db); SELECT r.name FROM sys.database_role_members m JOIN sys.database_principals r ON r.principal_id = m.role_principal_id JOIN sys.database_principals u ON u.principal_id = m.member_principal_id WHERE u.name = @t; "
+            [void]$dbCmd.Parameters.AddWithValue('@t', $TemplateLogin)
+            $roles = @(); $rd = $dbCmd.ExecuteReader(); while ($rd.Read()) { $roles += $rd[0] }; $rd.Close()
+
+            $dbCmd.CommandText = "USE $(Escape-SqlName $db); SELECT COUNT(*) FROM sys.database_principals WHERE name = @t"
+            if ([int]$dbCmd.ExecuteScalar() -eq 0) { continue } # la plantilla no tiene usuario aquí
+
+            $apply = $cn.CreateCommand()
+            $apply.CommandText = "USE $(Escape-SqlName $db); IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '$($NewLogin -replace "'", "''")') CREATE USER $(Escape-SqlName $NewLogin) FOR LOGIN $(Escape-SqlName $NewLogin); " +
+                (($roles | ForEach-Object { "ALTER ROLE $(Escape-SqlName $_) ADD MEMBER $(Escape-SqlName $NewLogin); " }) -join '')
+            [void]$apply.ExecuteNonQuery()
+            $replicated += "$db ($($roles -join ','))"
+        }
+        if ($replicated) { return "acceso replicado en $Server -> " + ($replicated -join '; ') }
+        return "login creado en $Server (la plantilla no tenía usuario en ninguna BD)"
+    }
+    finally { $cn.Close() }
+}
+
+function ConvertTo-DatabaseMap {
+    # El mapa llega como hashtable (código) o como PSCustomObject (JSON de
+    # environments.json / orden ad hoc). Siempre hashtable, sin distinguir mayúsculas.
+    param($Map)
+    if ($null -eq $Map) { return $null }
+    if ($Map -is [hashtable]) { return $Map }
+    $h = @{}
+    foreach ($p in $Map.PSObject.Properties) { $h[$p.Name] = [string]$p.Value }
+    if ($h.Count) { $h } else { $null }
+}
+
+function Initialize-IisSite {
+    <#
+    .SYNOPSIS
+        Deja listo un site de IIS (carpeta, app pool, site, bindings http/https con
+        certificado y configuración sembrada) clonando un site plantilla. Idempotente.
+
+    .DESCRIPTION
+        Es el aprovisionamiento que Publish ejecuta antes del primer despliegue en
+        un entorno cuya entrada declara `templateSite`. Pasos (lo que ya existe se
+        respeta, solo se crea lo que falta):
+          1) carpeta de destino
+          2) app pool -AppPoolName (por defecto -Name), clonando runtime/pipeline
+             del pool de la plantilla
+          3) site -Name con bindings *:80 y *:443 (SNI) para -HostName, con el
+             certificado de la plantilla si cubre el host (wildcard) o el primero
+             válido de LocalMachine\My. Si ya hay un site con ese host header bajo
+             OTRO nombre, se usa ese (no se crea un segundo).
+          4) siembra de Web.config y connections.config desde la carpeta de la
+             plantilla (Publish los preserva en cada swap, como en los servidores)
+             y, con -DatabaseMap, cambio del catálogo de las cadenas de conexión
+             sembradas para que el site nazca con SU base de datos
+          5) si la plantilla conecta a SQL local con Integrated Security, réplica
+             del acceso del pool plantilla al nuevo (login + usuarios + roles)
+          6) con -HostsIp, entrada "<ip> <hostname>" en el archivo hosts (solo
+             tiene sentido en el portátil; en un servidor con DNS no se pasa)
+
+        Requiere privilegios de administrador (IIS). Devuelve un objeto con lo
+        que se ha hecho (`actions`) y el app pool efectivo del site.
+
+    .EXAMPLE
+        Initialize-IisSite -Name devecoesp3 -Destination E:\wwwrootDevecoEsp3 -HostName devecoesp3.economitza.com -TemplateSite devecoesp1 -DatabaseMap @{ CCEspana = 'CCEspana_esp3' }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9._-]*$')][string]$Name,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9.-]*$')][string]$HostName,
+        [string]$AppPoolName,
+        [string]$TemplateSite,
+        $DatabaseMap,
+        [string]$HostsIp,
+        [switch]$SkipSqlAccess
+    )
+    $ErrorActionPreference = 'Stop'
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) { throw 'Initialize-IisSite requiere privilegios de administrador (IIS).' }
+    Import-Module WebAdministration -ErrorAction Stop
+
+    if (-not $AppPoolName) { $AppPoolName = $Name }
+    $DatabaseMap = ConvertTo-DatabaseMap $DatabaseMap
+    $actions = New-Object System.Collections.Generic.List[string]
+
+    $template = $null
+    $templatePath = $null
+    if ($TemplateSite) {
+        $template = Get-Website -Name $TemplateSite -ErrorAction SilentlyContinue
+        if (-not $template) { throw "El site plantilla '$TemplateSite' no existe en este IIS." }
+        $templatePath = [Environment]::ExpandEnvironmentVariables([string]$template.physicalPath)
+    }
+    $templateHttps = if ($template) {
+        $template.bindings.Collection | Where-Object protocol -eq 'https' | Select-Object -First 1
+    }
+
+    # 1) carpeta
+    if (Test-Path $Destination) {
+        Write-Host "[1/6] Carpeta ya existe: $Destination" -ForegroundColor Gray
+    } else {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        $actions.Add("carpeta $Destination")
+        Write-Host "[1/6] Carpeta creada: $Destination" -ForegroundColor Green
+    }
+
+    # 3, antes que 2) ¿ya hay un site sirviendo este host? Entonces su pool manda.
+    $site = Get-Website -Name $Name -ErrorAction SilentlyContinue
+    if (-not $site) {
+        $clash = Get-WebBinding | Where-Object bindingInformation -match ":$([regex]::Escape($HostName))$" | Select-Object -First 1
+        if ($clash -and $clash.ItemXPath -match "@name='([^']+)'") {
+            $site = Get-Website -Name $Matches[1] -ErrorAction SilentlyContinue
+            if ($site) {
+                Write-Warning "El host '$HostName' ya lo sirve el site '$($site.name)' (pool '$($site.applicationPool)'); se usa ese en vez de crear '$Name'."
+                $AppPoolName = $site.applicationPool
+            }
+        }
+    }
+
+    # 2) app pool
+    if (Test-Path "IIS:\AppPools\$AppPoolName") {
+        Write-Host "[2/6] App pool ya existe: $AppPoolName" -ForegroundColor Gray
+    } else {
+        New-WebAppPool -Name $AppPoolName | Out-Null
+        $runtime = 'v4.0'; $pipeline = 'Integrated'
+        if ($template) {
+            $tp = Get-Item "IIS:\AppPools\$($template.applicationPool)" -ErrorAction SilentlyContinue
+            if ($tp) { $runtime = $tp.managedRuntimeVersion; $pipeline = [string]$tp.managedPipelineMode }
+        }
+        Set-ItemProperty "IIS:\AppPools\$AppPoolName" managedRuntimeVersion $runtime
+        Set-ItemProperty "IIS:\AppPools\$AppPoolName" managedPipelineMode $pipeline
+        $actions.Add("app pool $AppPoolName")
+        Write-Host "[2/6] App pool creado: $AppPoolName ($runtime, $pipeline)" -ForegroundColor Green
+    }
+
+    # 3) site + bindings + certificado
+    if ($site) {
+        $sitePath = [Environment]::ExpandEnvironmentVariables([string]$site.physicalPath)
+        if ($sitePath -ne $Destination.TrimEnd('\')) {
+            throw "El site '$($site.name)' ya existe pero apunta a '$sitePath', no a '$Destination'. Corrige la entrada del entorno o el site."
+        }
+        Write-Host "[3/6] Site ya existe: $($site.name)" -ForegroundColor Gray
+    } else {
+        New-Website -Name $Name -PhysicalPath $Destination -ApplicationPool $AppPoolName `
+            -HostHeader $HostName -Port 80 | Out-Null
+        New-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostName -SslFlags 1
+
+        $found = Find-SiteCertificate -TemplateHttpsBinding $templateHttps -Target $HostName
+        $httpsBinding = Get-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostName
+        $httpsBinding.AddSslCertificate($found.cert.Thumbprint, $found.store)
+        $site = Get-Website -Name $Name
+        $actions.Add("site $Name ($HostName, cert $($found.source))")
+        Write-Host ("[3/6] Site creado: {0} -> {1} (http+https SNI, cert '{2}' de {3}, caduca {4:yyyy-MM-dd})" -f `
+            $Name, $HostName, $found.cert.Subject.Split(',')[0], $found.source, $found.cert.NotAfter) -ForegroundColor Green
+    }
+
+    # 4) siembra de la configuración de la plantilla (Publish la preserva en el swap)
+    $seeded = @()
+    foreach ($file in 'Web.config', 'connections.config') {
+        $dest = Join-Path $Destination $file
+        if (Test-Path $dest) { continue }
+        if (-not $templatePath) { continue }
+        $src = Join-Path $templatePath $file
+        if (Test-Path $src) {
+            Copy-Item $src $dest
+            $seeded += $file
+        }
+    }
+    if ($seeded) {
+        $actions.Add("config sembrada desde '$TemplateSite': $($seeded -join ', ')")
+        Write-Host "[4/6] Sembrado desde '$TemplateSite': $($seeded -join ', ')" -ForegroundColor Green
+        if ($DatabaseMap) {
+            $n = Set-ConnectionStringCatalog -WebConfigPath (Join-Path $Destination 'Web.config') -DatabaseMap $DatabaseMap
+            $desc = ($DatabaseMap.Keys | ForEach-Object { "$_ -> $($DatabaseMap[$_])" }) -join ', '
+            if ($n -gt 0) {
+                $actions.Add("catálogo de BD cambiado en $n cadena(s): $desc")
+                Write-Host "[4/6] Base de datos: $n cadena(s) apuntadas a su catálogo ($desc)" -ForegroundColor Green
+            } else {
+                Write-Warning "[4/6] databaseMap ($desc) no casó con ninguna cadena de conexión sembrada."
+            }
+        }
+    } elseif ($templatePath) {
+        Write-Host "[4/6] Configuración ya presente en el destino (se preservará)" -ForegroundColor Gray
+    } else {
+        Write-Host "[4/6] Sin plantilla: el publish usará la configuración del repo" -ForegroundColor Yellow
+    }
+
+    # 5) acceso SQL del app pool (Integrated Security contra la instancia local)
+    if ($template -and -not $SkipSqlAccess) {
+        $sqlServers = Get-LocalIntegratedSqlServers -WebConfigPath (Join-Path $Destination 'Web.config')
+        if (-not $sqlServers) {
+            Write-Host "[5/6] La configuración no conecta a SQL local con Integrated Security: nada que replicar" -ForegroundColor Gray
+        }
+        foreach ($srv in $sqlServers) {
+            try {
+                $msg = Copy-AppPoolSqlAccess -Server $srv `
+                    -TemplateLogin "IIS APPPOOL\$($template.applicationPool)" -NewLogin "IIS APPPOOL\$AppPoolName"
+                $actions.Add("SQL: $msg")
+                Write-Host "[5/6] SQL: $msg" -ForegroundColor Green
+            } catch {
+                Write-Warning "[5/6] SQL: no se pudo replicar el acceso en '$srv': $($_.Exception.Message)"
+            }
+        }
+    } else {
+        Write-Host "[5/6] Acceso SQL del pool: no se toca" -ForegroundColor Gray
+    }
+
+    # 6) hosts (solo si se pide: en un servidor con DNS sobra)
+    if ($HostsIp) {
+        $hostsFile = Join-Path $env:windir 'System32\drivers\etc\hosts'
+        $hasEntry = Select-String -Path $hostsFile -Pattern "^\s*[^#\s]\S*\s+.*\b$([regex]::Escape($HostName))\b" -Quiet
+        if ($hasEntry) {
+            Write-Host "[6/6] hosts ya contiene $HostName" -ForegroundColor Gray
+        } else {
+            $rawHosts = [IO.File]::ReadAllText($hostsFile)
+            $newline = if ($rawHosts.EndsWith("`n")) { '' } else { "`r`n" }
+            [IO.File]::AppendAllText($hostsFile, "$newline$HostsIp`t$HostName`r`n")
+            $actions.Add("hosts: $HostsIp $HostName")
+            Write-Host "[6/6] hosts: añadido $HostsIp $HostName" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "[6/6] hosts: no se toca (resolución por DNS)" -ForegroundColor Gray
+    }
+
+    [pscustomobject]@{
+        site        = $site.name
+        appPool     = $AppPoolName
+        destination = $Destination
+        hostName    = $HostName
+        template    = $TemplateSite
+        actions     = @($actions)
+    }
+}
+
 function New-DeployInfo {
     <#
     .SYNOPSIS
@@ -179,7 +568,14 @@ function Publish {
         [hashtable]$MSBuildProperties = @{},
         [switch]$KeepPrevious,
         [switch]$OverrideWebconfig,
-        [string]$RequestedBy
+        [string]$RequestedBy,
+        # Aprovisionamiento (ver Initialize-IisSite): si el entorno declara un site
+        # plantilla, el site se crea la primera vez y se respeta las siguientes.
+        # Se resuelven de la entrada del entorno (templateSite, hostName/siteUrl,
+        # databaseMap) cuando no se pasan explícitos.
+        [string]$TemplateSite,
+        [string]$HostName,
+        $DatabaseMap
     )
 
     # Check for admin privileges
@@ -193,8 +589,10 @@ function Publish {
 
     Write-Host "ENTER Publish function" -ForegroundColor Cyan
 
-    # If ProjectPath, Destination or AppPoolName not provided, load from central config
-    if (-not $ProjectPath -or -not $Destination -or -not $AppPoolName) {
+    # Rutas, pool y aprovisionamiento no indicados: se toman de la config central.
+    # Con las rutas explícitas (entorno ad hoc) un entorno desconocido no es error.
+    $cfg = $null
+    if ($Environment -or -not $ProjectPath -or -not $Destination -or -not $AppPoolName) {
         if (-not (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue)) {
             # try to dot-source config if available relative to module
             $maybeCfg = Join-Path $PSScriptRoot '..\config\config.ps1'
@@ -202,13 +600,23 @@ function Publish {
         }
 
         if (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue) {
-            $cfg = Get-PublishConfig -Environment $Environment
-            if (-not $ProjectPath -and $cfg.origin) { $ProjectPath = $cfg.origin }
-            if (-not $Destination -and $cfg.destination) { $Destination = $cfg.destination }
-            if (-not $AppPoolName -and $cfg.appPool) { $AppPoolName = $cfg.appPool }
-            # By convention the app pool matches the environment name; use it when not set explicitly
-            if (-not $AppPoolName -and $cfg._environment) { $AppPoolName = $cfg._environment }
+            try { $cfg = Get-PublishConfig -Environment $Environment }
+            catch { if (-not $ProjectPath -or -not $Destination) { throw } }
         }
+    }
+    if ($cfg) {
+        if (-not $ProjectPath -and $cfg.origin) { $ProjectPath = $cfg.origin }
+        if (-not $Destination -and $cfg.destination) { $Destination = $cfg.destination }
+        if (-not $AppPoolName -and $cfg.appPool) { $AppPoolName = $cfg.appPool }
+        # By convention the app pool matches the environment name; use it when not set explicitly
+        if (-not $AppPoolName -and $cfg._environment) { $AppPoolName = $cfg._environment }
+        if (-not $TemplateSite -and $cfg.templateSite) { $TemplateSite = [string]$cfg.templateSite }
+        if (-not $HostName -and $cfg.hostName) { $HostName = [string]$cfg.hostName }
+        if (-not $HostName -and $cfg.siteUrl) { $HostName = ([Uri][string]$cfg.siteUrl).Host }
+        if (-not $DatabaseMap -and $cfg.databaseMap) { $DatabaseMap = $cfg.databaseMap }
+    }
+    if (-not $ProjectPath -or -not $Destination) {
+        throw "Publish necesita ProjectPath y Destination (explícitos o por -Environment en environments.json)."
     }
 
     $msbuild = Get-MSBuild
@@ -219,6 +627,22 @@ function Publish {
 
     # Default the app pool to the site (destination) name when not configured
     if (-not $AppPoolName) { $AppPoolName = $siteName }
+
+    # Aprovisionamiento: con site plantilla declarado, el site/pool/carpeta se
+    # crean si faltan (y se respetan si existen) ANTES de construir nada. El
+    # nombre del site en IIS es el del entorno, como el del pool.
+    if ($TemplateSite) {
+        if (-not $HostName) {
+            throw "El entorno declara templateSite '$TemplateSite' pero no hay hostname (campo hostName o siteUrl)."
+        }
+        $iisSiteName = if ($Environment) { $Environment } else { $siteName }
+        Write-Host "Aprovisionando site '$iisSiteName' ($HostName) desde la plantilla '$TemplateSite'..." -ForegroundColor Yellow
+        $prov = Initialize-IisSite -Name $iisSiteName -AppPoolName $AppPoolName -Destination $Destination `
+            -HostName $HostName -TemplateSite $TemplateSite -DatabaseMap $DatabaseMap
+        $AppPoolName = $prov.appPool
+        if ($prov.actions.Count) { Write-Host ("Aprovisionado: " + ($prov.actions -join '; ')) -ForegroundColor Green }
+        else { Write-Host "Site ya aprovisionado; nada que crear." -ForegroundColor Gray }
+    }
 
     $releasingDir = Join-Path $parentDir "${siteName}_releasing"
     $previousDir = Join-Path $parentDir "${siteName}_previous"
@@ -445,6 +869,10 @@ function Invoke-DeployOrder {
         $pubArgs.ProjectPath = $cfg.origin
         $pubArgs.Destination = $cfg.destination
         if ($cfg.appPool) { $pubArgs.AppPoolName = $cfg.appPool }
+        if ($cfg.templateSite) { $pubArgs.TemplateSite = [string]$cfg.templateSite }
+        if ($cfg.hostName) { $pubArgs.HostName = [string]$cfg.hostName }
+        elseif ($cfg.siteUrl) { $pubArgs.HostName = ([Uri][string]$cfg.siteUrl).Host }
+        if ($cfg.databaseMap) { $pubArgs.DatabaseMap = $cfg.databaseMap }
     }
     if ($OverrideWebconfig) { $pubArgs.OverrideWebconfig = $true }
     if ($Configuration) { $pubArgs.Configuration = $Configuration }
@@ -459,6 +887,7 @@ function Invoke-DeployOrder {
         destination       = $cfg.destination
         overrideWebconfig = [bool]$OverrideWebconfig
         configuration     = if ($Configuration) { $Configuration } else { 'Release (default)' }
+        provision         = if ($cfg.templateSite) { "site desde plantilla '$($cfg.templateSite)' si no existe" } else { '-' }
         mode              = if ($Execute) { 'EXECUTE' } else { 'DRY-RUN' }
     }
 
@@ -1765,4 +2194,4 @@ function Register-Dashboard {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
