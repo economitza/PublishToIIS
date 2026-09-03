@@ -26,6 +26,14 @@
       "siteUrl": "https://devecoesp2.economitza.com",
       "responsable": "Marc"
     },
+    "devecoesp3": {
+      "server": "deployments-76",
+      "origin": "E:\\git\\central-de-compres\\CentralCompres",
+      "destination": "E:\\wwwrootDevecoEsp3",
+      "siteUrl": "https://devecoesp3.economitza.com",
+      "templateSite": "devecoesp1",
+      "responsable": "Joaquim"
+    },
     "devecoand2": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
