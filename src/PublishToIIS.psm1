@@ -284,6 +284,16 @@ function Publish {
             'overridden' { Write-Host "REPO web.config PUBLISHED (-OverrideWebconfig); production copy saved as web.config.previous" -ForegroundColor Yellow }
             default      { Write-Host "No production web.config found; publishing the repo one" -ForegroundColor Yellow }
         }
+        # connections.config va aparte del Web.config (configSource) y en el repo
+        # está gitignored: sin esto cada publish arrastraba el del ORIGEN a todos
+        # los sites construidos desde él (misma BD para todos). Misma política que
+        # el web.config: el del site se preserva; -OverrideWebconfig publica el del build.
+        $connResult = Protect-ProductionWebConfig -TargetWebConfig (Join-Path $Destination 'connections.config') `
+            -ReleasingWebConfig (Join-Path $releasingDir 'connections.config') -Override:$OverrideWebconfig
+        switch ($connResult) {
+            'preserved'  { Write-Host "Site connections.config preserved" -ForegroundColor Green }
+            'overridden' { Write-Host "BUILD connections.config PUBLISHED (-OverrideWebconfig); site copy saved as connections.config.previous" -ForegroundColor Yellow }
+        }
 
         # Sello de versión del despliegue: viaja dentro de releasing/ y por tanto con el swap
         $deployInfoEnv = if ($Environment) { $Environment } else { $siteName }

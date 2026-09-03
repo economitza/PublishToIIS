@@ -900,3 +900,23 @@ Describe 'Protect-ProductionWebConfig' {
         Get-Content $script:releasingCfg | Should -Be '<repo/>'
     }
 }
+
+Describe 'Publish preserva connections.config como el web.config' {
+    It 'Protect-ProductionWebConfig sirve para connections.config: preserva el del site sobre el del build' {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_conn_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $tmp 'site') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $tmp 'rel') -Force | Out-Null
+        try {
+            'SITE' | Set-Content (Join-Path $tmp 'site\connections.config')
+            'BUILD' | Set-Content (Join-Path $tmp 'rel\connections.config')
+            $r = Protect-ProductionWebConfig -TargetWebConfig (Join-Path $tmp 'site\connections.config') -ReleasingWebConfig (Join-Path $tmp 'rel\connections.config')
+            $r | Should -Be 'preserved'
+            (Get-Content (Join-Path $tmp 'rel\connections.config') -Raw).Trim() | Should -Be 'SITE'
+            # y si el build no trae el fichero (gitignored en el repo), el del site igualmente viaja
+            Remove-Item (Join-Path $tmp 'rel\connections.config')
+            Protect-ProductionWebConfig -TargetWebConfig (Join-Path $tmp 'site\connections.config') -ReleasingWebConfig (Join-Path $tmp 'rel\connections.config') | Should -Be 'preserved'
+            Test-Path (Join-Path $tmp 'rel\connections.config') | Should -BeTrue
+        }
+        finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
