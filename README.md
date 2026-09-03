@@ -88,6 +88,26 @@ Uso rápido:
   `runId` que la tarea devuelve en el resultado y `Wait-PublishResult` exige que
   coincida (`-RunId`). El registro además da permiso de Modify sobre la carpeta.
 
+- Aprovisionamiento desde plantilla: si la entrada del entorno declara
+  `templateSite` (un site IIS del mismo servidor), el primer publish crea lo que
+  falte —carpeta, app pool y site llamados como el entorno, bindings 80/443 para
+  el host de `siteUrl` con el certificado de la plantilla, `Web.config` y
+  `connections.config` sembrados desde ella— y con `databaseMap`
+  (`{"CCEspana": "CCEspana_esp3"}`) apunta las cadenas sembradas a su propia
+  base de datos. Idempotente: en los siguientes publish no toca nada. Es
+  `Initialize-IisSite`, la misma función que usa `tools\New-LocalIisSite.ps1`
+  para los sites locales. Sin `templateSite`, un destino inexistente falla como
+  siempre: aprovisionar es una decisión declarada, no un efecto de una ruta mal
+  escrita.
+
+- Actualizar el publicador de un servidor SIN RDP: `Request-RemoteUpdate -Server
+  deployments-76`. Encola una orden `kind=update` en la misma cola que los
+  despliegues (nunca coincide con un publish), la tarea elevada hace `git pull`
+  + reinstalación y reinicia el listener; el cliente espera el resultado y
+  enseña el salto de versión (`Get-RemoteDeployVersion` lo consulta a secas).
+  La primera vez que un servidor recibe una versión con `/api/update` hay que
+  actualizarlo por RDP con `Update-PublishToIIS`; a partir de ahí, ya no.
+
 - Versionado por push: los push de este repo van por `tools\Push-Release.ps1`,
   que **sube el `ModuleVersion` en +1 el tercer dígito** (patch), commitea
   `chore(release): vX.Y.Z` y pushea en un paso. `-Minor`/`-Major` suben ese nivel

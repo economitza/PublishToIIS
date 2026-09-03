@@ -6,6 +6,46 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.5.0] - 2026-09-03
+
+### Added
+- **Aprovisionamiento de sites desde una plantilla.** Una entrada de
+  `environments.json` puede declarar `templateSite` (nombre de un site IIS del
+  mismo servidor): el primer `Publish` en ese entorno crea lo que falte —carpeta,
+  app pool y site llamados como el entorno, bindings 80/443 para el host de
+  `siteUrl` (o `hostName`) con el certificado de la plantilla si lo cubre, y
+  siembra de `Web.config` + `connections.config` desde la carpeta de la
+  plantilla— y en los siguientes no toca nada. Con `databaseMap`
+  (`{"CCEspana": "CCEspana_esp3"}`) las cadenas de conexión sembradas se apuntan
+  a SU base de datos. Sin `templateSite` el comportamiento es el de siempre: un
+  destino inexistente falla. Nueva función exportada `Initialize-IisSite` (los
+  pasos 1-6 de `tools\New-LocalIisSite.ps1`, que ahora delega en ella) y
+  `Set-ConnectionStringCatalog`. `Add-PublishEnvironment.ps1` acepta
+  `-TemplateSite`. El plan de `Invoke-DeployOrder` muestra `provision`.
+- **Actualización remota del publicador.** `Request-RemoteUpdate -Server
+  deployments-76` hace `POST /api/update`: el servidor encola una orden
+  `kind=update` en la MISMA cola FIFO que los despliegues (nunca se actualiza el
+  módulo a mitad de un publish), la tarea elevada hace `Update-PublishToIIS`
+  (git pull --ff-only + reinstalar) y reinicia la tarea 'Publish Endpoint' para
+  que el listener cargue el código nuevo; el cliente sondea el resultado
+  tolerando el corte del reinicio y termina con `GET /api/version` para enseñar
+  el salto. Nuevas: `GET /api/version`, `Get-RemoteDeployVersion`,
+  `Request-ModuleUpdate` (mitad local), `Write-UpdateOrder`,
+  `Get-PublishToIISVersionInfo`. Requisito: la primera vez que un servidor
+  recibe esta versión hay que actualizarlo por RDP; desde entonces, sin RDP.
+
+### Changed
+- `Publish` **preserva también `connections.config`** del site en el swap, con
+  la misma política que `web.config` (`-OverrideWebconfig` publica el del build
+  y guarda el del site como `.previous`). Antes, al estar gitignored en el repo,
+  cada publish arrastraba el del ORIGEN del servidor a todos los sites
+  construidos desde él: misma base de datos para todos.
+- `Publish` lee la entrada del entorno aunque reciba rutas explícitas (para
+  resolver `templateSite`/`hostName`/`databaseMap`) y tolera un entorno ad hoc
+  que no está en la config central.
+- La versión del manifiesto se lee por regex (como `Push-Release.ps1`), no con
+  `Import-PowerShellDataFile`, que no existe en todas las instalaciones de 5.1.
+
 ## [0.4.7] - 2026-09-02
 
 ### Added
