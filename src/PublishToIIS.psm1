@@ -961,10 +961,11 @@ function Invoke-DeployOrder {
     try {
         & git -C $repo fetch --prune
         if ($LASTEXITCODE) { throw "git fetch falló (código $LASTEXITCODE). Si pide credenciales u host key, ejecuta 'git -C $repo fetch' una vez a mano con el mismo usuario." }
-        & git -C $repo checkout $Branch
-        if ($LASTEXITCODE) { throw "git checkout falló (código $LASTEXITCODE)." }
-        & git -C $repo pull --ff-only
-        if ($LASTEXITCODE) { throw "git pull falló (código $LASTEXITCODE)." }
+        # El checkout del servidor es una copia de despliegue, no un sitio de trabajo: la rama local
+        # se crea o se REPONE a la punta de origin (checkout -B). Con checkout + pull --ff-only, una
+        # rama reescrita en origin (rebase + push forzado) fallaba con código 128 y no se publicaba.
+        & git -C $repo checkout -B $Branch "origin/$Branch"
+        if ($LASTEXITCODE) { throw "git checkout -B $Branch origin/$Branch falló (código $LASTEXITCODE): ¿existe la rama en origin?" }
     }
     finally {
         $env:GIT_TERMINAL_PROMPT = $gitEnvPrev.GIT_TERMINAL_PROMPT
