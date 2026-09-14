@@ -35,6 +35,25 @@ Describe 'Encoding de los scripts' {
     }
 }
 
+Describe 'Restore-NuGetPackages' {
+    It 'no hace nada si el proyecto no tiene packages.config' {
+        $proj = Join-Path $TestDrive 'Sin\Sin.csproj'
+        New-Item -ItemType Directory -Force -Path (Split-Path $proj) | Out-Null
+        Set-Content -Path $proj -Value '<Project />'
+        Mock -ModuleName PublishToIIS Get-NuGetExe { throw 'no debe buscar nuget' }
+        { Restore-NuGetPackages -ProjectFile $proj } | Should -Not -Throw
+    }
+
+    It 'con packages.config y sin nuget.exe avisa y no lanza' {
+        $proj = Join-Path $TestDrive 'Con\Con.csproj'
+        New-Item -ItemType Directory -Force -Path (Split-Path $proj) | Out-Null
+        Set-Content -Path $proj -Value '<Project />'
+        Set-Content -Path (Join-Path (Split-Path $proj) 'packages.config') -Value '<packages />'
+        Mock -ModuleName PublishToIIS Get-NuGetExe { $null }
+        { Restore-NuGetPackages -ProjectFile $proj -WarningAction SilentlyContinue } | Should -Not -Throw
+        Should -Invoke -ModuleName PublishToIIS Get-NuGetExe -Times 1 -Exactly
+    }
+}
 Describe 'Get-PublishConfig' {
     It 'loads a defined environment config' {
         $cfg = Get-PublishConfig -Environment 'dev-joaquim-local'

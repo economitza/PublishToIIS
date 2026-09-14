@@ -49,7 +49,7 @@ Uso rápido:
 
   `Request-Publish` es exactamente la llamada que hará el job de CI o el
   dashboard: escribe la orden, dispara la tarea y espera el resultado. Todo el
-  trabajo con privilegios (checkout, MSBuild, parada del app pool y swap) lo hace
+  trabajo con privilegios (checkout, restore de NuGet, MSBuild, parada del app pool y swap) lo hace
   la tarea. Opciones: `-NoWait` (dispara y vuelve), `-TimeoutSeconds`,
   `-OverrideWebconfig`, `-TaskName`.
 

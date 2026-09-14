@@ -558,6 +558,55 @@ function New-DeployInfo {
     return $info
 }
 
+function Get-NuGetExe {
+    <#
+    .SYNOPSIS
+        Localiza nuget.exe: PATH, la cache del modulo (ProgramData\PublishToIIS) o, si no
+        esta, lo descarga de dist.nuget.org. Devuelve $null si no hay forma de tenerlo.
+    #>
+    $cmd = Get-Command nuget.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cacheDir = Join-Path $env:ProgramData 'PublishToIIS'
+    $cached = Join-Path $cacheDir 'nuget.exe'
+    if (Test-Path $cached) { return $cached }
+    try {
+        New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' -OutFile $cached -UseBasicParsing
+        return $cached
+    }
+    catch {
+        Write-Warning "No se pudo obtener nuget.exe: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Restore-NuGetPackages {
+    <#
+    .SYNOPSIS
+        Restaura los paquetes (packages.config) del proyecto antes de compilar.
+    .DESCRIPTION
+        La carpeta packages es por clon y no viaja en git: en un origen recien clonado o cuando
+        una rama anade un paquete (MailKit en SI-2498), MSBuild solo avisa (MSB3245) o falla con
+        CS0246 y la DLL no llega al site. Restaura contra la carpeta packages de la solucion
+        (HintPath ..\packages\...); sin packages.config no hace nada y sin nuget.exe avisa y sigue.
+    #>
+    param([Parameter(Mandatory)][string]$ProjectFile)
+    $projectDir = Split-Path $ProjectFile -Parent
+    if (-not (Test-Path (Join-Path $projectDir 'packages.config'))) { return }
+    $dir = $projectDir
+    $solutionDir = $null
+    while ($dir -and -not $solutionDir) {
+        if (Get-ChildItem -Path $dir -Filter *.sln -File -ErrorAction SilentlyContinue | Select-Object -First 1) { $solutionDir = $dir }
+        else { $dir = Split-Path $dir -Parent }
+    }
+    if (-not $solutionDir) { $solutionDir = Split-Path $projectDir -Parent }
+    $nuget = Get-NuGetExe
+    if (-not $nuget) { Write-Warning 'nuget restore omitido: no hay nuget.exe; si falta algun paquete MSBuild fallara con CS0246.'; return }
+    Write-Host "Restoring NuGet packages of $ProjectFile into $solutionDir\packages..." -ForegroundColor Yellow
+    & $nuget restore $ProjectFile -SolutionDirectory $solutionDir -NonInteractive
+    if ($LASTEXITCODE -ne 0) { throw "nuget restore failed with exit code $LASTEXITCODE." }
+}
 function Publish {
     param(
         [string]$ProjectPath,
@@ -683,6 +732,8 @@ function Publish {
         if ($extraProps.Count) {
             Write-Host "Extra MSBuild properties: $($extraProps -join ' ')" -ForegroundColor Gray
         }
+
+        Restore-NuGetPackages -ProjectFile $projectToBuild
 
         & $msbuild $projectToBuild `
             /p:Configuration=$Configuration `
@@ -2499,4 +2550,4 @@ function Register-Dashboard {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
