@@ -1379,3 +1379,255 @@ Describe 'Get-HotfixDelta' {
         (Get-HotfixDelta -Repo $repo -BaseCommit $otro).baseIsAncestor | Should -BeFalse
     }
 }
+
+BeforeAll {
+    function New-EntornoHotfix {
+        <#  Monta un repo con un proyecto web, un site "publicado" a partir de el y el
+            fichero de entorno ad hoc que los une. #>
+        param([string]$Raiz)
+
+        $repo = Join-Path $Raiz 'repo'
+        $proyecto = Join-Path $repo 'Web'
+        $site = Join-Path $Raiz 'site'
+        New-Item -ItemType Directory -Force -Path (Join-Path $proyecto 'Views') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $proyecto 'Scripts') | Out-Null
+        Set-Content (Join-Path $proyecto 'Views\Index.cshtml') -Value 'v1'
+        Set-Content (Join-Path $proyecto 'Scripts\app.js') -Value 'js1'
+        Set-Content (Join-Path $proyecto 'Controllers.cs') -Value 'class A {}'
+        Set-Content (Join-Path $proyecto 'Web.config') -Value '<configuration />'
+
+        & git -C $repo init -q
+        & git -C $repo config user.email 'test@economitza.com'
+        & git -C $repo config user.name 'Test'
+        & git -C $repo add -A
+        & git -C $repo commit -q -m 'base'
+        $base = ("$(& git -C $repo rev-parse HEAD)").Trim()
+        $rama = ("$(& git -C $repo rev-parse --abbrev-ref HEAD)").Trim()
+
+        # El "site publicado": el arbol del proyecto mas su sello
+        New-Item -ItemType Directory -Force -Path $site | Out-Null
+        Copy-Item (Join-Path $proyecto '*') $site -Recurse -Force
+        [pscustomobject]@{
+            branch = $rama; commit = $base.Substring(0, 9); commitFull = $base
+            publishDate = (Get-Date).ToString('o'); environment = 'wt-hotfix-test'
+        } | ConvertTo-Json | Set-Content (Join-Path $site 'deploy-info.json') -Encoding UTF8
+
+        $envFile = Join-Path $Raiz '.publish-env.json'
+        [pscustomobject]@{ name = 'wt-hotfix-test'; origin = $proyecto; destination = $site } |
+            ConvertTo-Json | Set-Content $envFile -Encoding UTF8
+
+        [pscustomobject]@{ repo = $repo; project = $proyecto; site = $site; envFile = $envFile; base = $base; branch = $rama }
+    }
+}
+
+Describe 'Update-DeployInfoHotfix' {
+    BeforeEach {
+        $script:site = Join-Path $TestDrive ('sello-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:site | Out-Null
+        [pscustomobject]@{ branch = 'main_SI-1'; commit = 'abc123456'; commitFull = 'abc123456def' } |
+            ConvertTo-Json | Set-Content (Join-Path $script:site 'deploy-info.json') -Encoding UTF8
+    }
+
+    It 'marca el site como sucio y guarda lo aplicado' {
+        Update-DeployInfoHotfix -Destination $script:site -Entry ([pscustomobject]@{ files = @('Views/A.cshtml'); views = 1 }) | Out-Null
+
+        $info = Get-SiteDeployInfo -Destination $script:site
+        $info.dirty | Should -BeTrue
+        @($info.hotfix).Count | Should -Be 1
+        $info.hotfix[0].files | Should -Be 'Views/A.cshtml'
+    }
+
+    It 'no toca branch ni commit: el sello no miente sobre lo que publico el swap' {
+        Update-DeployInfoHotfix -Destination $script:site -Entry ([pscustomobject]@{ files = @('Views/A.cshtml') }) | Out-Null
+
+        $info = Get-SiteDeployInfo -Destination $script:site
+        $info.branch | Should -Be 'main_SI-1'
+        $info.commitFull | Should -Be 'abc123456def'
+    }
+
+    It 'acumula hotfixes sucesivos' {
+        Update-DeployInfoHotfix -Destination $script:site -Entry ([pscustomobject]@{ files = @('a') }) | Out-Null
+        Update-DeployInfoHotfix -Destination $script:site -Entry ([pscustomobject]@{ files = @('b') }) | Out-Null
+
+        @((Get-SiteDeployInfo -Destination $script:site).hotfix).Count | Should -Be 2
+    }
+
+    It 'al quitar el ultimo hotfix el site deja de estar sucio' {
+        Update-DeployInfoHotfix -Destination $script:site -Entry ([pscustomobject]@{ files = @('a') }) | Out-Null
+        Update-DeployInfoHotfix -Destination $script:site -RemoveLast | Out-Null
+
+        $info = Get-SiteDeployInfo -Destination $script:site
+        $info.dirty | Should -BeFalse
+        @($info.hotfix).Count | Should -Be 0
+    }
+}
+
+Describe 'Restore-HotfixFiles' {
+    It 'repone lo sustituido y borra lo que el hotfix anadio' {
+        $site = Join-Path $TestDrive 'site-restore'
+        $backup = Join-Path $TestDrive 'backup-restore'
+        New-Item -ItemType Directory -Force -Path (Join-Path $site 'Views') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $backup 'Views') | Out-Null
+        Set-Content (Join-Path $backup 'Views\Vieja.cshtml') -Value 'original'
+        Set-Content (Join-Path $site 'Views\Vieja.cshtml') -Value 'parcheada'
+        Set-Content (Join-Path $site 'Views\Nueva.cshtml') -Value 'anadida'
+
+        $n = Restore-HotfixFiles -Destination $site -BackupDir $backup -Files @(
+            [pscustomobject]@{ rel = 'Views/Vieja.cshtml'; existed = $true },
+            [pscustomobject]@{ rel = 'Views/Nueva.cshtml'; existed = $false })
+
+        $n | Should -Be 2
+        (Get-Content (Join-Path $site 'Views\Vieja.cshtml') -Raw).Trim() | Should -Be 'original'
+        Test-Path (Join-Path $site 'Views\Nueva.cshtml') | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-Hotfix' {
+    BeforeEach {
+        $script:e = New-EntornoHotfix -Raiz (Join-Path $TestDrive ([Guid]::NewGuid().ToString('N')))
+    }
+
+    It 'en dry-run ensena el plan y no toca el site' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile
+
+        $r.status | Should -Be 'plan'
+        $r.toCopy | Should -Be 'Views/Index.cshtml'
+        (Get-Content (Join-Path $script:e.site 'Views\Index.cshtml') -Raw).Trim() | Should -Be 'v1'
+    }
+
+    It 'aplica la vista al site vivo y guarda copia de lo sustituido' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup
+
+        $r.status | Should -Be 'ok'
+        (Get-Content (Join-Path $script:e.site 'Views\Index.cshtml') -Raw).Trim() | Should -Be 'v2'
+        (Get-Content (Join-Path $r.backup 'Views\Index.cshtml') -Raw).Trim() | Should -Be 'v1'
+        Test-Path (Join-Path $r.backup 'hotfix-manifest.json') | Should -BeTrue
+    }
+
+    It 'una vista sola no recicla el AppDomain' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        (Invoke-Hotfix -EnvironmentFile $script:e.envFile).recycles | Should -BeFalse
+    }
+
+    It 'deja el sello marcado como sucio, con el parche declarado' {
+        Set-Content (Join-Path $script:e.project 'Scripts\app.js') -Value 'js2'
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup | Out-Null
+
+        $info = Get-SiteDeployInfo -Destination $script:e.site
+        $info.dirty | Should -BeTrue
+        $info.hotfix[0].files | Should -Be 'Scripts/app.js'
+        $info.commitFull | Should -Be $script:e.base
+    }
+
+    It 'un cambio que exige compilar bloquea en vez de dejar el site a medias' {
+        Set-Content (Join-Path $script:e.project 'Controllers.cs') -Value 'class A { int x; }'
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile
+        $r.status | Should -Be 'blocked'
+        $r.blocked -join ' ' | Should -BeLike '*compilados*'
+        { Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute } | Should -Throw '*no puede aplicarse entero*'
+    }
+
+    It 'la configuracion del entorno no viaja aunque haya cambiado' {
+        Set-Content (Join-Path $script:e.project 'Web.config') -Value '<configuration><!-- otra --></configuration>'
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup
+        $r.status | Should -Be 'nochange'
+        (Get-Content (Join-Path $script:e.site 'Web.config') -Raw) | Should -Not -BeLike '*otra*'
+    }
+
+    It 'si no hay nada distinto lo dice y no recicla nada' {
+        (Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup).status | Should -Be 'nochange'
+    }
+
+    It 'descarta los ficheros identicos aunque git los de por cambiados' {
+        # Tocar y devolver al contenido original: git lo ve modificado, el site no.
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        & git -C $script:e.repo add -A
+        & git -C $script:e.repo commit -q -m 'v2'
+        Copy-Item (Join-Path $script:e.project 'Views\Index.cshtml') (Join-Path $script:e.site 'Views\Index.cshtml') -Force
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile
+        $r.unchanged | Should -Be 'Views/Index.cshtml'
+        $r.toCopy | Should -BeNullOrEmpty
+    }
+
+    It 'no borra del site por defecto; con -IncludeRemovals si' {
+        Remove-Item (Join-Path $script:e.project 'Scripts\app.js')
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup
+        Test-Path (Join-Path $script:e.site 'Scripts\app.js') | Should -BeTrue
+
+        $r2 = Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup -IncludeRemovals
+        $r2.removed | Should -Be 'Scripts/app.js'
+        Test-Path (Join-Path $script:e.site 'Scripts\app.js') | Should -BeFalse
+    }
+
+    It 'se niega a parchear un site que sirve otra rama' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        $info = Get-SiteDeployInfo -Destination $script:e.site
+        $info.branch = 'main_OTRA'
+        $info | ConvertTo-Json | Set-Content (Join-Path $script:e.site 'deploy-info.json') -Encoding UTF8
+
+        { Invoke-Hotfix -EnvironmentFile $script:e.envFile } | Should -Throw '*no cambia de rama*'
+    }
+
+    It 'sin sello no hay hotfix: no se puede saber contra que calcular el delta' {
+        Remove-Item (Join-Path $script:e.site 'deploy-info.json')
+        { Invoke-Hotfix -EnvironmentFile $script:e.envFile } | Should -Throw '*no tiene sello*'
+    }
+
+    It 'dos hotfixes seguidos parten siempre del commit publicado' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup | Out-Null
+        Set-Content (Join-Path $script:e.project 'Scripts\app.js') -Value 'js2'
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup
+
+        # La vista del primer hotfix ya esta identica en el site: se descarta sola.
+        $r.applied | Should -Be 'Scripts/app.js'
+        $r.unchanged | Should -Be 'Views/Index.cshtml'
+        @((Get-SiteDeployInfo -Destination $script:e.site).hotfix).Count | Should -Be 2
+    }
+}
+
+Describe 'Undo-Hotfix' {
+    BeforeEach {
+        $script:e = New-EntornoHotfix -Raiz (Join-Path $TestDrive ([Guid]::NewGuid().ToString('N')))
+    }
+
+    It 'repone el contenido anterior y limpia el sello' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup | Out-Null
+
+        $r = Undo-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup
+
+        $r.status | Should -Be 'ok'
+        (Get-Content (Join-Path $script:e.site 'Views\Index.cshtml') -Raw).Trim() | Should -Be 'v1'
+        (Get-SiteDeployInfo -Destination $script:e.site).dirty | Should -BeFalse
+    }
+
+    It 'borra del site los ficheros que el hotfix habia anadido' {
+        Set-Content (Join-Path $script:e.project 'Views\Nueva.cshtml') -Value 'nueva'
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup | Out-Null
+        Test-Path (Join-Path $script:e.site 'Views\Nueva.cshtml') | Should -BeTrue
+
+        Undo-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup | Out-Null
+        Test-Path (Join-Path $script:e.site 'Views\Nueva.cshtml') | Should -BeFalse
+    }
+
+    It 'en dry-run no toca nada' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -Execute -SkipWarmup | Out-Null
+
+        (Undo-Hotfix -EnvironmentFile $script:e.envFile).status | Should -Be 'plan'
+        (Get-Content (Join-Path $script:e.site 'Views\Index.cshtml') -Raw).Trim() | Should -Be 'v2'
+    }
+
+    It 'sin hotfixes previos avisa en vez de fingir que ha hecho algo' {
+        { Undo-Hotfix -EnvironmentFile $script:e.envFile -Execute } | Should -Throw '*No hay hotfixes*'
+    }
+}

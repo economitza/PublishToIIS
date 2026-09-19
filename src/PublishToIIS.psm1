@@ -2831,6 +2831,551 @@ function Get-HotfixDelta {
     }
 }
 
+function Get-HotfixTarget {
+    <#
+    .SYNOPSIS
+        Resuelve el entorno de un hotfix: origen, destino, repo y prefijo del proyecto.
+
+    .DESCRIPTION
+        Mismas dos vias que Publish: la config central por -Environment o un fichero
+        de entorno ad hoc (worktrees efimeros). Ademas localiza la raiz del repo con
+        git y calcula el prefijo del proyecto web dentro de el, que es lo que traduce
+        las rutas del diff a rutas del site.
+    #>
+    [CmdletBinding()]
+    param([string]$Environment, [string]$EnvironmentFile)
+
+    if ($EnvironmentFile) {
+        $def = Read-AdHocEnvironment -Path $EnvironmentFile
+        if ($Environment -and $def.name -ne $Environment) {
+            throw "El fichero de entorno define '$($def.name)' y se ha pedido '$Environment'."
+        }
+        $nombre = [string]$def.name
+    }
+    else {
+        if (-not (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue)) {
+            $maybeCfg = Join-Path $PSScriptRoot '..\config\config.ps1'
+            if (Test-Path $maybeCfg) { . $maybeCfg }
+        }
+        $def = Get-PublishConfig -Environment $Environment
+        $nombre = [string]$def._environment
+    }
+
+    if ($nombre -in @('prod', 'staging')) {
+        throw "El hotfix no opera sobre '$nombre'. Produccion va por su propio procedimiento."
+    }
+    if (-not $def.origin -or -not $def.destination) {
+        throw "El entorno '$nombre' no declara origin/destination."
+    }
+
+    $origen = ([string]$def.origin).TrimEnd('\', '/')
+    $destino = ([string]$def.destination).TrimEnd('\', '/')
+    if (-not (Test-Path $origen)) { throw "El origen del entorno '$nombre' no existe: $origen" }
+    if (-not (Test-Path $destino)) { throw "El site del entorno '$nombre' no existe: $destino" }
+
+    $raiz = (Invoke-GitCommand -Repo $origen -Arguments @('rev-parse', '--show-toplevel')).text
+    if (-not $raiz) { throw "El origen '$origen' no es una copia de trabajo git: sin git no hay delta que calcular." }
+
+    # El prefijo es la ruta del proyecto web dentro del repo ('CentralCompres'):
+    # las rutas del diff son relativas a la raiz y las del site, al proyecto.
+    $oNorm = ($origen -replace '\\', '/').TrimEnd('/')
+    $rNorm = ($raiz -replace '\\', '/').TrimEnd('/')
+    if ($oNorm.ToLowerInvariant() -eq $rNorm.ToLowerInvariant()) { $prefijo = '' }
+    elseif ($oNorm.ToLowerInvariant().StartsWith($rNorm.ToLowerInvariant() + '/')) {
+        $prefijo = $oNorm.Substring($rNorm.Length + 1)
+    }
+    else { throw "El origen '$origen' no cuelga de la raiz del repo '$raiz'." }
+
+    [pscustomobject]@{
+        environment   = $nombre
+        origin        = $origen
+        destination   = $destino
+        siteUrl       = [string]$def.siteUrl
+        repo          = ($raiz -replace '/', '\')
+        projectPrefix = $prefijo
+    }
+}
+
+function Test-HotfixWritable {
+    # El hotfix no eleva: escribe en el site con la cuenta actual. Se comprueba
+    # ANTES de tocar nada, porque quedarse a medias por un permiso es justo lo que
+    # no puede pasar en un site vivo.
+    param([Parameter(Mandatory)][string]$Destination)
+    $sonda = Join-Path $Destination ('.hotfix-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        Set-Content -Path $sonda -Value 'x' -ErrorAction Stop
+        Remove-Item $sonda -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    catch { return $false }
+}
+
+function Restore-HotfixFiles {
+    <#
+    .SYNOPSIS
+        Repone en el site los ficheros de un hotfix a partir de su copia de seguridad.
+    .DESCRIPTION
+        Lo que existia se restaura desde el backup; lo que el hotfix ANADIO se borra.
+        Sirve tanto para el rollback automatico de una aplicacion a medias como para
+        Undo-Hotfix.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$BackupDir,
+        [AllowEmptyCollection()][object[]]$Files = @()
+    )
+    $repuestos = 0
+    foreach ($f in $Files) {
+        $rel = ([string]$f.rel) -replace '/', '\'
+        $destino = Join-Path $Destination $rel
+        if ($f.existed) {
+            $copia = Join-Path $BackupDir $rel
+            if (Test-Path $copia) { Copy-Item $copia $destino -Force; $repuestos++ }
+        }
+        elseif (Test-Path $destino) { Remove-Item $destino -Force; $repuestos++ }
+    }
+    $repuestos
+}
+
+function Update-DeployInfoHotfix {
+    <#
+    .SYNOPSIS
+        Resella deploy-info.json declarando que el site lleva un parche encima.
+    .DESCRIPTION
+        `branch`/`commit` siguen diciendo que dejo el ultimo Publish (no se miente
+        sobre el swap); se anade `hotfix[]` con lo aplicado y `dirty = true`, que es
+        la senal de que el site YA NO es reproducible desde su rama. El siguiente
+        Publish barre todo esto porque activa una carpeta nueva.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Destination,
+        [object]$Entry,
+        [switch]$RemoveLast
+    )
+    $file = Join-Path $Destination 'deploy-info.json'
+    $info = Get-SiteDeployInfo -Destination $Destination
+    if (-not $info) { throw "No se pudo releer el sello de '$Destination' para resellarlo." }
+
+    $previas = @()
+    if ($info.PSObject.Properties['hotfix'] -and $info.hotfix) { $previas = @($info.hotfix) }
+
+    if ($RemoveLast) {
+        # Ojo: $x[0..($x.Count - 2)] con un solo elemento es $x[0..-1], que en
+        # PowerShell devuelve la lista ENTERA en vez de vaciarla.
+        if (@($previas).Count -le 1) { $previas = @() }
+        else { $previas = @($previas[0..(@($previas).Count - 2)]) }
+    }
+    else { $previas = @($previas) + @($Entry) }
+
+    $info | Add-Member -NotePropertyName 'hotfix' -NotePropertyValue @($previas) -Force
+    $info | Add-Member -NotePropertyName 'dirty' -NotePropertyValue ([bool]@($previas).Count) -Force
+    $info | ConvertTo-Json -Depth 8 | Set-Content -Path $file -Encoding UTF8
+    $info
+}
+
+function Invoke-SiteWarmup {
+    <#
+    .SYNOPSIS
+        Golpea el site para pagar el arranque del AppDomain aqui y no en la cara del que entre.
+    .DESCRIPTION
+        Tras tocar bin\ o Global.asax, ASP.NET recicla el AppDomain y la primera
+        peticion paga JIT y compilacion de vistas. Se dispara desde aqui y se mide,
+        de modo que el hotfix solo dice "listo" cuando el site vuelve a responder.
+        Cualquier respuesta HTTP vale (un 302 al login o un 500 significan que el
+        AppDomain ya esta arriba); solo la falta de respuesta es un problema. El
+        certificado no se valida: son entornos de test con certificados propios.
+    #>
+    [CmdletBinding()]
+    param([string]$Url, [int]$TimeoutSec = 180)
+
+    if (-not $Url) { return $null }
+    $callbackPrevio = [Net.ServicePointManager]::ServerCertificateValidationCallback
+    $reloj = [Diagnostics.Stopwatch]::StartNew()
+    $estado = 'sin respuesta'
+    try {
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try {
+            Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 5 -ErrorAction Stop | Out-Null
+            $estado = 'ok'
+        }
+        catch {
+            if ($_.Exception.Response) { $estado = 'ok' }
+            else { $estado = "sin respuesta: $($_.Exception.Message)" }
+        }
+    }
+    finally {
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = $callbackPrevio
+        $reloj.Stop()
+    }
+    [pscustomobject]@{ url = $Url; status = $estado; ms = [int]$reloj.ElapsedMilliseconds }
+}
+
+function Test-SameFileContent {
+    <#
+    .SYNOPSIS
+        Dice si dos ficheros tienen exactamente el mismo contenido.
+
+    .DESCRIPTION
+        Sin Get-FileHash a proposito: el modulo corre bajo el PowerShell que toque
+        (5.1 en las tareas programadas, 7 en consola) y una sesion de 5.1 lanzada
+        desde un pwsh 7 hereda su PSModulePath, carga los modulos de PS7 y se queda
+        SIN ese cmdlet. Compara primero los tamanos, que descarta casi todo sin leer
+        un solo byte.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+
+    if (-not (Test-Path $A) -or -not (Test-Path $B)) { return $false }
+    $fa = Get-Item -LiteralPath $A
+    $fb = Get-Item -LiteralPath $B
+    if ($fa.Length -ne $fb.Length) { return $false }
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $s = [IO.File]::OpenRead($fa.FullName)
+        try { $ha = $sha.ComputeHash($s) } finally { $s.Dispose() }
+        $s = [IO.File]::OpenRead($fb.FullName)
+        try { $hb = $sha.ComputeHash($s) } finally { $s.Dispose() }
+    }
+    finally { $sha.Dispose() }
+    [Convert]::ToBase64String($ha) -eq [Convert]::ToBase64String($hb)
+}
+
+function Invoke-Hotfix {
+    <#
+    .SYNOPSIS
+        Aplica en caliente, sobre un site ya publicado, solo lo que ha cambiado en el origen.
+
+    .DESCRIPTION
+        Alternativa a Publish para ITERAR en un entorno de test: ni MSBuild completo,
+        ni carpeta de publicacion nueva, ni parada del app pool, ni swap. Calcula el
+        delta contra el commit que el site declara en deploy-info.json y copia
+        encima lo que el site sirve tal cual.
+
+        Por defecto es DRY-RUN, como Invoke-DeployOrder: ensena el plan y no toca
+        nada. Con -Execute aplica.
+
+        Que cuesta:
+          - estaticos y vistas: la siguiente peticion ya los sirve.
+          - bin\ y Global.asax: ASP.NET RECICLA el AppDomain. No se para el pool ni
+            se reinicia IIS, pero el sessionState InProc de central-de-compres se
+            pierde y la primera peticion paga el JIT (por eso el warm-up).
+
+        Garantias:
+          - copia de seguridad de todo lo sustituido en <site>_hotfixes\<sello>\,
+            con manifiesto; si algo falla a mitad, se repone lo ya aplicado.
+          - el sello queda marcado `dirty` con la lista de ficheros: nadie debe leer
+            deploy-info.json y creer que el site sirve el commit limpio.
+          - no toca el arbol de trabajo del origen (ni checkout ni fetch), asi que
+            es seguro contra el worktree base.
+          - lo que no sabe clasificar BLOQUEA, en vez de dar por aplicado un parche
+            incompleto.
+
+    .EXAMPLE
+        Invoke-Hotfix -Environment dev-joaquim-local
+        Invoke-Hotfix -Environment dev-joaquim-local -Execute
+
+    .OUTPUTS
+        PSCustomObject con el plan y, si se ejecuta, lo aplicado, el backup y el warm-up.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Environment,
+        [string]$EnvironmentFile,
+        [switch]$Execute,
+        # Aplica tambien los borrados: quita del site los ficheros que ya no estan
+        # en el origen. Es destructivo, por eso no va por defecto (un js o un css
+        # de mas no rompe nada; borrar de menos, tampoco).
+        [switch]$IncludeRemovals,
+        # Compara solo hasta HEAD en vez de contra el arbol de trabajo.
+        [switch]$Committed,
+        # Salta las comprobaciones de rama y de ancestria.
+        [switch]$Force,
+        [switch]$SkipWarmup,
+        [string]$RequestedBy
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $reloj = [Diagnostics.Stopwatch]::StartNew()
+
+    $target = Get-HotfixTarget -Environment $Environment -EnvironmentFile $EnvironmentFile
+    $sello = Get-SiteDeployInfo -Destination $target.destination
+    if (-not $sello -or -not $sello.commitFull) {
+        throw ("El site '$($target.destination)' no tiene sello deploy-info.json con commit. " +
+               "Un hotfix necesita saber contra que commit calcular el delta: publica una vez con Publish.")
+    }
+
+    # La base es siempre el ultimo commit PUBLICADO, no el del hotfix anterior: asi
+    # dos hotfixes seguidos no se pisan (el segundo reaplica lo del primero, que ya
+    # sera identico y se descartara por hash).
+    $base = [string]$sello.commitFull
+    $delta = Get-HotfixDelta -Repo $target.repo -BaseCommit $base -Committed:$Committed
+
+    if (-not $Force) {
+        if ($sello.branch -and $delta.branch -and $sello.branch -ne $delta.branch) {
+            throw ("El site sirve '$($sello.branch)' y el origen esta en '$($delta.branch)'. " +
+                   "Un hotfix no cambia de rama: publica, o repite con -Force si sabes lo que haces.")
+        }
+        if (-not $delta.baseIsAncestor) {
+            throw ("El commit publicado ($($sello.commit)) no es ancestro de HEAD: el origen ha divergido " +
+                   "(rebase, o rama reescrita). Publica en vez de parchear.")
+        }
+    }
+
+    $plan = Resolve-HotfixPlan -Path $delta.changed -Removed $delta.removed -ProjectPrefix $target.projectPrefix
+
+    # Lo identico se descarta antes de decidir nada: copiar un fichero igual no es
+    # inofensivo, porque tocar bin\ dispara un reciclado del AppDomain para nada.
+    $aCopiar = New-Object Collections.ArrayList
+    $sinCambios = New-Object Collections.ArrayList
+    foreach ($rel in $plan.copy) {
+        $relWin = $rel -replace '/', '\'
+        $origen = Join-Path $target.origin $relWin
+        $destino = Join-Path $target.destination $relWin
+        if (-not (Test-Path $origen)) { continue }
+        if (Test-SameFileContent -A $origen -B $destino) {
+            [void]$sinCambios.Add($rel)
+            continue
+        }
+        [void]$aCopiar.Add([pscustomobject]@{ rel = $rel; source = $origen; target = $destino })
+    }
+
+    $vistas = @($aCopiar | Where-Object { $_.rel.ToLowerInvariant().EndsWith('.cshtml') }).Count
+    # El reciclado se decide sobre lo que se va a aplicar DE VERDAD, no sobre el
+    # plan: un Global.asax identico se descarta por hash y entonces no recicla nada.
+    $reciclaPorCopia = @($aCopiar | Where-Object {
+        $b = $_.rel.ToLowerInvariant(); $b -eq 'global.asax' -or $b.StartsWith('bin/')
+    }).Count -gt 0
+    $recicla = $plan.needsBuild -or $reciclaPorCopia
+
+    $bloqueos = @()
+    if ($plan.unknown.Count) {
+        $bloqueos += ("no se sabe como llegan al site: " + (@($plan.unknown) -join ', '))
+    }
+    if ($plan.needsBuild) {
+        $bloqueos += ("$($plan.build.Count) fichero(s) solo llegan compilados (" +
+                      ((@($plan.build) | Select-Object -First 3) -join ', ') + "): esto es un Publish, no un hotfix")
+    }
+
+    Write-Host "== Plan de hotfix: $($target.environment) ==" -ForegroundColor Cyan
+    Write-Host ("  site        " + $target.destination) -ForegroundColor Gray
+    Write-Host ("  sirve       " + $sello.branch + "@" + $sello.commit + "  (publicado " + $sello.publishDate + ")") -ForegroundColor Gray
+    $etiquetaOrigen = "$($delta.branch)@$($delta.headShort)"
+    if ($delta.dirty -and -not $Committed) { $etiquetaOrigen += ' + cambios sin commitear' }
+    Write-Host ("  origen      " + $etiquetaOrigen) -ForegroundColor Gray
+    Write-Host ("  copiar      {0} fichero(s){1}" -f $aCopiar.Count, $(if ($vistas) { " ($vistas vista(s))" } else { '' })) -ForegroundColor Gray
+    if ($sinCambios.Count) { Write-Host ("  sin cambios {0} (identicos en el site)" -f $sinCambios.Count) -ForegroundColor DarkGray }
+    if ($plan.removed.Count) {
+        $queHace = if ($IncludeRemovals) { 'se quitan del site' } else { 'NO se tocan (usa -IncludeRemovals)' }
+        Write-Host ("  borrados    {0} -> {1}" -f $plan.removed.Count, $queHace) -ForegroundColor DarkYellow
+    }
+    if ($plan.config.Count) { Write-Host ("  excluidos   {0} de configuracion del entorno" -f $plan.config.Count) -ForegroundColor DarkGray }
+    Write-Host ("  AppDomain   " + $(if ($recicla) { 'SE RECICLA (sesiones InProc perdidas + warm-up)' } else { 'intacto' })) `
+        -ForegroundColor $(if ($recicla) { 'Yellow' } else { 'Green' })
+
+    $vistasPrevias = 0
+    if ($sello.PSObject.Properties['hotfix'] -and $sello.hotfix) {
+        foreach ($h in @($sello.hotfix)) { $vistasPrevias += [int]$h.views }
+    }
+    if (($vistasPrevias + $vistas) -ge 12) {
+        Write-Warning ("Van $($vistasPrevias + $vistas) vistas recompiladas desde el ultimo Publish. " +
+                       "ASP.NET recicla el AppDomain al llegar a numRecompilesBeforeAppRestart (15 por defecto).")
+    }
+
+    $resultado = [pscustomobject]@{
+        environment = $target.environment
+        destination = $target.destination
+        base        = $sello.commit
+        head        = $delta.headShort
+        branch      = $delta.branch
+        plan        = $plan
+        toCopy      = @($aCopiar | ForEach-Object { $_.rel })
+        unchanged   = @($sinCambios)
+        recycles    = $recicla
+        blocked     = @($bloqueos)
+        applied     = @()
+        removed     = @()
+        backup      = $null
+        warmup      = $null
+        status      = 'plan'
+        elapsedMs   = 0
+    }
+
+    if ($bloqueos.Count) {
+        foreach ($b in $bloqueos) { Write-Host ("  BLOQUEA     " + $b) -ForegroundColor Red }
+        $resultado.status = 'blocked'
+        if ($Execute) { throw ("El hotfix no puede aplicarse entero: " + ($bloqueos -join ' | ')) }
+        return $resultado
+    }
+
+    if (-not $Execute) {
+        Write-Host "DRY-RUN: no se ha tocado el site. Repite con -Execute para aplicarlo." -ForegroundColor Yellow
+        return $resultado
+    }
+
+    if (-not $aCopiar.Count -and -not ($IncludeRemovals -and $plan.removed.Count)) {
+        Write-Host "Nada que aplicar: el site ya esta al dia." -ForegroundColor Green
+        $resultado.status = 'nochange'
+        $reloj.Stop(); $resultado.elapsedMs = [int]$reloj.ElapsedMilliseconds
+        return $resultado
+    }
+
+    if (-not (Test-HotfixWritable -Destination $target.destination)) {
+        throw ("Sin permiso de escritura en '$($target.destination)'. El hotfix no eleva a proposito: " +
+               "abre la consola con una cuenta que pueda escribir en el site.")
+    }
+
+    $siteName = Split-Path $target.destination -Leaf
+    $parent = Split-Path $target.destination -Parent
+    $marca = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupDir = Join-Path (Join-Path $parent "${siteName}_hotfixes") $marca
+    New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+
+    $aplicados = New-Object Collections.ArrayList
+    $quitados = New-Object Collections.ArrayList
+    try {
+        foreach ($f in $aCopiar) {
+            $carpeta = Split-Path $f.target -Parent
+            if (-not (Test-Path $carpeta)) { New-Item -ItemType Directory -Force -Path $carpeta | Out-Null }
+            $existia = Test-Path $f.target
+            if ($existia) {
+                $copia = Join-Path $backupDir ($f.rel -replace '/', '\')
+                New-Item -ItemType Directory -Force -Path (Split-Path $copia -Parent) | Out-Null
+                Copy-Item $f.target $copia -Force
+            }
+            Copy-Item $f.source $f.target -Force
+            [void]$aplicados.Add([pscustomobject]@{ rel = $f.rel; existed = $existia })
+        }
+
+        if ($IncludeRemovals) {
+            foreach ($rel in $plan.removed) {
+                $destino = Join-Path $target.destination ($rel -replace '/', '\')
+                if (-not (Test-Path $destino)) { continue }
+                $copia = Join-Path $backupDir ($rel -replace '/', '\')
+                New-Item -ItemType Directory -Force -Path (Split-Path $copia -Parent) | Out-Null
+                Copy-Item $destino $copia -Force
+                Remove-Item $destino -Force
+                [void]$aplicados.Add([pscustomobject]@{ rel = $rel; existed = $true })
+                [void]$quitados.Add($rel)
+            }
+        }
+    }
+    catch {
+        Write-Host "Fallo aplicando el hotfix; reponiendo lo ya copiado..." -ForegroundColor Red
+        $repuestos = Restore-HotfixFiles -Destination $target.destination -BackupDir $backupDir -Files @($aplicados)
+        Write-Host "Repuestos $repuestos fichero(s). El site queda como estaba." -ForegroundColor Yellow
+        throw
+    }
+
+    $quien = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
+    $entrada = [pscustomobject]@{
+        at        = (Get-Date).ToString('o')
+        by        = $quien
+        base      = $sello.commit
+        commit    = $delta.headShort
+        branch    = $delta.branch
+        dirty     = [bool]$delta.dirty
+        views     = $vistas
+        recycled  = [bool]$recicla
+        backup    = $backupDir
+        files     = @($aplicados | ForEach-Object { $_.rel })
+        removed   = @($quitados)
+    }
+    [pscustomobject]@{
+        at = $entrada.at; by = $quien; environment = $target.environment
+        base = $sello.commitFull; head = $delta.head; branch = $delta.branch
+        files = @($aplicados); removed = @($quitados)
+    } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $backupDir 'hotfix-manifest.json') -Encoding UTF8
+
+    Update-DeployInfoHotfix -Destination $target.destination -Entry $entrada | Out-Null
+
+    Write-Host ("Aplicados {0} fichero(s). Copia de seguridad en {1}" -f $aplicados.Count, $backupDir) -ForegroundColor Green
+
+    if (-not $SkipWarmup) {
+        $warm = Invoke-SiteWarmup -Url $target.siteUrl
+        if ($warm) {
+            $color = if ($warm.status -eq 'ok') { 'Green' } else { 'Red' }
+            Write-Host ("Warm-up {0}: {1} ({2} ms)" -f $warm.url, $warm.status, $warm.ms) -ForegroundColor $color
+            $resultado.warmup = $warm
+        }
+    }
+
+    $reloj.Stop()
+    $resultado.applied = @($aplicados | ForEach-Object { $_.rel })
+    $resultado.removed = @($quitados)
+    $resultado.backup = $backupDir
+    $resultado.status = 'ok'
+    $resultado.elapsedMs = [int]$reloj.ElapsedMilliseconds
+    Write-Host ("Hotfix completado en {0:N1} s" -f ($reloj.Elapsed.TotalSeconds)) -ForegroundColor Cyan
+    $resultado
+}
+
+function Undo-Hotfix {
+    <#
+    .SYNOPSIS
+        Deshace el ultimo hotfix de un entorno reponiendo su copia de seguridad.
+
+    .DESCRIPTION
+        Repone lo que el hotfix sustituyo y borra lo que anadio, segun el manifiesto
+        del backup, y quita esa entrada del sello (si no quedan, el site deja de
+        estar `dirty`). Deshacer no reconstruye nada: para volver de verdad a la
+        rama publicada, publica.
+
+    .EXAMPLE
+        Undo-Hotfix -Environment dev-joaquim-local -Execute
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Environment,
+        [string]$EnvironmentFile,
+        # Backup concreto a reponer; por defecto, el mas reciente.
+        [string]$BackupDir,
+        [switch]$Execute,
+        [switch]$SkipWarmup
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $target = Get-HotfixTarget -Environment $Environment -EnvironmentFile $EnvironmentFile
+
+    if (-not $BackupDir) {
+        $siteName = Split-Path $target.destination -Leaf
+        $raizBackups = Join-Path (Split-Path $target.destination -Parent) "${siteName}_hotfixes"
+        if (-not (Test-Path $raizBackups)) { throw "No hay hotfixes que deshacer en '$raizBackups'." }
+        $ultimo = Get-ChildItem $raizBackups -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if (-not $ultimo) { throw "No hay hotfixes que deshacer en '$raizBackups'." }
+        $BackupDir = $ultimo.FullName
+    }
+
+    $manifiesto = Join-Path $BackupDir 'hotfix-manifest.json'
+    if (-not (Test-Path $manifiesto)) { throw "El backup '$BackupDir' no tiene hotfix-manifest.json." }
+    $man = (Get-Content $manifiesto -Raw -Encoding UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+
+    Write-Host "== Deshacer hotfix: $($target.environment) ==" -ForegroundColor Cyan
+    Write-Host ("  backup      " + $BackupDir) -ForegroundColor Gray
+    Write-Host ("  aplicado    " + $man.at + " por " + $man.by) -ForegroundColor Gray
+    Write-Host ("  ficheros    " + @($man.files).Count) -ForegroundColor Gray
+
+    if (-not $Execute) {
+        Write-Host "DRY-RUN: no se ha tocado el site. Repite con -Execute." -ForegroundColor Yellow
+        return [pscustomobject]@{ status = 'plan'; backup = $BackupDir; files = @($man.files | ForEach-Object { $_.rel }) }
+    }
+
+    $repuestos = Restore-HotfixFiles -Destination $target.destination -BackupDir $BackupDir -Files @($man.files)
+    Update-DeployInfoHotfix -Destination $target.destination -RemoveLast | Out-Null
+    Write-Host ("Repuestos $repuestos fichero(s).") -ForegroundColor Green
+
+    $warm = $null
+    if (-not $SkipWarmup) { $warm = Invoke-SiteWarmup -Url $target.siteUrl }
+
+    [pscustomobject]@{
+        status = 'ok'; environment = $target.environment; backup = $BackupDir
+        restored = $repuestos; warmup = $warm
+    }
+}
+
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
+Export-ModuleMember -Function Publish, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
