@@ -2549,6 +2549,288 @@ function Register-Dashboard {
     & $script -Port $Port
 }
 
+# ---------------------------------------------------------------------------
+# Hotfix en caliente
+#
+# Publish reconstruye el site entero y lo activa con un swap de carpetas: es lo
+# correcto para una entrega, pero cuesta minutos y una parada del app pool por
+# cada vuelta. Para iterar sobre un entorno de test (afinar una vista, un js, un
+# calculo) el hotfix aplica SOLO el delta sobre el site VIVO.
+#
+# Lo que cuesta cada clase de fichero, que es lo que decide si compensa:
+#   - estaticos (Content, Scripts, imagenes): nada, la siguiente peticion ya los
+#     sirve.
+#   - vistas .cshtml: Razor recompila esa vista a demanda. Ojo al limite
+#     numRecompilesBeforeAppRestart (15 por defecto): a la decimosexta, reciclado.
+#   - bin\*.dll y Global.asax: System.Web vigila bin y RECICLA el AppDomain. No se
+#     para el pool ni se reinicia IIS, pero el sessionState de central-de-compres
+#     es InProc, asi que las sesiones se pierden y la primera peticion paga el JIT.
+#
+# Un site parcheado deja de ser reproducible desde su rama, asi que el sello lo
+# declara (dirty + hotfix[]): nadie debe leer deploy-info.json y creer que sirve
+# el commit limpio. El siguiente Publish normal barre el parche, porque el swap
+# activa una carpeta nueva.
+# ---------------------------------------------------------------------------
+
+function Get-SiteDeployInfo {
+    <#
+    .SYNOPSIS
+        Lee el sello deploy-info.json de un site ya publicado.
+
+    .DESCRIPTION
+        El sello lo escribe New-DeployInfo dentro de la carpeta que el swap activa,
+        asi que dice que commit sirve el site AHORA: es la base contra la que el
+        hotfix calcula su delta. Sin sello no hay hotfix posible.
+
+        Se le quita el BOM a mano porque Set-Content -Encoding UTF8 de PS 5.1 lo
+        escribe y ConvertFrom-Json no siempre lo digiere.
+
+    .OUTPUTS
+        PSCustomObject con el sello, o $null si no hay o esta ilegible.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Destination)
+
+    $file = Join-Path $Destination 'deploy-info.json'
+    if (-not (Test-Path $file)) { return $null }
+    try {
+        $raw = (Get-Content $file -Raw -Encoding UTF8).TrimStart([char]0xFEFF)
+        if (-not $raw.Trim()) { return $null }
+        return ($raw | ConvertFrom-Json)
+    }
+    catch { return $null }
+}
+
+function Resolve-HotfixPlan {
+    <#
+    .SYNOPSIS
+        Clasifica un delta de ficheros en lo que se puede aplicar en caliente y lo que no.
+
+    .DESCRIPTION
+        Funcion pura (no toca disco, no llama a git) para poder probarla entera:
+        recibe rutas relativas al repo y devuelve, por clase, las relativas al
+        proyecto web.
+
+            copy     el site los sirve tal cual (vistas, css, js, plantillas).
+            build    solo llegan compilados (.cs, .resx, .csproj): exigen MSBuild
+                     y, al tocar bin, reciclan el AppDomain.
+            config   configuracion del entorno (web.config raiz, connections.config,
+                     log4net.config): NUNCA viaja en un hotfix, igual que en Publish,
+                     donde cada servidor conserva la suya.
+            removed  borrados en el origen: no se tocan en el site salvo que se pida.
+            unknown  dentro del proyecto pero sin regla conocida: BLOQUEA, porque no
+                     se puede afirmar que el hotfix haya llegado entero.
+            outside  fuera del proyecto web (tests, docs, tools): no van al site.
+
+        `recycles` avisa de si lo que se va a aplicar tira el AppDomain: lo hace
+        cualquier cosa bajo bin\, Global.asax y todo lo que exija compilar.
+
+    .OUTPUTS
+        PSCustomObject con una coleccion por clase mas needsBuild y recycles.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][string[]]$Path = @(),
+        [AllowEmptyCollection()][string[]]$Removed = @(),
+        # Ruta del proyecto web relativa a la raiz del repo ('CentralCompres').
+        # Vacia si el proyecto ES la raiz.
+        [string]$ProjectPrefix = ''
+    )
+
+    $prefijo = ($ProjectPrefix -replace '\\', '/').Trim('/')
+    $carpetasCopiables = @('views/', 'content/', 'scripts/', 'templates/', 'webserv/',
+                           'images/', 'img/', 'fonts/', 'areas/', 'app_globalresources/',
+                           'app_themes/', 'service references/', 'bin/')
+    $extensionesCopiables = @('.cshtml', '.vbhtml', '.css', '.js', '.map', '.html', '.htm',
+                              '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
+                              '.woff2', '.ttf', '.eot', '.xsl', '.xslt')
+    $extensionesBuild = @('.cs', '.vb', '.resx', '.csproj', '.vbproj', '.sln')
+    $configEntorno = @('web.config', 'web_local.config', 'connections.config', 'log4net.config')
+
+    $clasificar = {
+        param([string]$ruta)
+
+        $n = ($ruta -replace '\\', '/').Trim('/')
+        if ($n.StartsWith('./')) { $n = $n.Substring(2) }
+        if (-not $n) { return $null }
+
+        if ($prefijo) {
+            $bajoPrefijo = $prefijo.ToLowerInvariant() + '/'
+            if (-not $n.ToLowerInvariant().StartsWith($bajoPrefijo)) {
+                return [pscustomobject]@{ clase = 'outside'; rel = $n }
+            }
+            $n = $n.Substring($prefijo.Length + 1)
+        }
+
+        $bajo = $n.ToLowerInvariant()
+        $ext = [IO.Path]::GetExtension($bajo)
+
+        if ($configEntorno -contains $bajo) { return [pscustomobject]@{ clase = 'config'; rel = $n } }
+        if ($bajo -eq 'packages.config' -or $bajo.StartsWith('app_code/') -or $bajo.StartsWith('properties/')) {
+            return [pscustomobject]@{ clase = 'build'; rel = $n }
+        }
+        if ($extensionesBuild -contains $ext) { return [pscustomobject]@{ clase = 'build'; rel = $n } }
+        if ($bajo -eq 'global.asax' -or $extensionesCopiables -contains $ext) {
+            return [pscustomobject]@{ clase = 'copy'; rel = $n }
+        }
+        foreach ($c in $carpetasCopiables) {
+            if ($bajo.StartsWith($c)) { return [pscustomobject]@{ clase = 'copy'; rel = $n } }
+        }
+        [pscustomobject]@{ clase = 'unknown'; rel = $n }
+    }
+
+    $copy = New-Object Collections.ArrayList
+    $build = New-Object Collections.ArrayList
+    $config = New-Object Collections.ArrayList
+    $unknown = New-Object Collections.ArrayList
+    $outside = New-Object Collections.ArrayList
+    $borrados = New-Object Collections.ArrayList
+
+    foreach ($p in $Path) {
+        $r = & $clasificar $p
+        if (-not $r) { continue }
+        switch ($r.clase) {
+            'copy' { [void]$copy.Add($r.rel) }
+            'build' { [void]$build.Add($r.rel) }
+            'config' { [void]$config.Add($r.rel) }
+            'outside' { [void]$outside.Add($r.rel) }
+            default { [void]$unknown.Add($r.rel) }
+        }
+    }
+
+    # Un borrado que cae en 'build' lo resuelve la propia compilacion (el fichero
+    # desaparece del assembly); uno copiable exige quitarlo del site, que es una
+    # accion destructiva y por eso va a su propia clase.
+    foreach ($p in $Removed) {
+        $r = & $clasificar $p
+        if (-not $r) { continue }
+        switch ($r.clase) {
+            'copy' { [void]$borrados.Add($r.rel) }
+            'build' { [void]$build.Add($r.rel) }
+            'config' { [void]$config.Add($r.rel) }
+            'outside' { [void]$outside.Add($r.rel) }
+            default { [void]$unknown.Add($r.rel) }
+        }
+    }
+
+    $copiar = @($copy | Sort-Object -Unique)
+    $compilar = @($build | Sort-Object -Unique)
+    $reciclaPorCopia = @($copiar | Where-Object {
+        $b = $_.ToLowerInvariant(); $b -eq 'global.asax' -or $b.StartsWith('bin/')
+    }).Count -gt 0
+
+    [pscustomobject]@{
+        copy       = $copiar
+        build      = $compilar
+        config     = @($config | Sort-Object -Unique)
+        removed    = @($borrados | Sort-Object -Unique)
+        unknown    = @($unknown | Sort-Object -Unique)
+        outside    = @($outside | Sort-Object -Unique)
+        needsBuild = [bool]$compilar.Count
+        recycles   = ([bool]$compilar.Count) -or $reciclaPorCopia
+    }
+}
+
+function Invoke-GitCommand {
+    <#
+    .SYNOPSIS
+        Ejecuta git devolviendo salida y codigo, sin que su stderr rompa la llamada.
+
+    .DESCRIPTION
+        git usa stderr tanto para errores como para avisos rutinarios ("CRLF will be
+        replaced by LF"). Con $ErrorActionPreference = 'Stop', PowerShell 5.1
+        convierte ese stderr en un error TERMINANTE aunque se redirija a $null, de
+        modo que un aviso inocuo tumba a quien llama y un "no existe ese commit"
+        sale como excepcion cruda en vez de como mensaje util. Aqui se relaja la
+        preferencia mientras corre git y se decide por el CODIGO DE SALIDA, que es
+        el contrato de git.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $previo = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $salida = & git -C $Repo @Arguments 2>$null
+        $codigo = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previo }
+
+    [pscustomobject]@{
+        output   = @($salida | Where-Object { $null -ne $_ -and "$_".Trim() })
+        text     = ((@($salida) -join "`n").Trim())
+        exitCode = $codigo
+    }
+}
+
+function Get-HotfixDelta {
+    <#
+    .SYNOPSIS
+        Calcula, con git, que ha cambiado en el origen desde el commit que sirve el site.
+
+    .DESCRIPTION
+        Por defecto compara el commit base con el ARBOL DE TRABAJO (commits nuevos
+        + cambios sin commitear + ficheros nuevos sin trackear): es lo que hace util
+        el hotfix para iterar, porque no obliga a commitear cada prueba. Con
+        -Committed compara solo hasta HEAD.
+
+        Detecta renombrados como borrado + alta (--no-renames) a proposito: al
+        hotfix le importa que ficheros hay que poner y cuales sobran, no la
+        intencion del cambio.
+
+        NO toca el arbol de trabajo: ni checkout, ni fetch, ni pull. Por eso es
+        seguro contra el worktree base de otro, donde un Publish si haria checkout.
+
+    .OUTPUTS
+        PSCustomObject con changed, removed, head, branch, dirty y baseIsAncestor.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$BaseCommit,
+        [switch]$Committed
+    )
+
+    $ErrorActionPreference = 'Stop'
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git no esta disponible en el PATH.' }
+
+    if ((Invoke-GitCommand -Repo $Repo -Arguments @('cat-file', '-e', "$BaseCommit^{commit}")).exitCode -ne 0) {
+        throw "El commit publicado '$BaseCommit' no existe en '$Repo'. Haz fetch, o publica de nuevo: sin base comun no hay delta que calcular."
+    }
+
+    $branch = (Invoke-GitCommand -Repo $Repo -Arguments @('rev-parse', '--abbrev-ref', 'HEAD')).text
+    $head = (Invoke-GitCommand -Repo $Repo -Arguments @('rev-parse', 'HEAD')).text
+    $headCorto = (Invoke-GitCommand -Repo $Repo -Arguments @('rev-parse', '--short=9', 'HEAD')).text
+    $esAncestro = (Invoke-GitCommand -Repo $Repo -Arguments @('merge-base', '--is-ancestor', $BaseCommit, 'HEAD')).exitCode -eq 0
+
+    $hasta = @()
+    if ($Committed) { $hasta = @('HEAD') }
+
+    $diffCambios = Invoke-GitCommand -Repo $Repo -Arguments (@('diff', '--name-only', '--no-renames', '--diff-filter=ACMT', $BaseCommit) + $hasta + @('--'))
+    if ($diffCambios.exitCode -ne 0) { throw "git diff contra '$BaseCommit' fallo (codigo $($diffCambios.exitCode))." }
+    $cambiados = @($diffCambios.output)
+
+    $diffBorrados = Invoke-GitCommand -Repo $Repo -Arguments (@('diff', '--name-only', '--no-renames', '--diff-filter=D', $BaseCommit) + $hasta + @('--'))
+    $borrados = @($diffBorrados.output)
+
+    if (-not $Committed) {
+        $cambiados += @((Invoke-GitCommand -Repo $Repo -Arguments @('ls-files', '--others', '--exclude-standard')).output)
+    }
+
+    $sucio = [bool]@((Invoke-GitCommand -Repo $Repo -Arguments @('status', '--porcelain')).output).Count
+
+    [pscustomobject]@{
+        changed        = @($cambiados | Where-Object { $_ } | Sort-Object -Unique)
+        removed        = @($borrados | Where-Object { $_ } | Sort-Object -Unique)
+        head           = $head
+        headShort      = $headCorto
+        branch         = $branch
+        dirty          = $sucio
+        baseIsAncestor = $esAncestro
+    }
+}
+
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
+Export-ModuleMember -Function Publish, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update

@@ -1,4 +1,4 @@
-@{
+﻿@{
     RootModule = 'src\PublishToIIS.psm1'
     ModuleVersion = '0.5.4'
     GUID = 'd3f6d9b7-6c3a-4f0d-9a2b-123456789abc'
@@ -6,7 +6,7 @@
     CompanyName = 'Economitza'
     Copyright = '(c) 2026 Economitza'
     Description = 'PublishToIIS - helper module to publish .NET projects to IIS with safe swap'
-    FunctionsToExport = @('Publish','Get-MSBuild','Get-NuGetExe','Restore-NuGetPackages','Get-PublishConfig','Update-PublishToIIS','Protect-ProductionWebConfig','New-DeployInfo','Invoke-DeployOrder','Read-PublishOrder','Write-PublishOrder','Read-AdHocEnvironment','Wait-PublishResult','Request-Publish','Get-PublishToIISRepo','Register-PublishTask','New-DeployEndpointToken','Get-DeployEndpointToken','Invoke-DeployEndpointRequest','Start-DeployEndpoint','Request-RemotePublish','Add-DeployQueueItem','Get-DeployQueue','Get-DeployResult','Invoke-DeployQueueDrain','Register-DeployEndpoint','Test-DeployEndpoint','Register-DeployProxySite','Set-DeployToken','Get-DeployToken','Get-DeployServerUrl','Register-Dashboard','Initialize-IisSite','Set-ConnectionStringCatalog','Write-UpdateOrder','Request-ModuleUpdate','Get-PublishToIISVersionInfo','Get-RemoteDeployVersion','Request-RemoteUpdate')
+    FunctionsToExport = @('Publish','Get-SiteDeployInfo','Resolve-HotfixPlan','Get-HotfixDelta','Get-MSBuild','Get-NuGetExe','Restore-NuGetPackages','Get-PublishConfig','Update-PublishToIIS','Protect-ProductionWebConfig','New-DeployInfo','Invoke-DeployOrder','Read-PublishOrder','Write-PublishOrder','Read-AdHocEnvironment','Wait-PublishResult','Request-Publish','Get-PublishToIISRepo','Register-PublishTask','New-DeployEndpointToken','Get-DeployEndpointToken','Invoke-DeployEndpointRequest','Start-DeployEndpoint','Request-RemotePublish','Add-DeployQueueItem','Get-DeployQueue','Get-DeployResult','Invoke-DeployQueueDrain','Register-DeployEndpoint','Test-DeployEndpoint','Register-DeployProxySite','Set-DeployToken','Get-DeployToken','Get-DeployServerUrl','Register-Dashboard','Initialize-IisSite','Set-ConnectionStringCatalog','Write-UpdateOrder','Request-ModuleUpdate','Get-PublishToIISVersionInfo','Get-RemoteDeployVersion','Request-RemoteUpdate')
     CmdletsToExport = @()
     VariablesToExport = @()
     AliasesToExport = @('Publish-Update')

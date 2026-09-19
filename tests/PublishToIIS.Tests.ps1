@@ -1182,3 +1182,200 @@ Describe 'Órdenes de actualización del módulo (kind=update)' {
         }
     }
 }
+
+Describe 'Get-SiteDeployInfo' {
+    It 'devuelve null si el site no tiene sello' {
+        Get-SiteDeployInfo -Destination $TestDrive | Should -BeNullOrEmpty
+    }
+
+    It 'lee el sello aunque venga con BOM (lo escribe Set-Content -Encoding UTF8 en 5.1)' {
+        $site = Join-Path $TestDrive 'site-bom'
+        New-Item -ItemType Directory -Force -Path $site | Out-Null
+        [pscustomobject]@{ branch = 'main_SI-1'; commitFull = 'abc123' } |
+            ConvertTo-Json | Set-Content (Join-Path $site 'deploy-info.json') -Encoding UTF8
+
+        $info = Get-SiteDeployInfo -Destination $site
+        $info.branch | Should -Be 'main_SI-1'
+        $info.commitFull | Should -Be 'abc123'
+    }
+
+    It 'devuelve null si el sello esta corrupto, sin lanzar' {
+        $site = Join-Path $TestDrive 'site-roto'
+        New-Item -ItemType Directory -Force -Path $site | Out-Null
+        Set-Content (Join-Path $site 'deploy-info.json') -Value '{ esto no es json' -Encoding UTF8
+        Get-SiteDeployInfo -Destination $site | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Resolve-HotfixPlan' {
+    It 'una vista se copia y no recicla el AppDomain' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Views/Home/Index.cshtml') -ProjectPrefix 'CentralCompres'
+        $plan.copy | Should -Be 'Views/Home/Index.cshtml'
+        $plan.needsBuild | Should -BeFalse
+        $plan.recycles | Should -BeFalse
+    }
+
+    It 'un .cs exige compilar y recicla' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Controllers/HomeController.cs') -ProjectPrefix 'CentralCompres'
+        $plan.build | Should -Be 'Controllers/HomeController.cs'
+        $plan.copy | Should -BeNullOrEmpty
+        $plan.needsBuild | Should -BeTrue
+        $plan.recycles | Should -BeTrue
+    }
+
+    It 'la configuracion del entorno queda excluida, nunca viaja en un hotfix' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Path @(
+            'CentralCompres/Web.config', 'CentralCompres/connections.config', 'CentralCompres/log4net.config')
+        $plan.config.Count | Should -Be 3
+        $plan.copy | Should -BeNullOrEmpty
+        $plan.build | Should -BeNullOrEmpty
+    }
+
+    It 'el Web.config de Views SI viaja: es routing MVC, no configuracion de entorno' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Views/Web.config') -ProjectPrefix 'CentralCompres'
+        $plan.copy | Should -Be 'Views/Web.config'
+        $plan.config | Should -BeNullOrEmpty
+    }
+
+    It 'lo que queda fuera del proyecto web no va al site' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Path @(
+            'tests/e2e/tests/favoritos.spec.ts', 'docs/70-development/checkpoint-revision.md')
+        $plan.outside.Count | Should -Be 2
+        $plan.copy | Should -BeNullOrEmpty
+        $plan.unknown | Should -BeNullOrEmpty
+    }
+
+    It 'un fichero sin regla conocida cae en unknown y no se da por aplicado' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/LEEME.md') -ProjectPrefix 'CentralCompres'
+        $plan.unknown | Should -Be 'LEEME.md'
+        $plan.copy | Should -BeNullOrEmpty
+    }
+
+    It 'bin y Global.asax se copian pero avisan de que reciclan' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Global.asax') -ProjectPrefix 'CentralCompres'
+        $plan.copy | Should -Be 'Global.asax'
+        $plan.needsBuild | Should -BeFalse
+        $plan.recycles | Should -BeTrue
+    }
+
+    It 'un borrado copiable va a removed; uno compilable lo resuelve el build' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Removed @(
+            'CentralCompres/Views/Viejo.cshtml', 'CentralCompres/Models/Viejo.cs')
+        $plan.removed | Should -Be 'Views/Viejo.cshtml'
+        $plan.build | Should -Be 'Models/Viejo.cs'
+        $plan.copy | Should -BeNullOrEmpty
+    }
+
+    It 'packages.config exige build (es el restore de NuGet)' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/packages.config') -ProjectPrefix 'CentralCompres'
+        $plan.build | Should -Be 'packages.config'
+    }
+
+    It 'acepta separadores de Windows y no repite ficheros' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Path @(
+            'CentralCompres\Scripts\ec-search-select.js', 'CentralCompres/Scripts/ec-search-select.js')
+        @($plan.copy).Count | Should -Be 1
+        $plan.copy | Should -Be 'Scripts/ec-search-select.js'
+    }
+
+    It 'sin prefijo el proyecto es la raiz del repo' {
+        $plan = Resolve-HotfixPlan -Path @('Views/Home/Index.cshtml')
+        $plan.copy | Should -Be 'Views/Home/Index.cshtml'
+    }
+
+    It 'un delta vacio no exige nada ni recicla' {
+        $plan = Resolve-HotfixPlan -Path @() -ProjectPrefix 'CentralCompres'
+        $plan.copy | Should -BeNullOrEmpty
+        $plan.needsBuild | Should -BeFalse
+        $plan.recycles | Should -BeFalse
+    }
+}
+
+Describe 'Get-HotfixDelta' {
+    BeforeAll {
+        function New-RepoDePrueba {
+            param([string]$Path)
+            New-Item -ItemType Directory -Force -Path $Path | Out-Null
+            & git -C $Path init -q
+            & git -C $Path config user.email 'test@economitza.com'
+            & git -C $Path config user.name 'Test'
+            New-Item -ItemType Directory -Force -Path (Join-Path $Path 'Web\Views') | Out-Null
+            Set-Content (Join-Path $Path 'Web\Views\Index.cshtml') -Value 'v1'
+            Set-Content (Join-Path $Path 'Web\Prog.cs') -Value 'class A {}'
+            & git -C $Path add -A
+            & git -C $Path commit -q -m 'base'
+            ("$(& git -C $Path rev-parse HEAD)").Trim()
+        }
+    }
+
+    It 've los cambios sin commitear: es lo que permite iterar sin commits de prueba' {
+        $repo = Join-Path $TestDrive 'repo-sucio'
+        $base = New-RepoDePrueba -Path $repo
+        Set-Content (Join-Path $repo 'Web\Views\Index.cshtml') -Value 'v2'
+
+        $delta = Get-HotfixDelta -Repo $repo -BaseCommit $base
+        $delta.changed | Should -Contain 'Web/Views/Index.cshtml'
+        $delta.dirty | Should -BeTrue
+        $delta.baseIsAncestor | Should -BeTrue
+    }
+
+    It 'incluye los ficheros nuevos sin trackear' {
+        $repo = Join-Path $TestDrive 'repo-nuevo'
+        $base = New-RepoDePrueba -Path $repo
+        Set-Content (Join-Path $repo 'Web\Views\Nuevo.cshtml') -Value 'nuevo'
+
+        (Get-HotfixDelta -Repo $repo -BaseCommit $base).changed | Should -Contain 'Web/Views/Nuevo.cshtml'
+    }
+
+    It 'separa los borrados de los cambios' {
+        $repo = Join-Path $TestDrive 'repo-borrado'
+        $base = New-RepoDePrueba -Path $repo
+        Remove-Item (Join-Path $repo 'Web\Views\Index.cshtml')
+
+        $delta = Get-HotfixDelta -Repo $repo -BaseCommit $base
+        $delta.removed | Should -Contain 'Web/Views/Index.cshtml'
+        $delta.changed | Should -Not -Contain 'Web/Views/Index.cshtml'
+    }
+
+    It 'con -Committed ignora lo que no esta commiteado' {
+        $repo = Join-Path $TestDrive 'repo-committed'
+        $base = New-RepoDePrueba -Path $repo
+        Set-Content (Join-Path $repo 'Web\Views\Index.cshtml') -Value 'v2'
+
+        (Get-HotfixDelta -Repo $repo -BaseCommit $base -Committed).changed | Should -BeNullOrEmpty
+    }
+
+    It 'sin cambios devuelve un delta vacio' {
+        $repo = Join-Path $TestDrive 'repo-limpio'
+        $base = New-RepoDePrueba -Path $repo
+
+        $delta = Get-HotfixDelta -Repo $repo -BaseCommit $base
+        $delta.changed | Should -BeNullOrEmpty
+        $delta.removed | Should -BeNullOrEmpty
+        $delta.dirty | Should -BeFalse
+    }
+
+    It 'si el commit publicado no existe en el repo, lo dice en vez de calcular un delta falso' {
+        $repo = Join-Path $TestDrive 'repo-sinbase'
+        New-RepoDePrueba -Path $repo | Out-Null
+        { Get-HotfixDelta -Repo $repo -BaseCommit '0123456789abcdef0123456789abcdef01234567' } |
+            Should -Throw '*no existe*'
+    }
+
+    It 'detecta que el origen ha divergido del commit publicado' {
+        $repo = Join-Path $TestDrive 'repo-divergido'
+        $base = New-RepoDePrueba -Path $repo
+        Set-Content (Join-Path $repo 'Web\Views\Index.cshtml') -Value 'v2'
+        & git -C $repo add -A
+        & git -C $repo commit -q -m 'v2'
+        & git -C $repo checkout -q -B otra $base
+        Set-Content (Join-Path $repo 'Web\Views\Index.cshtml') -Value 'v3'
+        & git -C $repo add -A
+        & git -C $repo commit -q -m 'v3'
+        $otro = ("$(& git -C $repo rev-parse HEAD)").Trim()
+        & git -C $repo checkout -q -B tercera $base
+        & git -C $repo commit -q --allow-empty -m 'tercera'
+
+        (Get-HotfixDelta -Repo $repo -BaseCommit $otro).baseIsAncestor | Should -BeFalse
+    }
+}
