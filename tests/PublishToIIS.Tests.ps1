@@ -1803,3 +1803,64 @@ Describe 'Invoke-SiteWarmup' {
         $w.detail | Should -BeLike '*No such host*'
     }
 }
+
+Describe 'Resolve-HotfixPlan con ficheros de la herramienta' {
+    It 'el entorno ad hoc y el candado de sesion no bloquean: no son del site' {
+        # .publish-env.json vive en la raiz del worktree por convencion del
+        # publicador; sin esta regla bloqueaba TODOS los hotfixes de un worktree
+        # efimero.
+        $plan = Resolve-HotfixPlan -Path @(
+            '.publish-env.json', '.claude-session.lock', 'deploy-info.json')
+        @($plan.ignored).Count | Should -Be 3
+        $plan.unknown | Should -BeNullOrEmpty
+        $plan.copy | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-HotfixTarget' {
+    BeforeAll {
+        function New-RepoConProyecto {
+            param([string]$Raiz, [string]$SubCarpeta)
+            $repo = Join-Path $Raiz 'repo'
+            $proyecto = if ($SubCarpeta) { Join-Path $repo $SubCarpeta } else { $repo }
+            $site = Join-Path $Raiz 'site'
+            New-Item -ItemType Directory -Force -Path $proyecto | Out-Null
+            New-Item -ItemType Directory -Force -Path $site | Out-Null
+            Set-Content (Join-Path $proyecto 'a.txt') -Value 'x'
+            & git -C $repo init -q
+            & git -C $repo config user.email 't@e.com'
+            & git -C $repo config user.name 'T'
+            & git -C $repo add -A
+            & git -C $repo commit -q -m base
+            $envFile = Join-Path $Raiz '.publish-env.json'
+            [pscustomobject]@{ name = 'wt-target-test'; origin = $proyecto; destination = $site } |
+                ConvertTo-Json | Set-Content $envFile -Encoding UTF8
+            $envFile
+        }
+    }
+
+    It 'el prefijo del proyecto lo da git, no una resta de rutas' {
+        $envFile = New-RepoConProyecto -Raiz (Join-Path $TestDrive 'con-sub') -SubCarpeta 'CentralCompres'
+        (Get-HotfixTarget -EnvironmentFile $envFile).projectPrefix | Should -Be 'CentralCompres'
+    }
+
+    It 'si el proyecto es la raiz del repo, el prefijo va vacio' {
+        $envFile = New-RepoConProyecto -Raiz (Join-Path $TestDrive 'sin-sub') -SubCarpeta ''
+        (Get-HotfixTarget -EnvironmentFile $envFile).projectPrefix | Should -Be ''
+    }
+
+    It 'una ruta en formato corto 8.3 resuelve igual' {
+        # Restar las rutas como texto reventaba aqui: git --show-prefix no.
+        $raiz = Join-Path $TestDrive 'ocho-tres'
+        $envFile = New-RepoConProyecto -Raiz $raiz -SubCarpeta 'CentralCompres'
+        $fso = New-Object -ComObject Scripting.FileSystemObject
+        $corto = $fso.GetFolder((Join-Path $raiz 'repo\CentralCompres')).ShortPath
+        if ($corto -notmatch '~') { Set-ItResult -Skipped -Because 'el volumen no genera nombres 8.3'; return }
+
+        $def = Get-Content $envFile -Raw | ConvertFrom-Json
+        $def.origin = $corto
+        $def | ConvertTo-Json | Set-Content $envFile -Encoding UTF8
+
+        (Get-HotfixTarget -EnvironmentFile $envFile).projectPrefix | Should -Be 'CentralCompres'
+    }
+}

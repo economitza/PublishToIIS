@@ -2653,6 +2653,10 @@ function Resolve-HotfixPlan {
     $extensionesIgnorables = @('.md', '.gitignore', '.gitattributes', '.editorconfig', '.yml', '.yaml',
                                '.ps1', '.py', '.sh', '.sql', '.user', '.log', '.bak', '.orig')
     $configEntorno = @('web.config', 'web_local.config', 'connections.config', 'log4net.config')
+    # Ficheros de la herramienta que viven en la raiz del worktree por convencion:
+    # el entorno ad hoc del publicador y el candado de sesion. Sin esto, publicar un
+    # worktree efimero con .publish-env.json bloqueaba todos sus hotfixes.
+    $ficherosHerramienta = @('.publish-env.json', '.claude-session.lock', 'deploy-info.json')
 
     $clasificar = {
         param([string]$ruta)
@@ -2673,6 +2677,7 @@ function Resolve-HotfixPlan {
         $ext = [IO.Path]::GetExtension($bajo)
 
         if ($configEntorno -contains $bajo) { return [pscustomobject]@{ clase = 'config'; rel = $n } }
+        if ($ficherosHerramienta -contains $bajo) { return [pscustomobject]@{ clase = 'ignored'; rel = $n } }
         if ($bajo -eq 'packages.config' -or $bajo.StartsWith('app_code/') -or $bajo.StartsWith('properties/')) {
             return [pscustomobject]@{ clase = 'build'; rel = $n }
         }
@@ -2899,15 +2904,12 @@ function Get-HotfixTarget {
     $raiz = (Invoke-GitCommand -Repo $origen -Arguments @('rev-parse', '--show-toplevel')).text
     if (-not $raiz) { throw "El origen '$origen' no es una copia de trabajo git: sin git no hay delta que calcular." }
 
-    # El prefijo es la ruta del proyecto web dentro del repo ('CentralCompres'):
-    # las rutas del diff son relativas a la raiz y las del site, al proyecto.
-    $oNorm = ($origen -replace '\\', '/').TrimEnd('/')
-    $rNorm = ($raiz -replace '\\', '/').TrimEnd('/')
-    if ($oNorm.ToLowerInvariant() -eq $rNorm.ToLowerInvariant()) { $prefijo = '' }
-    elseif ($oNorm.ToLowerInvariant().StartsWith($rNorm.ToLowerInvariant() + '/')) {
-        $prefijo = $oNorm.Substring($rNorm.Length + 1)
-    }
-    else { throw "El origen '$origen' no cuelga de la raiz del repo '$raiz'." }
+    # El prefijo es la ruta del proyecto web dentro del repo ('CentralCompres'): las
+    # rutas del diff son relativas a la raiz y las del site, al proyecto. Lo da git
+    # con --show-prefix en vez de restar dos rutas como texto: esa resta fallaba en
+    # cuanto las dos formas no coincidian caracter a caracter (nombres 8.3 tipo
+    # JOAQUI~1, un symlink por medio, mayusculas distintas en la unidad).
+    $prefijo = (Invoke-GitCommand -Repo $origen -Arguments @('rev-parse', '--show-prefix')).text.Trim().Trim('/')
 
     [pscustomobject]@{
         environment   = $nombre
