@@ -50,6 +50,11 @@ Novedades reseñables de PublishToIIS. Formato basado en
   `Restore-HotfixFiles`, `Invoke-SiteWarmup`, `Test-HotfixWritable`,
   `Test-SameFileContent`.
 
+- El **warm-up reintenta por http** si el HTTPS se cae a nivel de conexion: el site
+  local renegocia la conexion TLS y `HttpWebRequest` no lo soporta (curl si), asi
+  que sin el reintento un site sano se reportaba como caido. Medido contra
+  esp.emkt.test: 32,5 s de arranque en frio que, sin warm-up, paga el primero que entra.
+
 ### Fixed
 - `Invoke-GitCommand` centraliza las llamadas a git: escribe avisos rutinarios
   por stderr ("CRLF will be replaced by LF") y con `$ErrorActionPreference =

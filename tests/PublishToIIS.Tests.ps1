@@ -1771,3 +1771,35 @@ Describe 'Invoke-Hotfix con -IncludeBuild' {
         Should -Invoke -ModuleName PublishToIIS Invoke-HotfixBuild -Times 1 -Exactly -ParameterFilter { $Restore }
     }
 }
+
+Describe 'Invoke-SiteWarmup' {
+    It 'sin url no hay nada que calentar' {
+        Invoke-SiteWarmup -Url '' | Should -BeNullOrEmpty
+    }
+
+    It 'una respuesta normal cuenta como calentado' {
+        Mock -ModuleName PublishToIIS Invoke-WebRequest { [pscustomobject]@{ StatusCode = 200 } }
+        $w = Invoke-SiteWarmup -Url 'https://esp.emkt.test'
+        $w.status | Should -Be 'ok'
+        $w.url | Should -Be 'https://esp.emkt.test'
+    }
+
+    It 'si el HTTPS se cae a nivel de conexion, reintenta por http' {
+        # esp.emkt.test renegocia la conexion TLS y HttpWebRequest no lo soporta;
+        # para levantar el AppDomain el esquema da igual.
+        Mock -ModuleName PublishToIIS Invoke-WebRequest {
+            if ($Uri -like 'https:*') { throw 'The underlying connection was closed.' }
+            [pscustomobject]@{ StatusCode = 200 }
+        }
+        $w = Invoke-SiteWarmup -Url 'https://esp.emkt.test'
+        $w.status | Should -Be 'ok'
+        $w.url | Should -Be 'http://esp.emkt.test'
+    }
+
+    It 'si no responde por ninguna via lo dice, con el motivo' {
+        Mock -ModuleName PublishToIIS Invoke-WebRequest { throw 'No such host is known' }
+        $w = Invoke-SiteWarmup -Url 'https://no-existe.test'
+        $w.status | Should -Be 'sin respuesta'
+        $w.detail | Should -BeLike '*No such host*'
+    }
+}

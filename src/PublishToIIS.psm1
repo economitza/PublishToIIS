@@ -3002,40 +3002,75 @@ function Invoke-SiteWarmup {
     <#
     .SYNOPSIS
         Golpea el site para pagar el arranque del AppDomain aqui y no en la cara del que entre.
+
     .DESCRIPTION
         Tras tocar bin\ o Global.asax, ASP.NET recicla el AppDomain y la primera
         peticion paga JIT y compilacion de vistas. Se dispara desde aqui y se mide,
         de modo que el hotfix solo dice "listo" cuando el site vuelve a responder.
-        Cualquier respuesta HTTP vale (un 302 al login o un 500 significan que el
-        AppDomain ya esta arriba); solo la falta de respuesta es un problema. El
-        certificado no se valida: son entornos de test con certificados propios.
+
+        Cualquier respuesta HTTP vale: un 302 al login o un 500 significan que el
+        AppDomain ya esta arriba. Solo la falta de respuesta es un problema.
+
+        Dos cosas medidas contra esp.emkt.test (19/09/2026) que explican el resto:
+        el certificado no se valida, porque los entornos de test llevan el suyo; y
+        si el HTTPS falla a nivel de CONEXION se reintenta por http, porque ese
+        site renegocia la conexion TLS (SSL settings de IIS con certificado de
+        cliente) y HttpWebRequest se cae con "The underlying connection was
+        closed" mientras curl pasa sin problema. Para calentar el AppDomain da
+        igual el esquema, y un falso "sin respuesta" hace pensar que el hotfix ha
+        roto el site cuando no lo ha tocado.
     #>
     [CmdletBinding()]
     param([string]$Url, [int]$TimeoutSec = 180)
 
     if (-not $Url) { return $null }
+
+    $intentos = @($Url)
+    if ($Url.ToLowerInvariant().StartsWith('https://')) { $intentos += ('http://' + $Url.Substring(8)) }
+
     $callbackPrevio = [Net.ServicePointManager]::ServerCertificateValidationCallback
+    $protocoloPrevio = [Net.ServicePointManager]::SecurityProtocol
     $reloj = [Diagnostics.Stopwatch]::StartNew()
     $estado = 'sin respuesta'
+    $via = $null
+    $detalle = $null
+
     try {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         try {
-            Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 5 -ErrorAction Stop | Out-Null
-            $estado = 'ok'
+            $protocolos = $protocoloPrevio -bor [Net.SecurityProtocolType]::Tls12
+            if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+                $protocolos = $protocolos -bor [Net.SecurityProtocolType]::Tls13
+            }
+            [Net.ServicePointManager]::SecurityProtocol = $protocolos
         }
-        catch {
-            if ($_.Exception.Response) { $estado = 'ok' }
-            else { $estado = "sin respuesta: $($_.Exception.Message)" }
+        catch { }
+
+        foreach ($u in $intentos) {
+            try {
+                Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 5 -ErrorAction Stop | Out-Null
+                $estado = 'ok'; $via = $u; break
+            }
+            catch {
+                # Con Response hay servidor al otro lado: el AppDomain esta arriba.
+                if ($_.Exception.Response) { $estado = 'ok'; $via = $u; break }
+                $detalle = $_.Exception.Message
+            }
         }
     }
     finally {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = $callbackPrevio
+        [Net.ServicePointManager]::SecurityProtocol = $protocoloPrevio
         $reloj.Stop()
     }
-    [pscustomobject]@{ url = $Url; status = $estado; ms = [int]$reloj.ElapsedMilliseconds }
-}
 
+    [pscustomobject]@{
+        url    = $(if ($via) { $via } else { $Url })
+        status = $estado
+        ms     = [int]$reloj.ElapsedMilliseconds
+        detail = $detalle
+    }
+}
 function Test-SameFileContent {
     <#
     .SYNOPSIS
