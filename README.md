@@ -137,6 +137,61 @@ Uso rápido:
   5.1 es quien ejecuta `Install.ps1` y el registro de la tarea. Hay dos pruebas
   en `tests/` que fallan si aparece un fichero sin BOM o con mojibake ya escrito.
 
+## Hotfix en caliente (iterar sin republicar)
+
+`Publish` reconstruye el site entero y lo activa con un swap de carpetas: es lo
+correcto para una entrega, pero cuesta minutos y una parada del app pool por cada
+vuelta. Para afinar una vista, un js o un cálculo en un entorno de test está
+`Invoke-Hotfix`, que aplica sobre el site VIVO solo lo que ha cambiado:
+
+    Invoke-Hotfix -Environment dev-joaquim-local              # plan (dry-run)
+    Invoke-Hotfix -Environment dev-joaquim-local -Execute     # aplicar
+    Undo-Hotfix   -Environment dev-joaquim-local -Execute     # deshacer
+
+El delta se calcula contra el commit que el site declara en su `deploy-info.json`
+y, por defecto, contra el **árbol de trabajo** del origen: no hace falta commitear
+cada prueba. Con `-Committed` se compara solo hasta HEAD.
+
+Qué cuesta cada clase de fichero:
+
+| Qué cambia | Qué pasa en IIS |
+|---|---|
+| `Content`, `Scripts`, imágenes | nada: la siguiente petición ya lo sirve |
+| `Views\**\*.cshtml` | Razor recompila esa vista a demanda |
+| `bin\*.dll`, `Global.asax` | ASP.NET **recicla el AppDomain** |
+
+El reciclado no para el pool ni reinicia IIS, pero pierde el `sessionState`
+InProc y la primera petición paga el JIT: por eso el nivel que exige compilar es
+opt-in y hay un warm-up que se come ese arranque y lo mide.
+
+    Invoke-Hotfix -Environment dev-joaquim-local -IncludeBuild -Execute
+
+`-IncludeBuild` compila con `msbuild /t:Build` (incremental, sobre el `bin` del
+proyecto), restaura paquetes solo si el delta toca `packages.config` y lleva al
+site únicamente los ensamblados cuyo contenido difiere. La compilación va antes
+de tocar el site: si MSBuild falla, el site se queda como estaba.
+
+Cuenta con que `numRecompilesBeforeAppRestart` vale 15: a la decimosexta vista
+recompilada sin republicar, ASP.NET recicla igualmente. El hotfix lleva la cuenta
+y avisa al acercarse.
+
+Lo que el hotfix **no** hace, a propósito:
+
+- no toca la configuración del entorno (`Web.config`, `connections.config`,
+  `log4net.config`), igual que `Publish`;
+- no borra del site lo que desaparece del origen salvo con `-IncludeRemovals`;
+- no toca el árbol de trabajo del origen: ni checkout, ni fetch, ni pull;
+- no eleva: escribe con la cuenta actual, y lo comprueba antes de empezar;
+- no aplica nada si hay ficheros que no sabe clasificar, en vez de dar por
+  aplicado un parche incompleto.
+
+Cada aplicación deja copia de lo sustituido en `<site>_hotfixes\<sello>\` con su
+manifiesto, y si algo falla a mitad repone lo ya copiado. El sello del site queda
+marcado `dirty` con la lista de ficheros: `branch` y `commit` siguen diciendo qué
+dejó el último swap, así que **un site parcheado se reconoce leyendo
+`deploy-info.json`**. El siguiente `Publish` barre el parche, porque activa una
+carpeta nueva.
+
 Estructura relevante:
 
 - `src/` : implementación del módulo

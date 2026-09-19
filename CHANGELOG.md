@@ -6,6 +6,60 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.6.0] - 2026-09-19
+
+### Added
+- **Hotfix en caliente (`Invoke-Hotfix`).** Alternativa a `Publish` para iterar
+  en un entorno de test: en vez de reconstruir el site entero y activarlo con el
+  swap, calcula qué ha cambiado desde el commit que el site declara en su
+  `deploy-info.json` y copia encima solo eso. Sin MSBuild completo, sin carpeta
+  de publicación nueva, sin parar el app pool y sin swap. Dry-run por defecto,
+  como `Invoke-DeployOrder`; `-Execute` aplica.
+
+  Lo que cuesta cada clase de fichero, que es lo que decide si compensa:
+  estáticos y vistas los sirve la siguiente petición sin más; tocar `bin\` o
+  `Global.asax` hace que ASP.NET **recicle el AppDomain** —no se para el pool ni
+  se reinicia IIS, pero el `sessionState` InProc se pierde y la primera petición
+  paga el JIT—, y por eso el nivel que exige compilar es opt-in (`-IncludeBuild`)
+  y hay un warm-up que se come ese arranque y lo mide.
+
+  Garantías: copia de seguridad con manifiesto en `<site>_hotfixes\<sello>\` y
+  reposición automática si algo falla a mitad; el sello queda marcado `dirty`
+  con la lista de ficheros aplicados (`branch`/`commit` siguen diciendo qué dejó
+  el swap: el sello no miente sobre lo publicado, declara el parche);
+  comprobación de escritura antes de tocar nada; se niega si el site sirve otra
+  rama o si el origen ha divergido; los ficheros idénticos se descartan
+  comparando contenido, porque copiar un DLL igual reciclaría el AppDomain para
+  nada; y no toca el árbol de trabajo del origen —ni checkout ni fetch—, así que
+  es seguro contra el worktree base. Lo que no sabe clasificar bloquea, en vez
+  de dar por aplicado un parche incompleto.
+
+  El siguiente `Publish` normal barre el parche, porque el swap activa una
+  carpeta nueva.
+- **`-IncludeBuild`**: sube al hotfix los cambios que solo llegan compilados. Usa
+  `msbuild /t:Build` (incremental, sobre el `bin` del propio proyecto) en vez del
+  `DeployOnBuild` + `PublishUrl` de `Publish`, hace `nuget restore` solo si el
+  delta toca `packages.config`, y lleva al site únicamente los ensamblados cuyo
+  contenido difiere. La compilación va antes de tocar el site: un MSBuild fallido
+  lo deja exactamente como estaba.
+- **`Undo-Hotfix`**: repone la copia de seguridad (borrando lo que el hotfix
+  añadió) y limpia la entrada del sello.
+- Funciones nuevas exportadas: `Invoke-Hotfix`, `Undo-Hotfix`, `Invoke-HotfixBuild`,
+  `Get-HotfixBinDelta`, `Get-HotfixDelta`, `Resolve-HotfixPlan`,
+  `Get-SiteDeployInfo`, `Get-HotfixTarget`, `Update-DeployInfoHotfix`,
+  `Restore-HotfixFiles`, `Invoke-SiteWarmup`, `Test-HotfixWritable`,
+  `Test-SameFileContent`.
+
+### Fixed
+- `Invoke-GitCommand` centraliza las llamadas a git: escribe avisos rutinarios
+  por stderr ("CRLF will be replaced by LF") y con `$ErrorActionPreference =
+  'Stop'` PowerShell 5.1 los convierte en error **terminante** aunque se
+  redirijan a `$null`. Se decide por el código de salida, que es el contrato de
+  git.
+- `Test-SameFileContent` compara ficheros con .NET en vez de `Get-FileHash`: una
+  sesión 5.1 lanzada desde un `pwsh` 7 hereda su `PSModulePath`, carga los
+  módulos de PS7 y se queda **sin ese cmdlet**.
+
 ## [0.5.0] - 2026-09-03
 
 ### Added
