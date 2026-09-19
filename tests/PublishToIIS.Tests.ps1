@@ -1245,9 +1245,44 @@ Describe 'Resolve-HotfixPlan' {
         $plan.unknown | Should -BeNullOrEmpty
     }
 
+    It 'lo que vive en el proyecto pero no tiene destino en el site se lista y no bloquea' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Path @(
+            'CentralCompres/CHANGELOG.md', 'CentralCompres/Scheduling/tools/carga.py',
+            'CentralCompres/scripts/alta-tabla.sql')
+        @($plan.ignored).Count | Should -Be 3
+        $plan.unknown | Should -BeNullOrEmpty
+        $plan.copy | Should -BeNullOrEmpty
+    }
+
+    It 'un .dbml genera codigo: lo que llega al site es el ensamblado' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Models/Model/DCModel.dbml') -ProjectPrefix 'CentralCompres'
+        $plan.build | Should -Be 'Models/Model/DCModel.dbml'
+        $plan.unknown | Should -BeNullOrEmpty
+    }
+
+    It 'un .resx de App_GlobalResources se compila Y se copia: el site sirve los dos' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Path @(
+            'CentralCompres/App_GlobalResources/Featured_Partner/Res.es-ES.resx')
+        $plan.build | Should -Be 'App_GlobalResources/Featured_Partner/Res.es-ES.resx'
+        $plan.copy | Should -Be 'App_GlobalResources/Featured_Partner/Res.es-ES.resx'
+    }
+
+    It 'el Designer.cs de App_GlobalResources no se copia: es codigo fuente' {
+        $plan = Resolve-HotfixPlan -ProjectPrefix 'CentralCompres' -Path @(
+            'CentralCompres/App_GlobalResources/Featured_Partner/Res.Designer.cs')
+        $plan.build | Should -Be 'App_GlobalResources/Featured_Partner/Res.Designer.cs'
+        $plan.copy | Should -BeNullOrEmpty
+    }
+
+    It 'un .resx normal solo se compila' {
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Resources/Model.resx') -ProjectPrefix 'CentralCompres'
+        $plan.build | Should -Be 'Resources/Model.resx'
+        $plan.copy | Should -BeNullOrEmpty
+    }
+
     It 'un fichero sin regla conocida cae en unknown y no se da por aplicado' {
-        $plan = Resolve-HotfixPlan -Path @('CentralCompres/LEEME.md') -ProjectPrefix 'CentralCompres'
-        $plan.unknown | Should -Be 'LEEME.md'
+        $plan = Resolve-HotfixPlan -Path @('CentralCompres/Datos/tarifas.dat') -ProjectPrefix 'CentralCompres'
+        $plan.unknown | Should -Be 'Datos/tarifas.dat'
         $plan.copy | Should -BeNullOrEmpty
     }
 

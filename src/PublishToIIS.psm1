@@ -2618,6 +2618,8 @@ function Resolve-HotfixPlan {
                      log4net.config): NUNCA viaja en un hotfix, igual que en Publish,
                      donde cada servidor conserva la suya.
             removed  borrados en el origen: no se tocan en el site salvo que se pida.
+            ignored  dentro del proyecto pero sin destino en el site (CHANGELOG.md,
+                     scripts de BD, utilidades): se listan, no bloquean.
             unknown  dentro del proyecto pero sin regla conocida: BLOQUEA, porque no
                      se puede afirmar que el hotfix haya llegado entero.
             outside  fuera del proyecto web (tests, docs, tools): no van al site.
@@ -2644,7 +2646,12 @@ function Resolve-HotfixPlan {
     $extensionesCopiables = @('.cshtml', '.vbhtml', '.css', '.js', '.map', '.html', '.htm',
                               '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
                               '.woff2', '.ttf', '.eot', '.xsl', '.xslt')
-    $extensionesBuild = @('.cs', '.vb', '.resx', '.csproj', '.vbproj', '.sln')
+    # .dbml/.edmx/.tt generan codigo: lo que llega al site es el ensamblado.
+    $extensionesBuild = @('.cs', '.vb', '.resx', '.csproj', '.vbproj', '.sln', '.dbml', '.edmx', '.tt', '.settings')
+    # Viven en el proyecto pero no tienen destino en el site. No bloquean, pero se
+    # listan: un script de BD que no viaja tiene que verse, no desaparecer.
+    $extensionesIgnorables = @('.md', '.gitignore', '.gitattributes', '.editorconfig', '.yml', '.yaml',
+                               '.ps1', '.py', '.sh', '.sql', '.user', '.log', '.bak', '.orig')
     $configEntorno = @('web.config', 'web_local.config', 'connections.config', 'log4net.config')
 
     $clasificar = {
@@ -2673,6 +2680,9 @@ function Resolve-HotfixPlan {
         if ($bajo -eq 'global.asax' -or $extensionesCopiables -contains $ext) {
             return [pscustomobject]@{ clase = 'copy'; rel = $n }
         }
+        # Antes que la regla de carpeta: un .sql dentro de Scripts/ no es un recurso
+        # del navegador por estar donde esta.
+        if ($extensionesIgnorables -contains $ext) { return [pscustomobject]@{ clase = 'ignored'; rel = $n } }
         foreach ($c in $carpetasCopiables) {
             if ($bajo.StartsWith($c)) { return [pscustomobject]@{ clase = 'copy'; rel = $n } }
         }
@@ -2683,6 +2693,7 @@ function Resolve-HotfixPlan {
     $build = New-Object Collections.ArrayList
     $config = New-Object Collections.ArrayList
     $unknown = New-Object Collections.ArrayList
+    $ignorados = New-Object Collections.ArrayList
     $outside = New-Object Collections.ArrayList
     $borrados = New-Object Collections.ArrayList
 
@@ -2694,6 +2705,7 @@ function Resolve-HotfixPlan {
             'build' { [void]$build.Add($r.rel) }
             'config' { [void]$config.Add($r.rel) }
             'outside' { [void]$outside.Add($r.rel) }
+            'ignored' { [void]$ignorados.Add($r.rel) }
             default { [void]$unknown.Add($r.rel) }
         }
     }
@@ -2709,12 +2721,22 @@ function Resolve-HotfixPlan {
             'build' { [void]$build.Add($r.rel) }
             'config' { [void]$config.Add($r.rel) }
             'outside' { [void]$outside.Add($r.rel) }
+            'ignored' { [void]$ignorados.Add($r.rel) }
             default { [void]$unknown.Add($r.rel) }
         }
     }
 
-    $copiar = @($copy | Sort-Object -Unique)
     $compilar = @($build | Sort-Object -Unique)
+    # App_GlobalResources viaja de las dos formas: el .resx se publica en el site y
+    # ademas se compila. Si solo se llevara el ensamblado, el site se quedaria con
+    # el .resx viejo al lado.
+    foreach ($b in $compilar) {
+        $bb = $b.ToLowerInvariant()
+        # Solo el .resx: el Designer.cs que lo acompana es codigo fuente y no pinta
+        # nada en el site.
+        if ($bb.StartsWith('app_globalresources/') -and $bb.EndsWith('.resx')) { [void]$copy.Add($b) }
+    }
+    $copiar = @($copy | Sort-Object -Unique)
     $reciclaPorCopia = @($copiar | Where-Object {
         $b = $_.ToLowerInvariant(); $b -eq 'global.asax' -or $b.StartsWith('bin/')
     }).Count -gt 0
@@ -2724,6 +2746,7 @@ function Resolve-HotfixPlan {
         build      = $compilar
         config     = @($config | Sort-Object -Unique)
         removed    = @($borrados | Sort-Object -Unique)
+        ignored    = @($ignorados | Sort-Object -Unique)
         unknown    = @($unknown | Sort-Object -Unique)
         outside    = @($outside | Sort-Object -Unique)
         needsBuild = [bool]$compilar.Count
@@ -3263,6 +3286,9 @@ function Invoke-Hotfix {
         Write-Host ("  borrados    {0} -> {1}" -f $plan.removed.Count, $queHace) -ForegroundColor DarkYellow
     }
     if ($plan.config.Count) { Write-Host ("  excluidos   {0} de configuracion del entorno" -f $plan.config.Count) -ForegroundColor DarkGray }
+    if ($plan.ignored.Count) {
+        Write-Host ("  no viajan   " + ((@($plan.ignored) | Select-Object -First 4) -join ', ')) -ForegroundColor DarkGray
+    }
     Write-Host ("  AppDomain   " + $(if ($recicla) { 'SE RECICLA (sesiones InProc perdidas + warm-up)' } else { 'intacto' })) `
         -ForegroundColor $(if ($recicla) { 'Yellow' } else { 'Green' })
 
