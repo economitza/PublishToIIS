@@ -3044,6 +3044,88 @@ function Test-SameFileContent {
     [Convert]::ToBase64String($ha) -eq [Convert]::ToBase64String($hb)
 }
 
+function Invoke-HotfixBuild {
+    <#
+    .SYNOPSIS
+        Compila el proyecto en su propio bin, sin publicar.
+
+    .DESCRIPTION
+        Publish llama a MSBuild con DeployOnBuild y PublishUrl para levantar un
+        arbol completo en una carpeta virgen: correcto para una entrega, caro para
+        una vuelta de iteracion. Aqui se pide solo /t:Build, que es incremental y
+        deja los ensamblados en el bin del propio proyecto; del bin sale despues el
+        delta que se copia al site.
+
+        El restore solo se hace si el delta toca packages.config: sin eso, cada
+        hotfix pagaria el restore entero para nada.
+
+    .OUTPUTS
+        PSCustomObject con el proyecto compilado y los milisegundos que costo.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [string]$Configuration = 'Release',
+        [switch]$Restore
+    )
+
+    $ErrorActionPreference = 'Stop'
+    if (Test-Path $ProjectPath -PathType Container) {
+        $csproj = Get-ChildItem -Path $ProjectPath -Filter *.csproj -File | Select-Object -First 1
+        if (-not $csproj) { throw "No hay ningun .csproj en '$ProjectPath'." }
+        $proyecto = $csproj.FullName
+    }
+    else { $proyecto = $ProjectPath }
+
+    if ($Restore) { Restore-NuGetPackages -ProjectFile $proyecto }
+
+    $msbuild = Get-MSBuild
+    $reloj = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host "Compilando $proyecto ($Configuration, incremental)..." -ForegroundColor Yellow
+    & $msbuild $proyecto /p:Configuration=$Configuration /t:Build /v:minimal /nologo /m
+    $reloj.Stop()
+    if ($LASTEXITCODE -ne 0) { throw "MSBuild fallo con codigo $LASTEXITCODE. El site NO se ha tocado." }
+    Write-Host ("Compilado en {0:N1} s" -f $reloj.Elapsed.TotalSeconds) -ForegroundColor Green
+
+    [pscustomobject]@{ project = $proyecto; elapsedMs = [int]$reloj.ElapsedMilliseconds }
+}
+
+function Get-HotfixBinDelta {
+    <#
+    .SYNOPSIS
+        Ensamblados del bin del proyecto que difieren de los del site.
+
+    .DESCRIPTION
+        Se comparan por contenido y solo se traen los distintos o los que faltan:
+        copiar un DLL identico dispararia un reciclado del AppDomain para nada. No
+        se borra nunca nada del bin del site: lo que sobra ahi no rompe, y un
+        borrado a ciegas si.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $binOrigen = Join-Path $ProjectPath 'bin'
+    if (-not (Test-Path $binOrigen)) { return @() }
+    $binSite = Join-Path $Destination 'bin'
+    $raiz = (Get-Item $binOrigen).FullName.TrimEnd('\')
+
+    $delta = New-Object Collections.ArrayList
+    foreach ($f in @(Get-ChildItem -Path $binOrigen -Recurse -File -Include *.dll, *.pdb -ErrorAction SilentlyContinue)) {
+        $relativo = $f.FullName.Substring($raiz.Length + 1)
+        $destino = Join-Path $binSite $relativo
+        if (Test-SameFileContent -A $f.FullName -B $destino) { continue }
+        [void]$delta.Add([pscustomobject]@{
+            rel    = 'bin/' + ($relativo -replace '\\', '/')
+            source = $f.FullName
+            target = $destino
+        })
+    }
+    @($delta)
+}
+
 function Invoke-Hotfix {
     <#
     .SYNOPSIS
@@ -3086,6 +3168,10 @@ function Invoke-Hotfix {
         [string]$Environment,
         [string]$EnvironmentFile,
         [switch]$Execute,
+        # Permite el nivel que exige MSBuild: compila el proyecto y lleva al site
+        # los ensamblados que hayan cambiado. Recicla el AppDomain, por eso es opt-in.
+        [switch]$IncludeBuild,
+        [string]$Configuration = 'Release',
         # Aplica tambien los borrados: quita del site los ficheros que ya no estan
         # en el origen. Es destructivo, por eso no va por defecto (un js o un css
         # de mas no rompe nada; borrar de menos, tampoco).
@@ -3155,9 +3241,10 @@ function Invoke-Hotfix {
     if ($plan.unknown.Count) {
         $bloqueos += ("no se sabe como llegan al site: " + (@($plan.unknown) -join ', '))
     }
-    if ($plan.needsBuild) {
+    if ($plan.needsBuild -and -not $IncludeBuild) {
         $bloqueos += ("$($plan.build.Count) fichero(s) solo llegan compilados (" +
-                      ((@($plan.build) | Select-Object -First 3) -join ', ') + "): esto es un Publish, no un hotfix")
+                      ((@($plan.build) | Select-Object -First 3) -join ', ') +
+                      "): repite con -IncludeBuild, o publica")
     }
 
     Write-Host "== Plan de hotfix: $($target.environment) ==" -ForegroundColor Cyan
@@ -3167,6 +3254,9 @@ function Invoke-Hotfix {
     if ($delta.dirty -and -not $Committed) { $etiquetaOrigen += ' + cambios sin commitear' }
     Write-Host ("  origen      " + $etiquetaOrigen) -ForegroundColor Gray
     Write-Host ("  copiar      {0} fichero(s){1}" -f $aCopiar.Count, $(if ($vistas) { " ($vistas vista(s))" } else { '' })) -ForegroundColor Gray
+    if ($plan.needsBuild -and $IncludeBuild) {
+        Write-Host ("  compilar    {0} fichero(s) -> el delta de bin sale de la compilacion" -f $plan.build.Count) -ForegroundColor Gray
+    }
     if ($sinCambios.Count) { Write-Host ("  sin cambios {0} (identicos en el site)" -f $sinCambios.Count) -ForegroundColor DarkGray }
     if ($plan.removed.Count) {
         $queHace = if ($IncludeRemovals) { 'se quitan del site' } else { 'NO se tocan (usa -IncludeRemovals)' }
@@ -3192,6 +3282,7 @@ function Invoke-Hotfix {
         head        = $delta.headShort
         branch      = $delta.branch
         plan        = $plan
+        build       = $null
         toCopy      = @($aCopiar | ForEach-Object { $_.rel })
         unchanged   = @($sinCambios)
         recycles    = $recicla
@@ -3216,7 +3307,8 @@ function Invoke-Hotfix {
         return $resultado
     }
 
-    if (-not $aCopiar.Count -and -not ($IncludeRemovals -and $plan.removed.Count)) {
+    $vaACompilar = $IncludeBuild -and $plan.needsBuild
+    if (-not $aCopiar.Count -and -not $vaACompilar -and -not ($IncludeRemovals -and $plan.removed.Count)) {
         Write-Host "Nada que aplicar: el site ya esta al dia." -ForegroundColor Green
         $resultado.status = 'nochange'
         $reloj.Stop(); $resultado.elapsedMs = [int]$reloj.ElapsedMilliseconds
@@ -3226,6 +3318,26 @@ function Invoke-Hotfix {
     if (-not (Test-HotfixWritable -Destination $target.destination)) {
         throw ("Sin permiso de escritura en '$($target.destination)'. El hotfix no eleva a proposito: " +
                "abre la consola con una cuenta que pueda escribir en el site.")
+    }
+
+    # La compilacion va ANTES de tocar el site: si MSBuild falla, el site se queda
+    # exactamente como estaba y no hay nada que deshacer.
+    if ($vaACompilar) {
+        $resultado.build = Invoke-HotfixBuild -ProjectPath $target.origin -Configuration $Configuration `
+            -Restore:(@($plan.build) -contains 'packages.config')
+        foreach ($ensamblado in (Get-HotfixBinDelta -ProjectPath $target.origin -Destination $target.destination)) {
+            [void]$aCopiar.Add($ensamblado)
+        }
+        $recicla = $true
+        $resultado.recycles = $true
+        Write-Host ("Ensamblados que cambian: {0}" -f @($aCopiar | Where-Object { $_.rel.StartsWith('bin/') }).Count) -ForegroundColor Gray
+    }
+
+    if (-not $aCopiar.Count -and -not ($IncludeRemovals -and $plan.removed.Count)) {
+        Write-Host "Compilado, pero ningun fichero del site cambia: ya estaba al dia." -ForegroundColor Green
+        $resultado.status = 'nochange'
+        $reloj.Stop(); $resultado.elapsedMs = [int]$reloj.ElapsedMilliseconds
+        return $resultado
     }
 
     $siteName = Split-Path $target.destination -Leaf
@@ -3378,4 +3490,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
+Export-ModuleMember -Function Publish, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update

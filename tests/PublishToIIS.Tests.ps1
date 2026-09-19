@@ -1395,6 +1395,7 @@ BeforeAll {
         Set-Content (Join-Path $proyecto 'Scripts\app.js') -Value 'js1'
         Set-Content (Join-Path $proyecto 'Controllers.cs') -Value 'class A {}'
         Set-Content (Join-Path $proyecto 'Web.config') -Value '<configuration />'
+        Set-Content (Join-Path $repo '.gitignore') -Value "bin/`nobj/"
 
         & git -C $repo init -q
         & git -C $repo config user.email 'test@economitza.com'
@@ -1629,5 +1630,109 @@ Describe 'Undo-Hotfix' {
 
     It 'sin hotfixes previos avisa en vez de fingir que ha hecho algo' {
         { Undo-Hotfix -EnvironmentFile $script:e.envFile -Execute } | Should -Throw '*No hay hotfixes*'
+    }
+}
+
+Describe 'Get-HotfixBinDelta' {
+    It 'trae solo los ensamblados distintos o nuevos' {
+        $proj = Join-Path $TestDrive 'bd-proj'
+        $site = Join-Path $TestDrive 'bd-site'
+        New-Item -ItemType Directory -Force -Path (Join-Path $proj 'bin') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $site 'bin') | Out-Null
+        Set-Content (Join-Path $proj 'bin\Igual.dll') -Value 'x'
+        Set-Content (Join-Path $site 'bin\Igual.dll') -Value 'x'
+        Set-Content (Join-Path $proj 'bin\Cambia.dll') -Value 'compilado'
+        Set-Content (Join-Path $site 'bin\Cambia.dll') -Value 'viejo'
+        Set-Content (Join-Path $proj 'bin\Nueva.dll') -Value 'nueva'
+        Set-Content (Join-Path $proj 'bin\notas.txt') -Value 'no es un ensamblado'
+
+        $d = Get-HotfixBinDelta -ProjectPath $proj -Destination $site
+
+        @($d).Count | Should -Be 2
+        @($d.rel) | Should -Contain 'bin/Cambia.dll'
+        @($d.rel) | Should -Contain 'bin/Nueva.dll'
+    }
+
+    It 'conserva la ruta de los ensamblados satelite' {
+        $proj = Join-Path $TestDrive 'bd-sat-proj'
+        $site = Join-Path $TestDrive 'bd-sat-site'
+        New-Item -ItemType Directory -Force -Path (Join-Path $proj 'bin\ca') | Out-Null
+        New-Item -ItemType Directory -Force -Path $site | Out-Null
+        Set-Content (Join-Path $proj 'bin\ca\Recursos.resources.dll') -Value 'ca'
+
+        (Get-HotfixBinDelta -ProjectPath $proj -Destination $site).rel | Should -Be 'bin/ca/Recursos.resources.dll'
+    }
+
+    It 'sin bin en el proyecto no hay nada que llevar' {
+        $proj = Join-Path $TestDrive 'bd-sinbin'
+        New-Item -ItemType Directory -Force -Path $proj | Out-Null
+        @(Get-HotfixBinDelta -ProjectPath $proj -Destination $TestDrive).Count | Should -Be 0
+    }
+}
+
+Describe 'Invoke-Hotfix con -IncludeBuild' {
+    BeforeEach {
+        $script:e = New-EntornoHotfix -Raiz (Join-Path $TestDrive ([Guid]::NewGuid().ToString('N')))
+    }
+
+    It 'un cambio de codigo deja de bloquear' {
+        Set-Content (Join-Path $script:e.project 'Controllers.cs') -Value 'class A { int x; }'
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile -IncludeBuild
+        $r.status | Should -Be 'plan'
+        $r.blocked | Should -BeNullOrEmpty
+    }
+
+    It 'lleva al site los ensamblados que cambian y avisa del reciclado' {
+        Set-Content (Join-Path $script:e.project 'Controllers.cs') -Value 'class A { int x; }'
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:e.site 'bin') | Out-Null
+        Set-Content (Join-Path $script:e.site 'bin\App.dll') -Value 'dll-viejo'
+        Mock -ModuleName PublishToIIS Invoke-HotfixBuild {
+            New-Item -ItemType Directory -Force -Path (Join-Path $ProjectPath 'bin') | Out-Null
+            Set-Content (Join-Path $ProjectPath 'bin\App.dll') -Value 'dll-nuevo'
+            [pscustomobject]@{ project = 'App.csproj'; elapsedMs = 1 }
+        }
+
+        $r = Invoke-Hotfix -EnvironmentFile $script:e.envFile -IncludeBuild -Execute -SkipWarmup
+
+        $r.status | Should -Be 'ok'
+        $r.recycles | Should -BeTrue
+        $r.applied | Should -Contain 'bin/App.dll'
+        (Get-Content (Join-Path $script:e.site 'bin\App.dll') -Raw).Trim() | Should -Be 'dll-nuevo'
+        (Get-Content (Join-Path $r.backup 'bin\App.dll') -Raw).Trim() | Should -Be 'dll-viejo'
+    }
+
+    It 'si la compilacion falla el site se queda intacto' {
+        Set-Content (Join-Path $script:e.project 'Views\Index.cshtml') -Value 'v2'
+        Set-Content (Join-Path $script:e.project 'Controllers.cs') -Value 'class A { int x; }'
+        Mock -ModuleName PublishToIIS Invoke-HotfixBuild { throw 'MSBuild fallo con codigo 1' }
+
+        { Invoke-Hotfix -EnvironmentFile $script:e.envFile -IncludeBuild -Execute } | Should -Throw '*MSBuild*'
+        (Get-Content (Join-Path $script:e.site 'Views\Index.cshtml') -Raw).Trim() | Should -Be 'v1'
+        (Get-SiteDeployInfo -Destination $script:e.site).dirty | Should -BeNullOrEmpty
+    }
+
+    It 'compilar sin que cambie ningun ensamblado no toca el site' {
+        Set-Content (Join-Path $script:e.project 'Controllers.cs') -Value 'class A { int x; }'
+        Mock -ModuleName PublishToIIS Invoke-HotfixBuild { [pscustomobject]@{ project = 'x'; elapsedMs = 1 } }
+
+        (Invoke-Hotfix -EnvironmentFile $script:e.envFile -IncludeBuild -Execute -SkipWarmup).status |
+            Should -Be 'nochange'
+    }
+
+    It 'no paga el restore de NuGet si no cambia packages.config' {
+        Set-Content (Join-Path $script:e.project 'Controllers.cs') -Value 'class A { int x; }'
+        Mock -ModuleName PublishToIIS Invoke-HotfixBuild { [pscustomobject]@{ project = 'x'; elapsedMs = 1 } }
+
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -IncludeBuild -Execute -SkipWarmup | Out-Null
+        Should -Invoke -ModuleName PublishToIIS Invoke-HotfixBuild -Times 1 -Exactly -ParameterFilter { -not $Restore }
+    }
+
+    It 'restaura paquetes cuando el delta toca packages.config' {
+        Set-Content (Join-Path $script:e.project 'packages.config') -Value '<packages />'
+        Mock -ModuleName PublishToIIS Invoke-HotfixBuild { [pscustomobject]@{ project = 'x'; elapsedMs = 1 } }
+
+        Invoke-Hotfix -EnvironmentFile $script:e.envFile -IncludeBuild -Execute -SkipWarmup | Out-Null
+        Should -Invoke -ModuleName PublishToIIS Invoke-HotfixBuild -Times 1 -Exactly -ParameterFilter { $Restore }
     }
 }
