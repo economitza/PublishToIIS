@@ -1080,15 +1080,31 @@ function Read-AdHocEnvironment {
         Reglas: `name`, `origin` y `destination` obligatorios; el nombre NO puede
         coincidir con un entorno de environments.json (para eso está la config
         central) ni ser prod/staging.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
 
-    if (-not (Test-Path $Path)) { throw "No existe el fichero de entorno ad hoc: '$Path'" }
-    $def = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        Con -Definition valida una definición YA leída, sin fichero: es la que
+        llega en el cuerpo de POST /api/publish o dentro de una orden de la cola.
+        Las reglas son las mismas y se escriben UNA vez: si la validación viviera
+        solo en el camino del fichero, la puerta HTTP entraría sin guardas.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Path')][string]$Path,
+        [Parameter(Mandatory, ParameterSetName = 'Definition')]$Definition
+    )
+
+    if ($PSCmdlet.ParameterSetName -eq 'Definition') {
+        if (-not $Definition) { throw 'La definición de entorno ad hoc está vacía.' }
+        $def = $Definition
+        $origen = "entorno ad hoc '$($Definition.name)'"
+    }
+    else {
+        if (-not (Test-Path $Path)) { throw "No existe el fichero de entorno ad hoc: '$Path'" }
+        $def = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $origen = "El entorno ad hoc '$Path'"
+    }
 
     foreach ($campo in 'name', 'origin', 'destination') {
-        if (-not $def.$campo) { throw "El entorno ad hoc '$Path' no define '$campo'." }
+        if (-not $def.$campo) { throw "$origen no define '$campo'." }
     }
     if ($def.name -in @('prod', 'staging')) { throw "Nombre de entorno ad hoc no permitido: '$($def.name)'." }
 
@@ -1341,18 +1357,120 @@ function Wait-PublishResult {
     throw "Timeout de $TimeoutSeconds s esperando el resultado en '$resultPath'. Revisa publish-order.log."
 }
 
+function Test-ScheduledTaskPresent {
+    # ¿Existe la tarea en esta máquina? Decide si hay cola disponible o hay que
+    # caer al camino directo. Se aísla para poder sustituirla en los tests.
+    param([Parameter(Mandatory)][string]$TaskName)
+    $null = & schtasks /query /tn $TaskName 2>&1
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Request-PublishQueued {
+    <#
+    .SYNOPSIS
+        Encola la publicación en la cola FIFO y espera su resultado.
+
+    .DESCRIPTION
+        La mitad "en cola" de Request-Publish: mete el item, despierta al
+        drenador y sigue el resultado por runId. El drenador procesa de una en
+        una, así que varias sesiones publicando a la vez en esta máquina se
+        serializan solas en lugar de pisarse la orden.
+
+        Mientras la orden espera turno informa de su posición, y en cuanto entra
+        en 'running' vuelca el log de la publicación como el camino directo: una
+        espera muda no distingue "hay cola" de "se ha colgado".
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Environment,
+        [Parameter(Mandatory)][string]$Branch,
+        [switch]$Execute,
+        [switch]$OverrideWebconfig,
+        [string[]]$AllowedEnvironments,
+        [string]$EnvironmentFile,
+        [string]$DrainerTaskName = 'Publish Queue Drainer',
+        [string]$DataDir,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 900,
+        [int]$PollSeconds = 2,
+        [switch]$Quiet,
+        [string]$RequestedBy
+    )
+    $ErrorActionPreference = 'Stop'
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $item = Add-DeployQueueItem -Environment $Environment -Branch $Branch `
+        -Execute:$Execute -OverrideWebconfig:$OverrideWebconfig `
+        -AllowedEnvironments $AllowedEnvironments -EnvironmentFile $EnvironmentFile `
+        -DataDir $dir -RequestedBy $RequestedBy
+
+    $cola = if ($item.position -gt 1) { " (posición $($item.position) en la cola)" } else { '' }
+    Write-Host "Orden encolada (runId $($item.runId))$cola" -ForegroundColor Gray
+    Write-Host "Despertando al drenador '$DrainerTaskName'..." -ForegroundColor Yellow
+    Start-PublishTask -TaskName $DrainerTaskName -DataDir $dir
+
+    if ($NoWait) {
+        return [pscustomobject]@{
+            status      = 'queued'
+            environment = $Environment
+            branch      = $Branch
+            runId       = $item.runId
+            position    = $item.position
+            logPath     = Join-Path $dir 'publish-order.log'
+        }
+    }
+
+    $logPath = Join-Path $dir 'publish-order.log'
+    $pos = 0
+    $stamp = [datetime]::MinValue
+    $anterior = ''
+    $limite = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $limite) {
+        $r = Get-DeployResult -RunId $item.runId -DataDir $dir
+        $estado = if ($r) { [string]$r.status } else { '' }
+
+        if ($estado -eq 'queued' -and $estado -ne $anterior -and -not $Quiet) {
+            Write-Host "  esperando turno (posición $($r.position))..." -ForegroundColor DarkGray
+        }
+        if ($estado -eq 'running' -and -not $Quiet) {
+            $pos = Write-PublishLogTail -Path $logPath -Position $pos -Stamp ([ref]$stamp)
+        }
+        if ($estado -in @('ok', 'error')) {
+            if (-not $Quiet) { $pos = Write-PublishLogTail -Path $logPath -Position $pos -Stamp ([ref]$stamp) }
+            $color = if ($estado -eq 'ok') { 'Green' } else { 'Red' }
+            Write-Host "RESULT: $estado $($r.message)" -ForegroundColor $color
+            return $r
+        }
+        $anterior = $estado
+        Start-Sleep -Seconds $PollSeconds
+    }
+    throw "Tiempo agotado ($TimeoutSeconds s) esperando el resultado de la orden $($item.runId). Mira la cola con Get-DeployQueue."
+}
+
 function Request-Publish {
     <#
     .SYNOPSIS
-        Pide una publicación SIN privilegios: escribe la orden, dispara la tarea
-        elevada 'Publish Local' y espera el resultado.
+        Pide una publicación SIN privilegios: encola la orden, despierta al
+        drenador y espera el resultado.
 
     .DESCRIPTION
         Es exactamente la llamada que hará el job de CI o el dashboard: no eleva
         nada, solo deja la orden y la dispara. Todo el trabajo con privilegios
         (checkout, MSBuild, parada del app pool y swap) lo hace la tarea.
 
-        La tarea hay que registrarla UNA vez en la máquina, con privilegios:
+        Por defecto la orden va a la COLA FIFO (la misma que alimenta el endpoint
+        HTTP) y la despacha el drenador. Antes se escribía en `publish-order.json`,
+        que es una ranura ÚNICA: dos llamadas a la vez en la misma máquina —dos
+        sesiones publicando en sitios distintos— se pisaban, la primera orden no
+        llegaba a ejecutarse y quien la lanzó se quedaba esperando un resultado
+        que era de la otra. La cola no necesita HTTP en local: es un directorio,
+        y el endpoint solo es la puerta para quien llama desde fuera.
+
+        Con -Direct se salta la cola y se escribe la orden directamente, que es
+        el camino de siempre. Lo usa el drenador (que YA es la cola) y sirve de
+        respaldo donde no exista la tarea drenadora.
+
+        Las tareas hay que registrarlas UNA vez en la máquina, con privilegios:
         tools\Register-PublishLocalTask.ps1 (con -Unattended en servidores).
 
     .EXAMPLE
@@ -1372,16 +1490,28 @@ function Request-Publish {
         # `.publish-env.json` en la raiz del worktree). Ver Read-AdHocEnvironment.
         [string]$EnvironmentFile,
         [string]$TaskName = 'Publish Local',
+        [string]$DrainerTaskName = 'Publish Queue Drainer',
         [string]$DataDir,
         [switch]$NoWait,
         [int]$TimeoutSeconds = 900,
         # Por defecto se va volcando el log de la tarea mientras publica, para no
         # dejar la consola muda durante minutos
         [switch]$Quiet,
-        [string]$RequestedBy
+        [string]$RequestedBy,
+        # Salta la cola y escribe la orden en la ranura única. Es lo que hace el
+        # drenador, que ya ES la cola.
+        [switch]$Direct
     )
 
     $ErrorActionPreference = 'Stop'
+
+    if (-not $Direct -and (Test-ScheduledTaskPresent -TaskName $DrainerTaskName)) {
+        return Request-PublishQueued -Environment $Environment -Branch $Branch `
+            -Execute:$Execute -OverrideWebconfig:$OverrideWebconfig `
+            -AllowedEnvironments $AllowedEnvironments -EnvironmentFile $EnvironmentFile `
+            -DrainerTaskName $DrainerTaskName -DataDir $DataDir -NoWait:$NoWait `
+            -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet -RequestedBy $RequestedBy
+    }
 
     $order = Write-PublishOrder -Environment $Environment -Branch $Branch `
         -Execute:$Execute -OverrideWebconfig:$OverrideWebconfig `
@@ -1702,6 +1832,12 @@ function Add-DeployQueueItem {
         [string]$DataDir,
         [string]$RunId = [Guid]::NewGuid().ToString(),
         [string]$RequestedBy,
+        # Entorno ad hoc de un worktree efímero: por fichero o ya leído. La
+        # definición viaja DENTRO del item de la cola, igual que en la orden
+        # local, para que estos entornos no tengan que darse de alta en
+        # environments.json solo por pasar por la cola.
+        [string]$EnvironmentFile,
+        $EnvironmentDef,
         # 'publish' (entorno + rama) o 'update' (actualizar el módulo del
         # servidor; sin entorno ni rama). Van por la MISMA cola: así nunca se
         # actualiza el módulo a mitad de una publicación.
@@ -1709,11 +1845,25 @@ function Add-DeployQueueItem {
     )
     $ErrorActionPreference = 'Stop'
 
+    $envDef = $null
     if ($Kind -eq 'publish') {
+        if ($EnvironmentFile) { $envDef = Read-AdHocEnvironment -Path $EnvironmentFile }
+        elseif ($EnvironmentDef) { $envDef = Read-AdHocEnvironment -Definition $EnvironmentDef }
+
+        if ($envDef) {
+            if ($Environment -and $Environment -ne $envDef.name) {
+                throw "-Environment '$Environment' no coincide con el name '$($envDef.name)' del entorno ad hoc."
+            }
+            $Environment = $envDef.name
+        }
         if (-not $Environment -or -not $Branch) { throw "Una orden de publicación necesita 'environment' y 'branch'." }
-        $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
-        if ($Environment -notin $allowed) {
-            throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+        # Un entorno ad hoc ya ha pasado sus propias guardas (nunca prod/staging,
+        # sin colisionar con la config central): la lista blanca es de la config.
+        if (-not $envDef) {
+            $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+            if ($Environment -notin $allowed) {
+                throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+            }
         }
         if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
             throw "Rama con formato inválido: '$Branch'"
@@ -1741,7 +1891,7 @@ function Add-DeployQueueItem {
     Set-Content $seqFile -Value $seq -Encoding Ascii
     # El prefijo cero-rellenado ordena lexicográficamente igual que numéricamente.
     $file = Join-Path $qdir ('{0:000000000000}-{1}.json' -f $seq, $RunId)
-    [pscustomobject]@{
+    $item = [ordered]@{
         kind              = $Kind
         environment       = [string]$Environment
         branch            = [string]$Branch
@@ -1750,7 +1900,9 @@ function Add-DeployQueueItem {
         runId             = $RunId
         queuedAt          = (Get-Date).ToString('o')
         requestedBy       = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
-    } | ConvertTo-Json -Compress | Set-Content $file -Encoding UTF8
+    }
+    if ($envDef) { $item.environmentDef = $envDef }
+    [pscustomobject]$item | ConvertTo-Json -Compress -Depth 6 | Set-Content $file -Encoding UTF8
 
     [pscustomobject]@{ runId = $RunId; position = $ahead + 1; path = $file }
 }
@@ -1857,12 +2009,24 @@ function Invoke-DeployQueueDrain {
             requestedBy = $requestedBy; startedAt = (Get-Date).ToString('o')
         } | ConvertTo-Json | Set-Content $resultFile -Encoding UTF8
 
+        $envFileTmp = $null
         try {
             if ($kind -eq 'update') {
                 $res = Request-ModuleUpdate -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
             }
             else {
-                $res = Request-Publish -Environment ([string]$order.environment) -Branch ([string]$order.branch) `
+                # Un entorno ad hoc viaja como definición dentro del item; se
+                # vuelca a un fichero temporal para entrar por el mismo
+                # -EnvironmentFile que valida y usa el resto del flujo.
+                $envArgs = @{ Environment = [string]$order.environment }
+                if ($order.environmentDef) {
+                    $envFileTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("adhoc-$($order.runId).json")
+                    $order.environmentDef | ConvertTo-Json -Depth 6 | Set-Content $envFileTmp -Encoding UTF8
+                    $envArgs = @{ EnvironmentFile = $envFileTmp }
+                }
+                # -Direct: el drenador YA es la cola. Sin esto volvería a encolar
+                # su propia orden y se llamaría a si mismo para siempre.
+                $res = Request-Publish @envArgs -Branch ([string]$order.branch) -Direct `
                     -Execute:([bool]$order.execute) -OverrideWebconfig:([bool]$order.overrideWebconfig) `
                     -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
             }
@@ -1879,6 +2043,7 @@ function Invoke-DeployQueueDrain {
                 execute = [bool]$order.execute; finishedAt = (Get-Date).ToString('o')
             }
         }
+        if ($envFileTmp) { Remove-Item $envFileTmp -Force -ErrorAction SilentlyContinue }
         $final | ConvertTo-Json | Set-Content $resultFile -Encoding UTF8
         Remove-Item $next.FullName -Force -ErrorAction SilentlyContinue
 
@@ -1974,8 +2139,13 @@ function Invoke-DeployEndpointRequest {
     if ($Method -eq 'POST' -and $Path -eq '/api/publish') {
         try { $req = $Body | ConvertFrom-Json }
         catch { return [pscustomobject]@{ status = 400; body = @{ error = 'Cuerpo JSON inválido.' } } }
-        if (-not $req -or -not $req.environment -or -not $req.branch) {
-            return [pscustomobject]@{ status = 400; body = @{ error = "Faltan 'environment' y/o 'branch' en la orden." } }
+        # Un worktree efímero manda su definición de entorno en el cuerpo
+        # (environmentDef) en vez de un nombre de environments.json, igual que
+        # -EnvironmentFile en local. Read-AdHocEnvironment le aplica las mismas
+        # guardas dentro de Add-DeployQueueItem.
+        $envDef = $req.environmentDef
+        if (-not $req -or (-not $req.environment -and -not $envDef) -or -not $req.branch) {
+            return [pscustomobject]@{ status = 400; body = @{ error = "Faltan 'environment' (o 'environmentDef') y/o 'branch' en la orden." } }
         }
         # Solo un booleano JSON de verdad ejecuta: un string "false" convertido a
         # [bool] sería $true, así que cualquier otro tipo degrada a dry-run.
@@ -1987,6 +2157,7 @@ function Invoke-DeployEndpointRequest {
         if ($requestedBy.Length -gt 128) { $requestedBy = $requestedBy.Substring(0, 128) }
         try {
             $item = Add-DeployQueueItem -Environment ([string]$req.environment) -Branch ([string]$req.branch) `
+                -EnvironmentDef $envDef `
                 -Execute:$execute -OverrideWebconfig:$override -RequestedBy $requestedBy -DataDir $dir
         }
         catch {
@@ -2236,10 +2407,14 @@ function Request-RemotePublish {
         # la URL del endpoint y el token registrado. Alternativa a pasar -Url/-Token.
         [string]$Server,
         [string]$Url,
-        [Parameter(Mandatory)][string]$Environment,
+        [string]$Environment,
         [Parameter(Mandatory)][string]$Branch,
         [switch]$Execute,
         [switch]$OverrideWebconfig,
+        # Entorno ad hoc de un worktree efímero: su definición viaja en el cuerpo
+        # de la petición, igual que en local, para no tener que darlo de alta en
+        # el environments.json del servidor solo para publicar una vez.
+        [string]$EnvironmentFile,
         [string]$Token,
         [switch]$NoWait,
         [int]$TimeoutSeconds = 1200,
@@ -2259,13 +2434,25 @@ function Request-RemotePublish {
     if (-not $Token) {
         throw "Sin token: pásalo con -Token, o usa -Server <nombre> con el token registrado (Set-DeployToken -Server <nombre>), o define PUBLISHTOIIS_API_TOKEN."
     }
+    $envDef = $null
+    if ($EnvironmentFile) {
+        $envDef = Read-AdHocEnvironment -Path $EnvironmentFile
+        if ($Environment -and $Environment -ne $envDef.name) {
+            throw "-Environment '$Environment' no coincide con el name '$($envDef.name)' de '$EnvironmentFile'."
+        }
+        $Environment = $envDef.name
+    }
+    if (-not $Environment) { throw 'Indica -Environment (config del servidor) o -EnvironmentFile (entorno ad hoc).' }
+
     $Url = $Url.TrimEnd('/')
     $headers = @{ 'X-Api-Token' = $Token }
-    $payload = @{
+    $cuerpo = [ordered]@{
         environment = $Environment; branch = $Branch
         execute = [bool]$Execute; overrideWebconfig = [bool]$OverrideWebconfig
         requestedBy = $RequestedBy
-    } | ConvertTo-Json -Compress
+    }
+    if ($envDef) { $cuerpo.environmentDef = $envDef }
+    $payload = [pscustomobject]$cuerpo | ConvertTo-Json -Compress -Depth 6
 
     try {
         $trig = Invoke-RestMethod -Method Post -Uri "$Url/api/publish" -Headers $headers `

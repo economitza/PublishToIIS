@@ -6,6 +6,38 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.7.0] - 2026-09-20
+
+### Changed
+- **`Request-Publish` encola en la cola FIFO en vez de escribir la ranura única.**
+  Hasta ahora dejaba la orden en `publish-order.json`, que es **un solo fichero**:
+  dos llamadas casi a la vez en la misma máquina —dos sesiones publicando en
+  sitios distintos— se pisaban, la primera orden no llegaba a ejecutarse y quien
+  la lanzó se quedaba esperando un resultado que era de la otra (visto el
+  20/09/2026 publicando `si-2558-esp1` mientras otra sesión publicaba en
+  `economitza_espana`). Ahora la orden va a la misma cola que alimenta el
+  endpoint HTTP y la despacha el drenador, que procesa de una en una.
+
+  **En local no hace falta HTTP**: la cola es un directorio, así que se escribe
+  en ella directamente y el endpoint queda como lo que es, la puerta para quien
+  llama desde fuera. Quien publica sigue llamando a `Request-Publish` igual.
+
+  `-Direct` mantiene el camino de siempre y lo usa el drenador, que YA es la
+  cola (sin eso se encolaría a sí mismo). Si la máquina no tiene registrada la
+  tarea drenadora, `Request-Publish` cae solo al camino directo.
+
+### Added
+- **Entornos ad hoc (worktrees efímeros) por la cola y por HTTP.** Hasta ahora
+  su definición solo viajaba por el camino local: `Add-DeployQueueItem` acepta
+  `-EnvironmentFile`/`-EnvironmentDef` y la guarda en el item,
+  `POST /api/publish` admite `environmentDef` en el cuerpo y
+  `Request-RemotePublish` estrena `-EnvironmentFile`. Así un worktree
+  efímero se publica por cualquiera de las tres vías sin darlo de alta en
+  `environments.json`, que es justo lo que la regla pide no hacer.
+- `Read-AdHocEnvironment -Definition` valida una definición ya leída, sin
+  fichero: las guardas (`name`/`origin`/`destination` obligatorios, nunca
+  prod/staging, sin colisionar con la config central) se escriben una vez y
+  valen igual para la puerta HTTP.
 ## [0.6.0] - 2026-09-19
 
 ### Added

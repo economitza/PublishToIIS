@@ -436,7 +436,7 @@ Describe 'Wait-PublishResult' {
     }
 }
 
-Describe 'Request-Publish' {
+Describe 'Request-Publish (camino directo, sin cola)' {
     BeforeEach {
         $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_rp_" + [Guid]::NewGuid())
     }
@@ -454,7 +454,7 @@ Describe 'Request-Publish' {
                 Set-Content (Join-Path $DataDir 'publish-order.result.json') -Encoding UTF8
         }
 
-        $r = Request-Publish -Environment 'devecoand1' -Branch 'main_deploy-20260730' -Execute `
+        $r = Request-Publish -Environment 'devecoand1' -Branch 'main_deploy-20260730' -Execute -Direct `
             -DataDir $script:dataDir -TimeoutSeconds 5
         $r.status | Should -Be 'ok'
         $r.branch | Should -Be 'main_deploy-20260730'
@@ -473,20 +473,20 @@ Describe 'Request-Publish' {
                 Set-Content (Join-Path $DataDir 'publish-order.result.json') -Encoding UTF8
         }
 
-        (Request-Publish -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir -TimeoutSeconds 10).message |
+        (Request-Publish -Environment 'devecoand1' -Branch 'main' -Direct -DataDir $script:dataDir -TimeoutSeconds 10).message |
             Should -Be 'lo de ahora'
     }
 
     It 'con -NoWait no espera resultado y devuelve la orden escrita' {
         Mock -ModuleName PublishToIIS Start-PublishTask { }
-        $r = Request-Publish -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir -NoWait
+        $r = Request-Publish -Environment 'devecoand1' -Branch 'main' -Direct -DataDir $script:dataDir -NoWait
         $r.status | Should -Be 'triggered'
         Test-Path (Join-Path $script:dataDir 'publish-order.json') | Should -BeTrue
     }
 
     It 'no dispara la tarea si la orden es inválida' {
         Mock -ModuleName PublishToIIS Start-PublishTask { }
-        { Request-Publish -Environment 'devecoand1' -Branch 'bad;branch' -DataDir $script:dataDir } |
+        { Request-Publish -Environment 'devecoand1' -Branch 'bad;branch' -Direct -DataDir $script:dataDir } |
             Should -Throw '*formato inválido*'
         Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 0
     }
@@ -1862,5 +1862,126 @@ Describe 'Get-HotfixTarget' {
         $def | ConvertTo-Json | Set-Content $envFile -Encoding UTF8
 
         (Get-HotfixTarget -EnvironmentFile $envFile).projectPrefix | Should -Be 'CentralCompres'
+    }
+}
+
+Describe 'Request-Publish por la cola FIFO' {
+    BeforeEach {
+        $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_q_" + [Guid]::NewGuid())
+        # El camino por defecto depende de que exista la tarea drenadora en la
+        # maquina: se fija aqui para que el test diga lo mismo en cualquier sitio.
+        Mock -ModuleName PublishToIIS Test-ScheduledTaskPresent { $true }
+    }
+
+    AfterEach {
+        Remove-Item $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'encola, despierta al drenador y devuelve su resultado' {
+        Mock -ModuleName PublishToIIS Start-PublishTask {
+            param($TaskName, $DataDir)
+            # Hace de drenador: coge el item de la cola y deja su resultado.
+            $item = Get-ChildItem (Join-Path $DataDir 'queue') -Filter '*.json' |
+                Sort-Object Name | Select-Object -First 1
+            $o = Get-Content $item.FullName -Raw | ConvertFrom-Json
+            New-Item -ItemType Directory -Path (Join-Path $DataDir 'results') -Force | Out-Null
+            "{`"status`":`"ok`",`"message`":`"publicado`",`"runId`":`"$($o.runId)`",`"branch`":`"$($o.branch)`"}" |
+                Set-Content (Join-Path $DataDir "results\$($o.runId).json") -Encoding UTF8
+        }
+
+        $r = Request-Publish -Environment 'devecoand1' -Branch 'main_deploy-20260730' -Execute `
+            -DataDir $script:dataDir -TimeoutSeconds 10 -Quiet
+        $r.status | Should -Be 'ok'
+        $r.branch | Should -Be 'main_deploy-20260730'
+        # Despierta al DRENADOR, no a la tarea elevada: quien publica es la cola.
+        Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 1 `
+            -ParameterFilter { $TaskName -eq 'Publish Queue Drainer' }
+    }
+
+    It 'no escribe la ranura unica publish-order.json' {
+        Mock -ModuleName PublishToIIS Start-PublishTask { }
+        Request-Publish -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir -NoWait | Out-Null
+        # Es la ranura que se pisaban dos sesiones publicando a la vez.
+        Test-Path (Join-Path $script:dataDir 'publish-order.json') | Should -BeFalse
+        @(Get-ChildItem (Join-Path $script:dataDir 'queue') -Filter '*.json').Count | Should -Be 1
+    }
+
+    It 'con -NoWait devuelve queued con su posicion' {
+        Mock -ModuleName PublishToIIS Start-PublishTask { }
+        $r = Request-Publish -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir -NoWait
+        $r.status | Should -Be 'queued'
+        $r.position | Should -Be 1
+    }
+
+    It 'dos ordenes seguidas se encolan en orden de llegada en vez de pisarse' {
+        Mock -ModuleName PublishToIIS Start-PublishTask { }
+        $a = Request-Publish -Environment 'devecoand1' -Branch 'rama-a' -DataDir $script:dataDir -NoWait
+        $b = Request-Publish -Environment 'devecoesp1' -Branch 'rama-b' -DataDir $script:dataDir -NoWait
+        $b.position | Should -Be 2
+        $cola = @(Get-DeployQueue -DataDir $script:dataDir)
+        $cola.Count | Should -Be 2
+        $cola[0].runId | Should -Be $a.runId
+        $cola[1].runId | Should -Be $b.runId
+    }
+
+    It 'un entorno ad hoc viaja dentro del item de la cola' {
+        Mock -ModuleName PublishToIIS Start-PublishTask { }
+        $wt = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_wt_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $wt | Out-Null
+        $envFile = Join-Path $wt '.publish-env.json'
+        '{"name":"wt-cola-test","origin":"C:\\claude-worktrees\\repo\\wt\\CentralCompres\\","destination":"C:\\inetpub\\wwwroot\\sitio","appPool":"sitio","siteUrl":"https://sitio.test"}' |
+            Set-Content $envFile -Encoding UTF8
+
+        $r = Request-Publish -EnvironmentFile $envFile -Branch 'main' -DataDir $script:dataDir -NoWait
+        $r.status | Should -Be 'queued'
+
+        $item = Get-ChildItem (Join-Path $script:dataDir 'queue') -Filter '*.json' | Select-Object -First 1
+        $o = Get-Content $item.FullName -Raw | ConvertFrom-Json
+        $o.environment | Should -Be 'wt-cola-test'
+        $o.environmentDef.destination | Should -Be 'C:\inetpub\wwwroot\sitio'
+        Remove-Item $wt -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'sin tarea drenadora cae al camino directo' {
+        Mock -ModuleName PublishToIIS Test-ScheduledTaskPresent { $false }
+        Mock -ModuleName PublishToIIS Start-PublishTask { }
+        $r = Request-Publish -Environment 'devecoand1' -Branch 'main' -DataDir $script:dataDir -NoWait
+        $r.status | Should -Be 'triggered'
+        Test-Path (Join-Path $script:dataDir 'publish-order.json') | Should -BeTrue
+    }
+}
+
+Describe 'Invoke-DeployQueueDrain con entorno ad hoc' {
+    It 'publica en directo para no encolarse a si mismo, con la definicion en un fichero' {
+        $dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_dr_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $dataDir 'queue') -Force | Out-Null
+        $runId = [Guid]::NewGuid().ToString()
+        $item = @{
+            kind = 'publish'; environment = 'wt-drenador'; branch = 'main'
+            execute = $true; overrideWebconfig = $false; runId = $runId
+            queuedAt = (Get-Date).ToString('o'); requestedBy = 'test'
+            environmentDef = @{
+                name = 'wt-drenador'; origin = 'C:\wt\CentralCompres\'
+                destination = 'C:\inetpub\wwwroot\wtsitio'; appPool = 'wtsitio'
+            }
+        }
+        [pscustomobject]$item | ConvertTo-Json -Depth 6 -Compress |
+            Set-Content (Join-Path $dataDir 'queue\000000000001-x.json') -Encoding UTF8
+
+        $script:visto = $null
+        Mock -ModuleName PublishToIIS Request-Publish {
+            param($Environment, $Branch, $EnvironmentFile, $Direct, $Execute, $OverrideWebconfig, $RequestedBy, $TaskName, $TimeoutSeconds, $Quiet)
+            $script:visto = [pscustomobject]@{
+                direct  = [bool]$Direct
+                defJson = if ($EnvironmentFile -and (Test-Path $EnvironmentFile)) { Get-Content $EnvironmentFile -Raw } else { $null }
+            }
+            [pscustomobject]@{ status = 'ok'; message = 'publicado' }
+        }
+
+        Invoke-DeployQueueDrain -DataDir $dataDir -MaxItems 1 | Should -Be 1
+        $script:visto.direct | Should -BeTrue
+        $script:visto.defJson | Should -Match 'wtsitio'
+        (Get-Content (Join-Path $dataDir "results\$runId.json") -Raw | ConvertFrom-Json).status | Should -Be 'ok'
+        Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
