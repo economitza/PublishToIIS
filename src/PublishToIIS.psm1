@@ -4,6 +4,37 @@ if (Test-Path $configPath) {
     . $configPath
 }
 
+function Grant-RuntimeFolderWrite {
+    <#
+    .SYNOPSIS
+        Crea las carpetas de ejecucion del site y les da escritura al proceso de IIS.
+    .DESCRIPTION
+        Se llama despues del swap. Sin esto, cada publicacion deja el site sin poder
+        escribir en Upload\tmp y cualquier importacion falla con «Access to the path
+        ... is denied», que es un sintoma que no apunta a la publicacion.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SitePath,
+        [string[]]$Folders = @('Upload', 'Upload\tmp')
+    )
+
+    foreach ($relativa in $Folders) {
+        $ruta = Join-Path $SitePath $relativa
+        if (-not (Test-Path $ruta)) {
+            New-Item -ItemType Directory -Path $ruta -Force | Out-Null
+        }
+    }
+
+    # IIS_IUSRS cubre a la identidad del grupo de aplicaciones sea cual sea su nombre.
+    $raiz = Join-Path $SitePath 'Upload'
+    & icacls $raiz /grant 'IIS_IUSRS:(OI)(CI)M' /T | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "No se pudo dar escritura a IIS_IUSRS en $raiz (icacls $LASTEXITCODE): las subidas de ficheros fallaran."
+    } else {
+        Write-Host "Runtime folders ready (write granted on $raiz)" -ForegroundColor Green
+    }
+}
 function Get-MSBuild {
     $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -797,6 +828,13 @@ function Publish {
 
         $swapCompleted = $true
         Write-Host "Directory swap completed" -ForegroundColor Green
+
+        # La aplicacion escribe en Upload\tmp (ficheros que sube el usuario, excels
+        # temporales). Esa carpeta es contenido de ejecucion: no viaja en la publicacion y el
+        # swap estrena carpeta, asi que se recrea vacia y hereda los permisos del padre. Si el
+        # padre no da escritura al proceso de IIS, la aplicacion crea la carpeta pero no puede
+        # escribir en ella y las importaciones mueren con «Access to the path ... is denied».
+        Grant-RuntimeFolderWrite -SitePath $Destination
     }
     catch {
         Write-Host "Publish failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -3740,4 +3778,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
