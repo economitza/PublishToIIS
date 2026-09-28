@@ -1039,6 +1039,30 @@ function Get-SiteSqlTarget {
     }
 }
 
+function Get-SiteAppPool {
+    # El app pool de verdad del site (o aplicación) que sirve $Destination, leído de IIS
+    # por su ruta física: los sites antiguos no siguen la convención de llamar al pool como
+    # el entorno. Sin IIS a mano (sin privilegios, sin el módulo) vale la convención.
+    param([Parameter(Mandatory)][string]$Destination, [string]$Fallback)
+    try {
+        Import-Module WebAdministration -ErrorAction Stop -WarningAction SilentlyContinue
+        $ruta = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+        $mismaRuta = { param($fisica) $fisica -and ([IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$fisica)).TrimEnd('\') -ieq $ruta) }
+        $site = Get-ChildItem IIS:\Sites -ErrorAction Stop | Where-Object { & $mismaRuta $_.physicalPath } | Select-Object -First 1
+        if ($site -and $site.applicationPool) { return [string]$site.applicationPool }
+        $app = Get-WebApplication -ErrorAction Stop | Where-Object { & $mismaRuta $_.PhysicalPath } | Select-Object -First 1
+        if ($app -and $app.applicationPool) { return [string]$app.applicationPool }
+    }
+    catch { }
+    $Fallback
+}
+
+function Test-IISAppPoolExists {
+    param([Parameter(Mandatory)][string]$Name)
+    try { Import-Module WebAdministration -ErrorAction Stop -WarningAction SilentlyContinue; Test-Path "IIS:\AppPools\$Name" }
+    catch { $false }
+}
+
 function Resolve-DbRefreshPlan {
     <#
     .SYNOPSIS
@@ -1124,7 +1148,7 @@ function Resolve-DbRefreshPlan {
     $target = Get-SiteSqlTarget -WebConfigPath $webConfig
     if (-not $target) { throw "$webConfig no tiene 'centralcompresConnectionString'." }
 
-    $pool = if ($Config.appPool) { [string]$Config.appPool } else { $Environment }
+    $pool = Get-SiteAppPool -Destination ([string]$Config.destination) -Fallback $(if ($Config.appPool) { [string]$Config.appPool } else { $Environment })
     $sites = @([pscustomobject]@{ environment = $Environment; appPool = $pool; siteUrl = [string]$Config.siteUrl })
     foreach ($name in ($OtherEnvironments.Keys | Sort-Object)) {
         $o = $OtherEnvironments[$name]
@@ -1135,7 +1159,8 @@ function Resolve-DbRefreshPlan {
         $t = $null
         try { $t = Get-SiteSqlTarget -WebConfigPath $wc } catch { continue }
         if ($t -and $t.key -eq $target.key) {
-            $sites += [pscustomobject]@{ environment = $name; appPool = $(if ($o.appPool) { [string]$o.appPool } else { $name }); siteUrl = [string]$o.siteUrl }
+            $poolDe = Get-SiteAppPool -Destination ([string]$o.destination) -Fallback $(if ($o.appPool) { [string]$o.appPool } else { $name })
+            $sites += [pscustomobject]@{ environment = $name; appPool = $poolDe; siteUrl = [string]$o.siteUrl }
         }
     }
 
@@ -1149,6 +1174,9 @@ function Resolve-DbRefreshPlan {
         database           = $target.database
         testEmail          = $TestEmail
         tables             = $Tables
+        # BD de la réplica que se copia cuando el nombre del destino no la deja deducir
+        # (devecoand1_20260706): campo sourceDatabase del entorno.
+        sourceDatabase     = $(if ($Config.sourceDatabase -and [string]$Config.sourceDatabase -match '^[A-Za-z0-9_]+$') { [string]$Config.sourceDatabase } else { '' })
         sites              = $sites
     }
 }
@@ -1211,6 +1239,7 @@ function Invoke-DbRefreshOrder {
     $plan | Add-Member -NotePropertyName toolsCommit -NotePropertyValue $copia.commit
 
     $scriptArgs = @('-TestEmail', $plan.testEmail, '-ConnectionsConfig', $plan.webConfig, '-ReplicaCredentials', $plan.replicaCredentials)
+    if ($plan.sourceDatabase) { $scriptArgs += @('-SourceDatabase', $plan.sourceDatabase) }
     if ($plan.tables) { $scriptArgs += @('-Tables', ($plan.tables -join ',')) }
     if ($Execute) { $scriptArgs += '-Execute' }
 
@@ -1225,6 +1254,12 @@ function Invoke-DbRefreshOrder {
             [void](Enter-DbRefreshLock -Key $target.key -RunId $RunId -Database $plan.database -DataDir $DataDir)
             $locked = $true
             foreach ($s in $plan.sites) {
+                # Un site que comparte la BD pero cuyo pool no está en este IIS no puede
+                # abortar el refresco de los demás: se avisa y se sigue.
+                if (-not (Test-IISAppPoolExists -Name $s.appPool)) {
+                    Write-Warning "El site $($s.environment) comparte la BD pero su app pool '$($s.appPool)' no existe en este IIS: no se para."
+                    continue
+                }
                 Write-Host "Parando el app pool '$($s.appPool)'..." -ForegroundColor Yellow
                 Stop-IISAppPool -Name $s.appPool
                 $stopped += $s

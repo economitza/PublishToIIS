@@ -1231,6 +1231,9 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
             }
             $dir
         }
+        # Sin IIS de verdad: el pool es el de la convención y todos existen, salvo que el test diga otra cosa
+        Mock -ModuleName PublishToIIS Get-SiteAppPool { $Fallback }
+        Mock -ModuleName PublishToIIS Test-IISAppPoolExists { $true }
         $script:esp1 = New-TestSite 'esp1' 'Data Source=localhost;Initial Catalog=CCEspana;Integrated Security=True' -ConfigSource
         $script:esp3 = New-TestSite 'esp3' "Data Source=$env:COMPUTERNAME;Initial Catalog=ccespana;Integrated Security=True"
         $script:esp2 = New-TestSite 'esp2' 'Data Source=localhost;Initial Catalog=CCEspana_esp2;Integrated Security=True'
@@ -1334,6 +1337,35 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
             $salida = (& powershell.exe -NoProfile -NonInteractive -Command $cmd 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
             $salida | Should -Match 'linea final'
             $salida | Should -Match 'CODIGO=3'
+        }
+
+        It 'el origen declarado en el entorno (sourceDatabase) llega al script como -SourceDatabase' {
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
+            Mock -ModuleName PublishToIIS New-DbRefreshSnapshot {
+                [pscustomobject]@{ root = $Destination; script = 'C:\\copia\\tools\\db-refresh\\Sync-TestDatabase.ps1'; commit = 'abc123' }
+            }
+            $cfg = $script:cfg | Select-Object *; $cfg | Add-Member sourceDatabase 'CCAndorra'
+            (Invoke-DbRefreshOrder -Environment devecoand1 -TestEmail 'it@economitza.com' -Config $cfg -OtherEnvironments @{} -DataDir $script:dataDir 6>$null).sourceDatabase |
+                Should -Be 'CCAndorra'
+            Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 1 -ParameterFilter { ($Arguments -join ' ') -like '*-SourceDatabase CCAndorra*' }
+        }
+
+        It 'un site de la BD cuyo pool no está en el IIS se salta con aviso y no aborta el refresco' {
+            Mock -ModuleName PublishToIIS Test-ProcessElevated { $true }
+            Mock -ModuleName PublishToIIS Test-IISAppPoolExists { $Name -ne 'pool3' }
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
+            Mock -ModuleName PublishToIIS Stop-IISAppPool { }
+            Mock -ModuleName PublishToIIS Start-IISAppPool { }
+            Mock -ModuleName PublishToIIS Invoke-SiteWarmup { }
+            Mock -ModuleName PublishToIIS New-DbRefreshSnapshot {
+                [pscustomobject]@{ root = $Destination; script = 'C:\copia\tools\db-refresh\Sync-TestDatabase.ps1'; commit = 'abc123' }
+            }
+            Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute `
+                -Config $script:cfg -OtherEnvironments $script:otros -DataDir $script:dataDir -WarningVariable avisos -WarningAction SilentlyContinue 6>$null | Out-Null
+            Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 1
+            Should -Invoke -ModuleName PublishToIIS Stop-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'devecoesp1' }
+            Should -Invoke -ModuleName PublishToIIS Stop-IISAppPool -Times 0 -ParameterFilter { $Name -eq 'pool3' }
+            ($avisos -join ' ') | Should -Match 'pool3'
         }
 
         It 'con -Execute y sin elevación no toca nada' {
