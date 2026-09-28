@@ -1112,6 +1112,17 @@ Describe 'Órdenes de actualización del módulo (kind=update)' {
             { Add-DeployQueueItem -Environment 'devecoesp1' -DataDir $script:dataDir } | Should -Throw "*'environment' y 'branch'*"
         }
 
+        It 'al arrancar el listener se despierta al drenador solo si hay órdenes varadas en la cola' {
+            Mock -ModuleName PublishToIIS Start-PublishTask { }
+            InModuleScope PublishToIIS -Parameters @{ d = $script:dataDir } {
+                param($d)
+                Resume-StrandedQueue -DataDir $d | Should -BeFalse
+                Add-DeployQueueItem -Kind update -DataDir $d | Out-Null
+                Resume-StrandedQueue -DataDir $d | Should -BeTrue
+            }
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 1 -ParameterFilter { $TaskName -eq 'Publish Queue Drainer' }
+        }
+
         It 'Drain ejecuta la actualización con Request-ModuleUpdate y las publicaciones con Request-Publish, en orden de llegada' {
             Mock -ModuleName PublishToIIS Request-Publish { [pscustomobject]@{ status = 'ok'; message = 'pub' } }
             Mock -ModuleName PublishToIIS Request-ModuleUpdate { [pscustomobject]@{ status = 'ok'; message = 'upd' } }

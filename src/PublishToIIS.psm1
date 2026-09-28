@@ -2682,6 +2682,23 @@ function Invoke-DeployEndpointRequest {
     [pscustomobject]@{ status = 404; body = @{ error = "Ruta desconocida: $Method $Path" } }
 }
 
+function Resume-StrandedQueue {
+    # El drenador solo se dispara con cada 202. Una orden encolada mientras el
+    # listener se reiniciaba (típicamente, justo tras un /api/update) se quedaría
+    # varada hasta la siguiente orden: al arrancar el listener se despierta al
+    # drenador si hay cola. Devuelve si lo ha disparado.
+    param([Parameter(Mandatory)][string]$DataDir, [string]$DrainerTaskName = 'Publish Queue Drainer', [string]$AuditPath)
+    if (-not @(Get-DeployQueue -DataDir $DataDir).Count) { return $false }
+    try { Start-PublishTask -TaskName $DrainerTaskName -DataDir $DataDir; return $true }
+    catch {
+        if ($AuditPath) {
+            "$((Get-Date).ToString('s')) | - | no se pudo disparar el drenador al arrancar: $($_.Exception.Message)" |
+                Add-Content $AuditPath -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
+        return $false
+    }
+}
+
 function Start-DeployEndpoint {
     <#
     .SYNOPSIS
@@ -2716,6 +2733,8 @@ function Start-DeployEndpoint {
     $listener.Prefixes.Add($prefix)
     $listener.Start()
     Write-Host "Endpoint de despliegue escuchando en $prefix (tarea destino: '$TaskName')" -ForegroundColor Green
+
+    Resume-StrandedQueue -DataDir $dir -DrainerTaskName $DrainerTaskName -AuditPath $auditPath
 
     try {
         while ($listener.IsListening) {
