@@ -1242,9 +1242,13 @@ function Invoke-DbRefreshScript {
     # Lanza el script de refresco en un powershell.exe hijo: su `exit 1` no debe
     # tumbar la tarea, y su salida tiene que acabar en el transcript de la orden
     # (la de un proceso nativo no entra en Start-Transcript si no se reescribe).
+    # En 5.1, 2>&1 convierte cada línea de stderr del hijo en un ErrorRecord y,
+    # con ErrorActionPreference=Stop, el primero lanza: se perdería el resto de
+    # la salida y el código de salida, que es lo que decide el resultado.
     param([Parameter(Mandatory)][string]$Script, [string[]]$Arguments)
+    $ErrorActionPreference = 'Continue'
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1 |
-        ForEach-Object { Write-Host $_ }
+        ForEach-Object { Write-Host ([string]$_) }
     $LASTEXITCODE
 }
 

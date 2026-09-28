@@ -1280,6 +1280,22 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
             Should -Invoke -ModuleName PublishToIIS Start-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'pool3' }
         }
 
+        It 'el script hijo que escribe en stderr y sale con error no corta la salida ni pierde el código (Windows PowerShell 5.1)' {
+            $hijo = Join-Path $script:root 'hijo.ps1'
+            Set-Content $hijo -Encoding UTF8 -Value @(
+                '[Console]::Error.WriteLine("primera linea de error")'
+                'Write-Output "linea final"'
+                'exit 3'
+            )
+            $psd1 = Join-Path $PSScriptRoot '..\PublishToIIS.psd1'
+            # Es el intérprete de la tarea Publish Local: en pwsh 7 el stderr nativo ya no lanza.
+            $cmd = "`$env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath','Machine'); Import-Module '$psd1'; " +
+                   "`$ErrorActionPreference = 'Stop'; `$c = & (Get-Module PublishToIIS) { Invoke-DbRefreshScript -Script '$hijo' }; 'CODIGO=' + `$c"
+            $salida = (& powershell.exe -NoProfile -NonInteractive -Command $cmd 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+            $salida | Should -Match 'linea final'
+            $salida | Should -Match 'CODIGO=3'
+        }
+
         It 'con -Execute y sin elevación no toca nada' {
             Mock -ModuleName PublishToIIS Test-ProcessElevated { $false }
             Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
