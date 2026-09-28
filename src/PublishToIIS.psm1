@@ -2398,6 +2398,19 @@ function Get-DeployResult {
     $null
 }
 
+function Wait-ScheduledTaskIdle {
+    # Espera a que una tarea programada no esté en marcha. Sin tarea (máquina de
+    # desarrollo, tests) no hay nada que esperar.
+    param([Parameter(Mandatory)][string]$TaskName, [int]$TimeoutSeconds = 300)
+    $limite = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $limite) {
+        $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $t -or $t.State -ne 'Running') { return }
+        Start-Sleep -Seconds 1
+    }
+    throw "La tarea '$TaskName' sigue en marcha tras $TimeoutSeconds s: no se le puede pasar otra orden."
+}
+
 function Invoke-DeployQueueDrain {
     <#
     .SYNOPSIS
@@ -2441,6 +2454,11 @@ function Invoke-DeployQueueDrain {
             Move-Item $next.FullName "$($next.FullName).bad" -Force -ErrorAction SilentlyContinue
             continue
         }
+
+        # La tarea deja su resultado ANTES de terminar (tras un update aún reinicia
+        # el listener): si se la dispara en ese hueco, schtasks la ignora por estar
+        # en marcha, la orden nunca se consume y aquí se espera hasta el timeout.
+        Wait-ScheduledTaskIdle -TaskName $TaskName
 
         $resultFile = Join-Path $rdir ($order.runId + '.json')
         $requestedBy = [string]$order.requestedBy

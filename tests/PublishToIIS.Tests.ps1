@@ -1112,6 +1112,21 @@ Describe 'Órdenes de actualización del módulo (kind=update)' {
             { Add-DeployQueueItem -Environment 'devecoesp1' -DataDir $script:dataDir } | Should -Throw "*'environment' y 'branch'*"
         }
 
+        It 'el drenador no pasa la siguiente orden a Publish Local mientras la tarea sigue en marcha' {
+            $script:estados = [Collections.Generic.Queue[string]]::new([string[]]@('Running', 'Running', 'Ready'))
+            Mock -ModuleName PublishToIIS Get-ScheduledTask { [pscustomobject]@{ State = $script:estados.Dequeue() } }
+            Mock -ModuleName PublishToIIS Start-Sleep { }
+            Mock -ModuleName PublishToIIS Request-ModuleUpdate {
+                # la orden solo se despacha con la tarea ya libre
+                $script:estados.Count | Should -Be 0
+                [pscustomobject]@{ status = 'ok'; message = 'upd' }
+            }
+            Add-DeployQueueItem -Kind update -DataDir $script:dataDir | Out-Null
+            Invoke-DeployQueueDrain -DataDir $script:dataDir | Should -Be 1
+            Should -Invoke -ModuleName PublishToIIS Get-ScheduledTask -Times 3 -ParameterFilter { $TaskName -eq 'Publish Local' }
+            Should -Invoke -ModuleName PublishToIIS Request-ModuleUpdate -Times 1
+        }
+
         It 'al arrancar el listener se despierta al drenador solo si hay órdenes varadas en la cola' {
             Mock -ModuleName PublishToIIS Start-PublishTask { }
             InModuleScope PublishToIIS -Parameters @{ d = $script:dataDir } {
