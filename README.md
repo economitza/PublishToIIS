@@ -161,9 +161,32 @@ Lo que resuelve el publicador (`Resolve-DbRefreshPlan`):
   `Web.config` apunte a la misma BD, porque el refresco trunca tablas por debajo
   de todos ellos. Se vuelven a arrancar aunque el refresco falle, y se calientan.
 
-La orden va por la misma cola FIFO que las publicaciones (`kind=dbrefresh`,
-`POST /api/dbrefresh`), así que nunca coincide con un publish en el mismo
-servidor. Solo entornos de la lista blanca (nunca `prod`/`staging` ni ad hoc) y,
+**Dos carriles.** El refresco tiene su propia cola (`dbqueue\`), su drenador
+(«Publish DbRefresh Drainer») y su tarea elevada («Publish DbRefresh», con dos horas
+de límite): un refresco no frena ningún deploy, y los refrescos van de uno en uno
+entre ellos. **El dry-run no pasa por ninguna cola**: no para pools ni escribe en la
+BD, así que se ejecuta al momento (en remoto, en un proceso aparte que lanza el
+endpoint; su log en `/api/log?runId=...`). `Install.ps1` registra esas dos tareas
+con la misma identidad que sus parejas del carril de publicación, así que llegan con
+cualquier `Update-PublishToIIS`; mientras no existan, los refrescos siguen yendo por
+la cola de las publicaciones. `Get-DeployQueue` enseña los dos carriles y
+`/api/log?lane=dbrefresh` el transcript del refresco.
+
+Lo que coordina los dos carriles:
+
+- **Candado por BD** (`%ProgramData%\PublishToIIS\dbrefresh-locks\`, vigente mientras
+  viva el PID del refresco): no entran dos refrescos de la misma BD, y una publicación
+  de un site cuya BD se está refrescando hace el swap pero **deja el pool parado**; lo
+  arranca el refresco al terminar, que quita el candado antes de arrancar los pools.
+- **Copia fija de las herramientas**: el refresco no ejecuta el checkout compartido
+  (una publicación puede cambiarlo de rama a mitad), sino `tools\db-refresh` y los
+  `.sql` de su `config.json` extraídos del commit de HEAD con `git archive`. Si ese
+  commit no trae la sanitización, no hay refresco.
+- **Fallar rápido**: si la tarea no recoge la orden en un minuto (schtasks ignora el
+  disparo de una tarea que aún está en marcha), se vuelve a disparar una vez y, si
+  tampoco, la orden termina en error en vez de esperar al timeout.
+
+Solo entornos de la lista blanca (nunca `prod`/`staging` ni ad hoc) y,
 además, las guardas del script: servidor de destino en `allowedTargetServers` y
 jamás la propia réplica. `-TestEmail` es obligatorio salvo que el entorno
 declare `testEmail` en `environments.json`.

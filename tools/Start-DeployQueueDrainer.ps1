@@ -7,15 +7,19 @@
 # caiga justo al terminar. Corre SIN privilegios.
 [CmdletBinding()]
 param(
-    [string]$TaskName = 'Publish Local'
+    # Sin indicar, la tarea elevada del carril.
+    [string]$TaskName,
+    [ValidateSet('publish', 'dbrefresh')][string]$Lane = 'publish'
 )
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot '..\PublishToIIS.psd1') -Force
-$auditPath = Join-Path (Join-Path $env:ProgramData 'PublishToIIS') 'drainer.log'
+$auditPath = Join-Path (Join-Path $env:ProgramData 'PublishToIIS') $(if ($Lane -eq 'dbrefresh') { 'drainer-dbrefresh.log' } else { 'drainer.log' })
+$drainArgs = @{ Lane = $Lane }
+if ($TaskName) { $drainArgs.TaskName = $TaskName }
 
 try {
-    $n = Invoke-DeployQueueDrain -TaskName $TaskName
+    $n = Invoke-DeployQueueDrain @drainArgs
     if ($n -gt 0) {
         "$((Get-Date).ToString('s')) | drenadas $n orden(es)" |
             Add-Content $auditPath -Encoding UTF8 -ErrorAction SilentlyContinue

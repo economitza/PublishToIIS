@@ -13,14 +13,18 @@
 [CmdletBinding()]
 param(
     # Tarea del listener HTTP a reiniciar tras una actualización del módulo.
-    [string]$EndpointTaskName = 'Publish Endpoint'
+    [string]$EndpointTaskName = 'Publish Endpoint',
+    # 'publish' (tarea Publish Local, publish-order.*) o 'dbrefresh' (tarea
+    # Publish DbRefresh, dbrefresh-order.*, solo órdenes de refresco).
+    [ValidateSet('publish', 'dbrefresh')][string]$Lane = 'publish'
 )
 $ErrorActionPreference = 'Stop'
 
 $dataDir = Join-Path $env:ProgramData 'PublishToIIS'
-$orderPath = Join-Path $dataDir 'publish-order.json'
-$logPath = Join-Path $dataDir 'publish-order.log'
-$resultPath = Join-Path $dataDir 'publish-order.result.json'
+$slot = if ($Lane -eq 'dbrefresh') { 'dbrefresh-order' } else { 'publish-order' }
+$orderPath = Join-Path $dataDir "$slot.json"
+$logPath = Join-Path $dataDir "$slot.log"
+$resultPath = Join-Path $dataDir "$slot.result.json"
 
 $startedAt = Get-Date
 $order = $null
@@ -58,6 +62,9 @@ try {
 
     $order = Read-PublishOrder -Path $orderPath
     Move-Item -Path $orderPath -Destination "$orderPath.consumed" -Force
+    if ($Lane -eq 'dbrefresh' -and $order.kind -ne 'dbrefresh') {
+        throw "La tarea de refresco solo ejecuta órdenes dbrefresh (llegó '$($order.kind)')."
+    }
 
     if ($order.kind -eq 'update') {
         # Actualización del propio módulo. La cola FIFO del endpoint garantiza que
@@ -73,7 +80,7 @@ try {
     }
     elseif ($order.kind -eq 'dbrefresh') {
         $plan = Invoke-DbRefreshOrder -Environment $order.environment -TestEmail $order.testEmail `
-            -Tables $order.tables -Execute:([bool]$order.execute) -RequestedBy $order.requestedBy
+            -Tables $order.tables -Execute:([bool]$order.execute) -RequestedBy $order.requestedBy -RunId $order.runId
         $sitios = ($plan.sites | ForEach-Object { $_.environment }) -join ', '
         Write-Host 'RESULT: OK'
         $done = if ($order.execute) { "BD $($plan.database) de $($order.environment) refrescada y sanitizada (correo a $($plan.testEmail)) en $($plan.elapsed); sites parados durante el refresco: $sitios." }

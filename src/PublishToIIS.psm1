@@ -857,7 +857,7 @@ function Publish {
     finally {
         if ($poolStopped) {
             Write-Host "Starting app pool '$AppPoolName'..." -ForegroundColor Yellow
-            Start-IISAppPool -Name $AppPoolName
+            [void](Start-SitePoolUnlessRefreshing -Destination $Destination -AppPoolName $AppPoolName)
         }
 
         if ($swapCompleted -and -not $KeepPrevious) {
@@ -1182,7 +1182,8 @@ function Invoke-DbRefreshOrder {
         [psobject]$Config,
         [hashtable]$OtherEnvironments,
         [string]$DataDir,
-        [switch]$SkipWarmup
+        [switch]$SkipWarmup,
+        [string]$RunId = [Guid]::NewGuid().ToString()
     )
     $ErrorActionPreference = 'Stop'
 
@@ -1199,25 +1200,45 @@ function Invoke-DbRefreshOrder {
     Write-Host ("Sites que comparten la BD (se paran con -Execute): {0}" -f (($plan.sites | ForEach-Object { "$($_.environment) [$($_.appPool)]" }) -join ', '))
     if ($plan.tables) { Write-Host ("Tablas:   {0}" -f ($plan.tables -join ', ')) }
 
+    if ($Execute -and -not (Test-ProcessElevated)) {
+        throw 'El refresco con -Execute para app pools de IIS y requiere un proceso elevado (la tarea Publish DbRefresh o Publish Local).'
+    }
+
+    # Las herramientas se ejecutan desde una copia fija del commit del checkout: una
+    # publicación que cambie de rama a mitad no puede cambiarle la sanitización.
+    $copia = New-DbRefreshSnapshot -Repo $plan.repo -Destination (Join-Path ([IO.Path]::GetTempPath()) "p2iis-dbrefresh-$RunId")
+    Write-Host ("Herramientas: copia del commit {0} en {1}" -f $copia.commit, $copia.root)
+    $plan | Add-Member -NotePropertyName toolsCommit -NotePropertyValue $copia.commit
+
     $scriptArgs = @('-TestEmail', $plan.testEmail, '-ConnectionsConfig', $plan.webConfig, '-ReplicaCredentials', $plan.replicaCredentials)
     if ($plan.tables) { $scriptArgs += @('-Tables', ($plan.tables -join ',')) }
     if ($Execute) { $scriptArgs += '-Execute' }
 
+    $target = Get-SiteSqlTarget -WebConfigPath $plan.webConfig
     $stopped = @()
-    if ($Execute) {
-        if (-not (Test-ProcessElevated)) { throw 'El refresco con -Execute para app pools de IIS y requiere un proceso elevado (la tarea Publish Local).' }
-        foreach ($s in $plan.sites) {
-            Write-Host "Parando el app pool '$($s.appPool)'..." -ForegroundColor Yellow
-            Stop-IISAppPool -Name $s.appPool
-            $stopped += $s
-        }
-    }
+    $locked = $false
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $exit = Invoke-DbRefreshScript -Script $plan.script -Arguments $scriptArgs
-        if ($exit -ne 0) { throw "Sync-TestDatabase.ps1 terminó con código $exit (detalle en su refresh.log, junto al script)." }
+        if ($Execute) {
+            # El candado va antes de parar nada: con él puesto, una publicación de
+            # cualquiera de estos sites deja su pool parado en vez de arrancarlo.
+            [void](Enter-DbRefreshLock -Key $target.key -RunId $RunId -Database $plan.database -DataDir $DataDir)
+            $locked = $true
+            foreach ($s in $plan.sites) {
+                Write-Host "Parando el app pool '$($s.appPool)'..." -ForegroundColor Yellow
+                Stop-IISAppPool -Name $s.appPool
+                $stopped += $s
+            }
+        }
+        $exit = Invoke-DbRefreshScript -Script $copia.script -Arguments $scriptArgs
+        if ($exit -ne 0) { throw "Sync-TestDatabase.ps1 terminó con código $exit (detalle en el log de la orden)." }
     }
     finally {
+        # Primero se quita el candado y después se arrancan los pools: una
+        # publicación que llegue entre medias arranca el suyo, y una anterior que lo
+        # dejó parado lo encuentra arrancado aquí. Al revés, quedaría parado.
+        if ($locked) { Exit-DbRefreshLock -Key $target.key -DataDir $DataDir }
+        Remove-Item $copia.root -Recurse -Force -ErrorAction SilentlyContinue
         foreach ($s in $stopped) {
             try { Write-Host "Arrancando el app pool '$($s.appPool)'..." -ForegroundColor Yellow; Start-IISAppPool -Name $s.appPool }
             catch { Write-Warning "No se pudo arrancar '$($s.appPool)': $($_.Exception.Message)" }
@@ -1252,6 +1273,236 @@ function Invoke-DbRefreshScript {
     $LASTEXITCODE
 }
 
+# Dos carriles, cada uno con su cola, su drenador, su tarea elevada y su ranura de
+# orden: las publicaciones van de una en una entre ellas y los refrescos de BD
+# también, pero un refresco (que copia la BD entera) no frena ningún deploy.
+$script:Lanes = @{
+    publish   = [pscustomobject]@{ task = 'Publish Local'; drainer = 'Publish Queue Drainer'; queue = 'queue'; slot = 'publish-order' }
+    dbrefresh = [pscustomobject]@{ task = 'Publish DbRefresh'; drainer = 'Publish DbRefresh Drainer'; queue = 'dbqueue'; slot = 'dbrefresh-order' }
+}
+
+function Get-Lane {
+    # Tareas y ficheros de un carril.
+    param([ValidateSet('publish', 'dbrefresh')][string]$Lane = 'publish', [string]$DataDir)
+    $l = $script:Lanes[$Lane]
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    [pscustomobject]@{
+        name    = $Lane
+        task    = $l.task
+        drainer = $l.drainer
+        dir     = $dir
+        queue   = Join-Path $dir $l.queue
+        order   = Join-Path $dir "$($l.slot).json"
+        result  = Join-Path $dir "$($l.slot).result.json"
+        log     = Join-Path $dir "$($l.slot).log"
+    }
+}
+
+function Get-DbRefreshLane {
+    # Un refresco va a su carril si la máquina tiene sus dos tareas; si no (aún sin
+    # registrar), al de las publicaciones, que es como funcionaba hasta la 0.8.
+    $l = $script:Lanes['dbrefresh']
+    if ((Test-ScheduledTaskPresent -TaskName $l.task) -and (Test-ScheduledTaskPresent -TaskName $l.drainer)) { 'dbrefresh' } else { 'publish' }
+}
+
+function Get-DbRefreshLockPath {
+    param([Parameter(Mandatory)][string]$Key, [string]$DataDir)
+    $nombre = ($Key -replace '[^A-Za-z0-9_.-]', '_') + '.json'
+    Join-Path (Join-Path (Get-PublishDataDir -DataDir $DataDir) 'dbrefresh-locks') $nombre
+}
+
+function Get-DbRefreshLock {
+    <#
+    .SYNOPSIS
+        El candado de refresco de una BD, si está puesto y vivo.
+
+    .DESCRIPTION
+        Mismo criterio que los candados de worktree: lo que da vigencia al candado es
+        el PID del proceso que refresca. Si ya no corre (refresco muerto a medias,
+        reinicio del servidor), el candado está libre.
+    #>
+    param([Parameter(Mandatory)][string]$Key, [string]$DataDir)
+    $p = Get-DbRefreshLockPath -Key $Key -DataDir $DataDir
+    if (-not (Test-Path $p)) { return $null }
+    try { $l = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (-not $l.pid -or -not (Get-Process -Id ([int]$l.pid) -ErrorAction SilentlyContinue)) { return $null }
+    $l
+}
+
+function Enter-DbRefreshLock {
+    # Pone el candado de refresco de una BD: dos refrescos de la misma BD a la vez se
+    # truncarían tablas el uno al otro.
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [string]$RunId,
+        [string]$Database,
+        [string]$DataDir
+    )
+    $vivo = Get-DbRefreshLock -Key $Key -DataDir $DataDir
+    if ($vivo) {
+        throw "La BD $($vivo.database) ya se está refrescando (runId $($vivo.runId), desde $($vivo.startedAt)): no se lanza otro refresco encima."
+    }
+    $p = Get-DbRefreshLockPath -Key $Key -DataDir $DataDir
+    New-Item -ItemType Directory -Path (Split-Path $p -Parent) -Force | Out-Null
+    [pscustomobject]@{
+        key = $Key; database = $Database; runId = $RunId; pid = $PID
+        startedAt = (Get-Date).ToString('o')
+    } | ConvertTo-Json -Compress | Set-Content $p -Encoding UTF8
+    $p
+}
+
+function Exit-DbRefreshLock {
+    param([Parameter(Mandatory)][string]$Key, [string]$DataDir)
+    Remove-Item (Get-DbRefreshLockPath -Key $Key -DataDir $DataDir) -Force -ErrorAction SilentlyContinue
+}
+
+function Get-SiteDbRefreshLock {
+    # ¿Se está refrescando ahora la BD de este site? Cualquier fallo leyendo su
+    # Web.config cuenta como «no»: esto no puede tumbar una publicación.
+    param([Parameter(Mandatory)][string]$Destination, [string]$DataDir)
+    try {
+        $t = Get-SiteSqlTarget -WebConfigPath (Join-Path $Destination 'Web.config')
+        if ($t) { return Get-DbRefreshLock -Key $t.key -DataDir $DataDir }
+    }
+    catch { }
+    $null
+}
+
+function Start-SitePoolUnlessRefreshing {
+    <#
+    .SYNOPSIS
+        Arranca el app pool de un site tras publicar, salvo que su BD se esté refrescando.
+
+    .DESCRIPTION
+        Un refresco para los pools de todos los sites de su BD y los arranca al
+        terminar. Si en medio se publica uno de ellos, arrancar su pool al acabar el
+        swap pondría la aplicación contra una BD a medio cargar, y su scheduler
+        escribiría durante la copia. El pool se queda parado y lo arranca el refresco.
+    #>
+    param([Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string]$AppPoolName, [string]$DataDir)
+    $refresco = Get-SiteDbRefreshLock -Destination $Destination -DataDir $DataDir
+    if ($refresco) {
+        Write-Host ("La BD {0} se está refrescando (runId {1}): el app pool '{2}' se queda parado y lo arranca el refresco al terminar." -f $refresco.database, $refresco.runId, $AppPoolName) -ForegroundColor Yellow
+        return $false
+    }
+    Start-IISAppPool -Name $AppPoolName
+    $true
+}
+
+function New-DbRefreshSnapshot {
+    <#
+    .SYNOPSIS
+        Copia fija de las herramientas de refresco, sacada del commit del checkout.
+
+    .DESCRIPTION
+        El checkout del servidor lo comparten todas las publicaciones y cada una hace
+        `git checkout -B <rama>`. Si una cambia de rama a mitad de un refresco, el
+        script leería otra versión de su configuración o de la sanitización, o no la
+        encontraría: el peor desenlace es una BD de test con los correos reales. Se
+        fija el commit de HEAD y se extraen de él tools\db-refresh y los .sql que
+        declara su config.json; lo que no está en git (credenciales de la réplica,
+        contraseña de test) se copia del árbol. Si el commit no trae la
+        sanitización, no hay copia y no hay refresco.
+    #>
+    param([Parameter(Mandatory)][string]$Repo, [Parameter(Mandatory)][string]$Destination)
+    # En 5.1 el stderr de git con Stop lanzaría antes de poder leer $LASTEXITCODE.
+    $ErrorActionPreference = 'Continue'
+
+    $sha = ((& git -C $Repo rev-parse HEAD 2>$null) | Out-String).Trim()
+    if ($LASTEXITCODE -or -not $sha) { throw "No se pudo leer el commit de $Repo (¿es un checkout git?)." }
+    $cfgText = (& git -C $Repo show "${sha}:tools/db-refresh/config.json" 2>$null) | Out-String
+    if ($LASTEXITCODE -or -not $cfgText.Trim()) { throw "El commit $sha no tiene tools/db-refresh/config.json." }
+    $cfg = $cfgText | ConvertFrom-Json
+
+    $rutas = @('tools/db-refresh') + @(@($cfg.sanitizeSqlFile, $cfg.alignSqlFile) | Where-Object { $_ })
+    if (Test-Path $Destination) { Remove-Item $Destination -Recurse -Force }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $zip = Join-Path $Destination 'snapshot.zip'
+    $salida = (& git -C $Repo archive --format=zip -o $zip $sha @rutas 2>&1) | Out-String
+    if ($LASTEXITCODE) {
+        throw "git archive falló en $sha ($($salida.Trim())): falta alguno de $($rutas -join ', '). Sin la sanitización no se refresca."
+    }
+    Expand-Archive -Path $zip -DestinationPath $Destination -Force
+    Remove-Item $zip -Force
+
+    foreach ($rel in @('tools/db-refresh/replica.connection.json', $cfg.testPasswordEnvFile) | Where-Object { $_ }) {
+        $origen = Join-Path $Repo $rel
+        if (-not (Test-Path $origen)) { continue }
+        $destino = Join-Path $Destination $rel
+        New-Item -ItemType Directory -Path (Split-Path $destino -Parent) -Force | Out-Null
+        Copy-Item $origen $destino -Force
+    }
+    [pscustomobject]@{
+        root   = $Destination
+        script = Join-Path $Destination 'tools\db-refresh\Sync-TestDatabase.ps1'
+        commit = $sha
+    }
+}
+
+function Test-OrderPending {
+    # ¿Sigue la orden $RunId en la ranura sin que la tarea la haya recogido? La tarea
+    # la renombra a .consumed nada más arrancar.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$RunId)
+    if (-not (Test-Path $Path)) { return $false }
+    try { return ((Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json).runId -eq $RunId) } catch { return $false }
+}
+
+function Get-DbRefreshDryRunLogPath {
+    param([Parameter(Mandatory)][string]$RunId, [string]$DataDir)
+    Join-Path (Join-Path (Get-PublishDataDir -DataDir $DataDir) 'logs') "dbrefresh-$RunId.log"
+}
+
+function Start-DbRefreshDryRunProcess {
+    # Proceso oculto que ejecuta el dry-run (tools\Invoke-DbRefreshDryRun.ps1). Aparte
+    # para poder sustituirlo en los tests.
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $script = Join-Path $PSScriptRoot '..\tools\Invoke-DbRefreshDryRun.ps1'
+    $todos = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"") + $Arguments
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $todos -WindowStyle Hidden | Out-Null
+}
+
+function Start-DbRefreshDryRun {
+    <#
+    .SYNOPSIS
+        Lanza al momento, fuera de toda cola, el dry-run de un refresco de BD.
+
+    .DESCRIPTION
+        Un dry-run no para pools, no toca la BD ni necesita privilegios: no tiene por
+        qué esperar detrás de un deploy ni de otro refresco. Se valida como cualquier
+        orden, se marca como en marcha en results\<runId>.json y se ejecuta en un
+        proceso oculto, que deja allí su resultado y su transcript en
+        logs\dbrefresh-<runId>.log.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [string]$RequestedBy,
+        [string[]]$AllowedEnvironments,
+        [string]$DataDir,
+        [string]$RunId = [Guid]::NewGuid().ToString()
+    )
+    $ErrorActionPreference = 'Stop'
+    $orden = New-DbRefreshOrderBody -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+        -AllowedEnvironments $AllowedEnvironments -RunId $RunId -RequestedBy $RequestedBy
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    $rdir = Join-Path $dir 'results'
+    if (-not (Test-Path $rdir)) { New-Item -ItemType Directory -Path $rdir -Force | Out-Null }
+    [pscustomobject]@{
+        status = 'running'; runId = $RunId; kind = 'dbrefresh'; lane = 'dryrun'
+        environment = $Environment; branch = ''; requestedBy = $orden.requestedBy; execute = $false
+        startedAt = (Get-Date).ToString('o')
+    } | ConvertTo-Json | Set-Content (Join-Path $rdir "$RunId.json") -Encoding UTF8
+
+    $argumentos = @('-RunId', $RunId, '-Environment', $Environment, '-DataDir', "`"$dir`"")
+    if ($orden.testEmail) { $argumentos += @('-TestEmail', $orden.testEmail) }
+    if ($orden.tables) { $argumentos += @('-Tables', ($orden.tables -join ',')) }
+    if ($orden.requestedBy) { $argumentos += @('-RequestedBy', "`"$($orden.requestedBy)`"") }
+    Start-DbRefreshDryRunProcess -Arguments $argumentos
+    [pscustomobject]@{ runId = $RunId; lane = 'dryrun'; logPath = Get-DbRefreshDryRunLogPath -RunId $RunId -DataDir $dir }
+}
+
 function Write-DbRefreshOrder {
     <#
     .SYNOPSIS
@@ -1270,16 +1521,17 @@ function Write-DbRefreshOrder {
         [string[]]$AllowedEnvironments,
         [string]$DataDir,
         [string]$RunId = [Guid]::NewGuid().ToString(),
-        [string]$RequestedBy
+        [string]$RequestedBy,
+        [ValidateSet('publish', 'dbrefresh')][string]$Lane = 'dbrefresh'
     )
     $ErrorActionPreference = 'Stop'
     $orden = New-DbRefreshOrderBody -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
         -Execute:$Execute -AllowedEnvironments $AllowedEnvironments -RunId $RunId -RequestedBy $RequestedBy
 
-    $dir = Get-PublishDataDir -DataDir $DataDir
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Remove-Item (Join-Path $dir 'publish-order.result.json') -Force -ErrorAction SilentlyContinue
-    $orderPath = Join-Path $dir 'publish-order.json'
+    $carril = Get-Lane -Lane $Lane -DataDir $DataDir
+    if (-not (Test-Path $carril.dir)) { New-Item -ItemType Directory -Path $carril.dir -Force | Out-Null }
+    Remove-Item $carril.result -Force -ErrorAction SilentlyContinue
+    $orderPath = $carril.order
     $orden.requestedAt = (Get-Date).ToString('o')
     [pscustomobject]$orden | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
     [pscustomobject]@{ path = $orderPath; runId = $RunId }
@@ -1381,11 +1633,14 @@ function Request-DbRefresh {
         [string[]]$Tables,
         [switch]$Execute,
         [string[]]$AllowedEnvironments,
-        [string]$TaskName = 'Publish Local',
-        [string]$DrainerTaskName = 'Publish Queue Drainer',
+        # Sin indicar: el carril propio del refresco si la máquina lo tiene
+        # registrado; si no, el de las publicaciones.
+        [ValidateSet('publish', 'dbrefresh')][string]$Lane,
+        [string]$TaskName,
+        [string]$DrainerTaskName,
         [string]$DataDir,
         [switch]$NoWait,
-        [int]$TimeoutSeconds = 7200,
+        [int]$TimeoutSeconds = 3600,
         [switch]$Quiet,
         [string]$RequestedBy,
         [switch]$Direct
@@ -1393,8 +1648,31 @@ function Request-DbRefresh {
     $ErrorActionPreference = 'Stop'
     $dir = Get-PublishDataDir -DataDir $DataDir
 
+    # El dry-run no para pools ni escribe en la BD: se ejecuta aquí mismo, sin cola,
+    # sin tarea elevada y sin esperar a nadie.
+    if (-not $Execute -and -not $Direct) {
+        try {
+            $plan = Invoke-DbRefreshOrder -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+                -AllowedEnvironments $AllowedEnvironments -RequestedBy $RequestedBy -DataDir $dir
+            $sitios = ($plan.sites | ForEach-Object { $_.environment }) -join ', '
+            $r = [pscustomobject]@{ status = 'ok'; kind = 'dbrefresh'; environment = $Environment; plan = $plan
+                message = "DRY-RUN: plan de refresco de $($plan.database) ($($plan.dataSource)) para $Environment; sites que comparten la BD: $sitios." }
+        }
+        catch {
+            $r = [pscustomobject]@{ status = 'error'; kind = 'dbrefresh'; environment = $Environment; message = $_.Exception.Message }
+        }
+        $color = if ($r.status -eq 'ok') { 'Green' } else { 'Red' }
+        Write-Host "RESULT: $($r.status) $($r.message)" -ForegroundColor $color
+        return $r
+    }
+
+    if (-not $Lane) { $Lane = Get-DbRefreshLane }
+    $carril = Get-Lane -Lane $Lane -DataDir $dir
+    if (-not $TaskName) { $TaskName = $carril.task }
+    if (-not $DrainerTaskName) { $DrainerTaskName = $carril.drainer }
+
     if (-not $Direct -and (Test-ScheduledTaskPresent -TaskName $DrainerTaskName)) {
-        $item = Add-DeployQueueItem -Kind dbrefresh -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+        $item = Add-DeployQueueItem -Kind dbrefresh -Lane $Lane -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
             -Execute:$Execute -AllowedEnvironments $AllowedEnvironments -DataDir $dir -RequestedBy $RequestedBy
         $cola = if ($item.position -gt 1) { " (posición $($item.position) en la cola)" } else { '' }
         Write-Host "Refresco de BD encolado (runId $($item.runId))$cola" -ForegroundColor Gray
@@ -1403,12 +1681,13 @@ function Request-DbRefresh {
         return Wait-DeployQueueItem -RunId $item.runId -DataDir $dir -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
     }
 
-    $order = Write-DbRefreshOrder -Environment $Environment -TestEmail $TestEmail -Tables $Tables -Execute:$Execute `
+    $order = Write-DbRefreshOrder -Lane $Lane -Environment $Environment -TestEmail $TestEmail -Tables $Tables -Execute:$Execute `
         -AllowedEnvironments $AllowedEnvironments -DataDir $dir -RequestedBy $RequestedBy
     Write-Host "Orden de refresco escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
     Start-PublishTask -TaskName $TaskName -DataDir $dir
     if ($NoWait) { return [pscustomobject]@{ status = 'triggered'; kind = 'dbrefresh'; environment = $Environment; runId = $order.runId } }
-    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    $result = Wait-PublishResult -DataDir $dir -Lane $Lane -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet `
+        -OrderPath $order.path -TaskName $TaskName
     $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
     Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
     return $result
@@ -1764,13 +2043,23 @@ function Wait-PublishResult {
         # La tarea escribe su consola en publish-order.log, no en la nuestra: sin
         # esto, quien la dispara se queda mirando una pantalla muda durante todo
         # el publish. Con -Quiet se calla y solo devuelve el resultado.
-        [switch]$Quiet
+        [switch]$Quiet,
+        [ValidateSet('publish', 'dbrefresh')][string]$Lane = 'publish',
+        # Fallar rápido: la tarea renombra la orden nada más arrancar. Si al cabo de
+        # -ConsumeTimeoutSeconds la orden sigue en la ranura, la tarea no ha
+        # arrancado (schtasks ignora el disparo de una tarea que aún está en
+        # marcha): se vuelve a disparar una vez y, si tampoco, se abandona.
+        [string]$OrderPath,
+        [string]$TaskName,
+        [int]$ConsumeTimeoutSeconds = 60
     )
 
-    $dir = Get-PublishDataDir -DataDir $DataDir
-    $resultPath = Join-Path $dir 'publish-order.result.json'
-    $logPath = Join-Path $dir 'publish-order.log'
+    $carril = Get-Lane -Lane $Lane -DataDir $DataDir
+    $resultPath = $carril.result
+    $logPath = $carril.log
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $consumeDeadline = (Get-Date).AddSeconds($ConsumeTimeoutSeconds)
+    $redisparada = $false
     # Arrancar al final del log existente: lo de la ejecución anterior no es
     # nuestro y volcarlo confunde. Cuando la tarea cree su transcript, el cambio
     # de fecha de creación hace que se lea desde el principio.
@@ -1784,6 +2073,16 @@ function Wait-PublishResult {
 
     while ((Get-Date) -lt $deadline) {
         if (-not $Quiet) { $logPos = Write-PublishLogTail -Path $logPath -Position $logPos -Stamp ([ref]$logStamp) }
+        if ($OrderPath -and $RunId -and (Get-Date) -gt $consumeDeadline -and (Test-OrderPending -Path $OrderPath -RunId $RunId)) {
+            if ($redisparada -or -not $TaskName) {
+                throw "La tarea '$TaskName' no ha recogido la orden $RunId ($OrderPath) ni al volver a dispararla: no está arrancando."
+            }
+            Write-Host "La tarea '$TaskName' no ha recogido la orden en $ConsumeTimeoutSeconds s: se vuelve a disparar." -ForegroundColor Yellow
+            Wait-ScheduledTaskIdle -TaskName $TaskName -TimeoutSeconds 120
+            Start-PublishTask -TaskName $TaskName -DataDir $carril.dir
+            $redisparada = $true
+            $consumeDeadline = (Get-Date).AddSeconds($ConsumeTimeoutSeconds)
+        }
         if (Test-Path $resultPath) {
             # Pequeña espera defensiva: el fichero puede estar a medio escribir.
             try {
@@ -1808,7 +2107,7 @@ function Wait-PublishResult {
         Start-Sleep -Seconds $PollSeconds
     }
 
-    throw "Timeout de $TimeoutSeconds s esperando el resultado en '$resultPath'. Revisa publish-order.log."
+    throw "Timeout de $TimeoutSeconds s esperando el resultado en '$resultPath'. Revisa $logPath."
 }
 
 function Test-ScheduledTaskPresent {
@@ -1965,7 +2264,8 @@ function Request-Publish {
         }
     }
 
-    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet `
+        -OrderPath $order.path -TaskName $TaskName
     $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
     Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
     return $result
@@ -2008,7 +2308,8 @@ function Request-ModuleUpdate {
         return [pscustomobject]@{ status = 'triggered'; kind = 'update'; runId = $order.runId; orderPath = $order.path }
     }
 
-    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet `
+        -OrderPath $order.path -TaskName $TaskName
     $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
     Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
     return $result
@@ -2275,9 +2576,14 @@ function Add-DeployQueueItem {
         [ValidateSet('publish', 'update', 'dbrefresh')][string]$Kind = 'publish',
         # Solo kind=dbrefresh: buzón de la sanitización y tablas concretas.
         [string]$TestEmail,
-        [string[]]$Tables
+        [string[]]$Tables,
+        # Carril: sin indicar, el refresco va al suyo si la máquina lo tiene y el
+        # resto, al de las publicaciones.
+        [ValidateSet('publish', 'dbrefresh')][string]$Lane
     )
     $ErrorActionPreference = 'Stop'
+    if (-not $Lane) { $Lane = if ($Kind -eq 'dbrefresh') { Get-DbRefreshLane } else { 'publish' } }
+    if ($Lane -eq 'dbrefresh' -and $Kind -ne 'dbrefresh') { throw "El carril de refresco solo admite órdenes dbrefresh." }
 
     $envDef = $null
     $refresh = $null
@@ -2317,7 +2623,7 @@ function Add-DeployQueueItem {
         $OverrideWebconfig = $false
     }
 
-    $qdir = Join-Path (Get-PublishDataDir -DataDir $DataDir) 'queue'
+    $qdir = (Get-Lane -Lane $Lane -DataDir $DataDir).queue
     if (-not (Test-Path $qdir)) { New-Item -ItemType Directory -Path $qdir -Force | Out-Null }
     $ahead = @(Get-ChildItem $qdir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
 
@@ -2334,6 +2640,7 @@ function Add-DeployQueueItem {
     $file = Join-Path $qdir ('{0:000000000000}-{1}.json' -f $seq, $RunId)
     $item = [ordered]@{
         kind              = $Kind
+        lane              = $Lane
         environment       = [string]$Environment
         branch            = [string]$Branch
         execute           = [bool]$Execute
@@ -2346,23 +2653,27 @@ function Add-DeployQueueItem {
     if ($refresh) { $item.testEmail = $refresh.testEmail; $item.tables = $refresh.tables }
     [pscustomobject]$item | ConvertTo-Json -Compress -Depth 6 | Set-Content $file -Encoding UTF8
 
-    [pscustomobject]@{ runId = $RunId; position = $ahead + 1; path = $file }
+    [pscustomobject]@{ runId = $RunId; position = $ahead + 1; path = $file; lane = $Lane }
 }
 
 function Get-DeployQueue {
     # Cola pendiente, en orden de proceso (position 1 = la siguiente en salir).
+    # Cada carril con su orden: position 1 es la siguiente en salir de SU cola.
     [CmdletBinding()]
-    param([string]$DataDir)
-    $qdir = Join-Path (Get-PublishDataDir -DataDir $DataDir) 'queue'
-    if (-not (Test-Path $qdir)) { return @() }
-    $i = 0
-    Get-ChildItem $qdir -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
-        try { $o = Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return }
-        $i++
-        [pscustomobject]@{
-            position = $i; runId = $o.runId; kind = $(if ($o.kind) { [string]$o.kind } else { 'publish' })
-            environment = $o.environment; branch = $o.branch; execute = [bool]$o.execute
-            queuedAt = $o.queuedAt; requestedBy = $o.requestedBy
+    param([string]$DataDir, [ValidateSet('publish', 'dbrefresh')][string]$Lane)
+    $carriles = if ($Lane) { @($Lane) } else { @('publish', 'dbrefresh') }
+    foreach ($c in $carriles) {
+        $qdir = (Get-Lane -Lane $c -DataDir $DataDir).queue
+        if (-not (Test-Path $qdir)) { continue }
+        $i = 0
+        Get-ChildItem $qdir -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
+            try { $o = Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return }
+            $i++
+            [pscustomobject]@{
+                position = $i; lane = $c; runId = $o.runId; kind = $(if ($o.kind) { [string]$o.kind } else { 'publish' })
+                environment = $o.environment; branch = $o.branch; execute = [bool]$o.execute
+                queuedAt = $o.queuedAt; requestedBy = $o.requestedBy
+            }
         }
     }
 }
@@ -2434,11 +2745,13 @@ function Invoke-DeployQueueDrain {
         [string]$TaskName = 'Publish Local',
         [int]$TimeoutSeconds = 1800,
         # Tope de órdenes por pasada (0 = drenar hasta vaciar). Los tests lo usan.
-        [int]$MaxItems = 0
+        [int]$MaxItems = 0,
+        [ValidateSet('publish', 'dbrefresh')][string]$Lane = 'publish'
     )
     $ErrorActionPreference = 'Stop'
     $dir = Get-PublishDataDir -DataDir $DataDir
-    $qdir = Join-Path $dir 'queue'
+    if (-not $PSBoundParameters.ContainsKey('TaskName')) { $TaskName = (Get-Lane -Lane $Lane -DataDir $dir).task }
+    $qdir = (Get-Lane -Lane $Lane -DataDir $dir).queue
     $rdir = Join-Path $dir 'results'
     if (-not (Test-Path $qdir)) { return 0 }
     if (-not (Test-Path $rdir)) { New-Item -ItemType Directory -Path $rdir -Force | Out-Null }
@@ -2478,8 +2791,8 @@ function Invoke-DeployQueueDrain {
                 # Un refresco copia la BD entera desde la réplica: su espera no
                 # puede ser la de una publicación.
                 $res = Request-DbRefresh -Environment ([string]$order.environment) -TestEmail ([string]$order.testEmail) `
-                    -Tables @($order.tables | Where-Object { $_ }) -Execute:([bool]$order.execute) -Direct `
-                    -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds ([Math]::Max($TimeoutSeconds, 7200)) -Quiet
+                    -Tables @($order.tables | Where-Object { $_ }) -Execute:([bool]$order.execute) -Direct -Lane $Lane `
+                    -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds ([Math]::Max($TimeoutSeconds, 3600)) -Quiet
             }
             else {
                 # Un entorno ad hoc viaja como definición dentro del item; se
@@ -2615,16 +2928,34 @@ function Invoke-DeployEndpointRequest {
         $execute = ($req.execute -is [bool]) -and $req.execute
         $requestedBy = (([string]$req.requestedBy) -replace '[^\p{L}\p{N}_.@\\\- ]', '').Trim()
         if ($requestedBy.Length -gt 128) { $requestedBy = $requestedBy.Substring(0, 128) }
+        $tablas = @($req.tables | ForEach-Object { [string]$_ })
+        if (-not $execute) {
+            # Un dry-run no espera turno: se lanza ya, fuera de la cola, y el
+            # listener no tiene drenador que despertar (drainer vacío).
+            try {
+                $dry = Start-DbRefreshDryRun -Environment ([string]$req.environment) -TestEmail ([string]$req.testEmail) `
+                    -Tables $tablas -RequestedBy $requestedBy -DataDir $dir
+            }
+            catch {
+                return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
+            }
+            return [pscustomobject]@{ status = 202; drainer = ''; body = @{
+                status = 'running'; kind = 'dbrefresh'; runId = $dry.runId; position = 0; lane = 'dryrun'
+                environment = [string]$req.environment; execute = $false
+                result = "/api/result?runId=$($dry.runId)"; log = "/api/log?runId=$($dry.runId)"
+            } }
+        }
         try {
             $item = Add-DeployQueueItem -Kind dbrefresh -Environment ([string]$req.environment) `
-                -TestEmail ([string]$req.testEmail) -Tables @($req.tables | ForEach-Object { [string]$_ }) `
+                -TestEmail ([string]$req.testEmail) -Tables $tablas `
                 -Execute:$execute -RequestedBy $requestedBy -DataDir $dir
         }
         catch {
             return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
         }
-        return [pscustomobject]@{ status = 202; body = @{
-            status = 'queued'; kind = 'dbrefresh'; runId = $item.runId; position = $item.position
+        # `drainer`: el listener despierta al drenador del carril de la orden.
+        return [pscustomobject]@{ status = 202; drainer = (Get-Lane -Lane $item.lane -DataDir $dir).drainer; body = @{
+            status = 'queued'; kind = 'dbrefresh'; runId = $item.runId; position = $item.position; lane = $item.lane
             environment = [string]$req.environment; execute = $execute
             result = "/api/result?runId=$($item.runId)"
         } }
@@ -2680,6 +3011,9 @@ function Invoke-DeployEndpointRequest {
     }
 
     if ($Method -eq 'GET' -and $Path -eq '/api/log') {
+        # ?lane=dbrefresh: el transcript del carril de refresco; ?runId=: el de un dry-run.
+        if ([string]$Query['lane'] -eq 'dbrefresh') { $logPath = (Get-Lane -Lane dbrefresh -DataDir $dir).log }
+        if ([string]$Query['runId'] -match '^[0-9a-fA-F-]{8,64}$') { $logPath = Get-DbRefreshDryRunLogPath -RunId ([string]$Query['runId']) -DataDir $dir }
         if (-not (Test-Path $logPath)) {
             return [pscustomobject]@{ status = 404; body = @{ error = 'Aún no hay transcript de publicación.' } }
         }
@@ -2706,15 +3040,19 @@ function Resume-StrandedQueue {
     # varada hasta la siguiente orden: al arrancar el listener se despierta al
     # drenador si hay cola. Devuelve si lo ha disparado.
     param([Parameter(Mandatory)][string]$DataDir, [string]$DrainerTaskName = 'Publish Queue Drainer', [string]$AuditPath)
-    if (-not @(Get-DeployQueue -DataDir $DataDir).Count) { return $false }
-    try { Start-PublishTask -TaskName $DrainerTaskName -DataDir $DataDir; return $true }
-    catch {
-        if ($AuditPath) {
-            "$((Get-Date).ToString('s')) | - | no se pudo disparar el drenador al arrancar: $($_.Exception.Message)" |
-                Add-Content $AuditPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    $disparado = $false
+    foreach ($c in @('publish', 'dbrefresh')) {
+        if (-not @(Get-DeployQueue -DataDir $DataDir -Lane $c).Count) { continue }
+        $drenador = if ($c -eq 'publish') { $DrainerTaskName } else { (Get-Lane -Lane $c -DataDir $DataDir).drainer }
+        try { Start-PublishTask -TaskName $drenador -DataDir $DataDir; $disparado = $true }
+        catch {
+            if ($AuditPath) {
+                "$((Get-Date).ToString('s')) | - | no se pudo disparar el drenador '$drenador' al arrancar: $($_.Exception.Message)" |
+                    Add-Content $AuditPath -Encoding UTF8 -ErrorAction SilentlyContinue
+            }
         }
-        return $false
     }
+    $disparado
 }
 
 function Start-DeployEndpoint {
@@ -2770,6 +3108,7 @@ function Start-DeployEndpoint {
             $ip = [string]$req.Headers['X-Forwarded-For']
             if (-not $ip) { try { $ip = $req.RemoteEndPoint.Address.ToString() } catch { $ip = '?' } }
             $status = 500
+            $out = $null
 
             # Ningun fallo de UNA peticion puede tumbar el listener: todo el manejo
             # va en try/catch y el Close y la auditoria en el suyo.
@@ -2818,11 +3157,12 @@ function Start-DeployEndpoint {
             # sondeando; el drenador procesa y termina. Su MultipleInstances=Queue
             # cubre las órdenes que lleguen mientras drena.
             if ($status -eq 202) {
-                try { Start-PublishTask -TaskName $DrainerTaskName -DataDir $dir }
+                $drenador = if ($out -and $out.PSObject.Properties['drainer']) { [string]$out.drainer } else { $DrainerTaskName }
+                if ($drenador) { try { Start-PublishTask -TaskName $drenador -DataDir $dir }
                 catch {
-                    "$((Get-Date).ToString('s')) | - | no se pudo disparar el drenador '$DrainerTaskName': $($_.Exception.Message)" |
+                    "$((Get-Date).ToString('s')) | - | no se pudo disparar el drenador '$drenador': $($_.Exception.Message)" |
                         Add-Content $auditPath -Encoding UTF8 -ErrorAction SilentlyContinue
-                }
+                } }
             }
         }
     }
@@ -3045,7 +3385,7 @@ function Request-RemoteDbRefresh {
         [switch]$Execute,
         [switch]$NoWait,
         [switch]$ShowLog,
-        [int]$TimeoutSeconds = 7200,
+        [int]$TimeoutSeconds = 3600,
         [int]$PollSeconds = 10,
         [string]$RequestedBy = (Get-RequesterIdentity)
     )
@@ -3071,7 +3411,8 @@ function Request-RemoteDbRefresh {
 
     $result = Wait-RemoteResult -Url $ep.url -Headers $ep.headers -RunId $trig.runId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
     if ($ShowLog) {
-        try { Invoke-RestMethod -Method Get -Uri "$($ep.url)/api/log" -Headers $ep.headers | Write-Host }
+        $consulta = if ($trig.lane -eq 'dryrun') { "runId=$($trig.runId)" } elseif ($trig.lane) { "lane=$($trig.lane)" } else { 'lane=publish' }
+        try { Invoke-RestMethod -Method Get -Uri "$($ep.url)/api/log?$consulta" -Headers $ep.headers | Write-Host }
         catch { Write-Warning "No se pudo leer /api/log: $($_.Exception.Message)" }
     }
     return $result
@@ -4328,4 +4669,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath -Alias Publish-Update

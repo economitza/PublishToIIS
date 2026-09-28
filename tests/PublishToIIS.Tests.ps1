@@ -1280,23 +1280,34 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
     Context 'ejecución' {
         It 'en dry-run llama al script sin -Execute, con el Web.config del site, y no para ningún pool' {
             Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
+            Mock -ModuleName PublishToIIS New-DbRefreshSnapshot {
+                [pscustomobject]@{ root = $Destination; script = 'C:\copia\tools\db-refresh\Sync-TestDatabase.ps1'; commit = 'abc123' }
+            }
             Mock -ModuleName PublishToIIS Stop-IISAppPool { }
             $p = Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Tables 'Articles,Families' `
                 -Config $script:cfg -OtherEnvironments $script:otros -DataDir $script:dataDir 6>$null
             $p.mode | Should -Be 'DRY-RUN'
             $esperado = Join-Path $script:esp1 'Web.config'
             Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 1 -ParameterFilter {
+                # se ejecuta la copia fija, no el script del checkout compartido
+                $Script -eq 'C:\copia\tools\db-refresh\Sync-TestDatabase.ps1' -and
                 ($Arguments -join ' ') -like "*-ConnectionsConfig $esperado*" -and
                 ($Arguments -join ' ') -like '*-Tables Articles,Families*' -and $Arguments -notcontains '-Execute'
             }
             Should -Invoke -ModuleName PublishToIIS Stop-IISAppPool -Times 0
         }
 
-        It 'con -Execute para y arranca los pools de todos los sites de la BD aunque el script falle' {
+        It 'con -Execute para y arranca los pools de todos los sites de la BD aunque el script falle, con el candado solo mientras refresca' {
             Mock -ModuleName PublishToIIS Test-ProcessElevated { $true }
-            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 1 }
+            $locks = Join-Path $script:dataDir 'dbrefresh-locks'
+            $script:candadoDuranteElScript = $null
+            $script:candadosAlArrancar = @()
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { $script:candadoDuranteElScript = @(Get-ChildItem $locks -Filter *.json -ErrorAction SilentlyContinue).Count; 1 }
             Mock -ModuleName PublishToIIS Stop-IISAppPool { }
-            Mock -ModuleName PublishToIIS Start-IISAppPool { }
+            Mock -ModuleName PublishToIIS Start-IISAppPool { $script:candadosAlArrancar += @(Get-ChildItem $locks -Filter *.json -ErrorAction SilentlyContinue).Count }
+            Mock -ModuleName PublishToIIS New-DbRefreshSnapshot {
+                [pscustomobject]@{ root = $Destination; script = 'C:\copia\tools\db-refresh\Sync-TestDatabase.ps1'; commit = 'abc123' }
+            }
             Mock -ModuleName PublishToIIS Invoke-SiteWarmup { }
             { Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute `
                 -Config $script:cfg -OtherEnvironments $script:otros -DataDir $script:dataDir 6>$null } | Should -Throw '*código 1*'
@@ -1304,6 +1315,9 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
             Should -Invoke -ModuleName PublishToIIS Stop-IISAppPool -Times 2
             Should -Invoke -ModuleName PublishToIIS Start-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'devecoesp1' }
             Should -Invoke -ModuleName PublishToIIS Start-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'pool3' }
+            $script:candadoDuranteElScript | Should -Be 1
+            # el candado se quita ANTES de arrancar: si no, una publicación entre medias dejaría su pool parado para siempre
+            @($script:candadosAlArrancar | Where-Object { $_ -ne 0 }).Count | Should -Be 0
         }
 
         It 'el script hijo que escribe en stderr y sale con error no corta la salida ni pierde el código (Windows PowerShell 5.1)' {
@@ -1325,6 +1339,9 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
         It 'con -Execute y sin elevación no toca nada' {
             Mock -ModuleName PublishToIIS Test-ProcessElevated { $false }
             Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
+            Mock -ModuleName PublishToIIS New-DbRefreshSnapshot {
+                [pscustomobject]@{ root = $Destination; script = 'C:\copia\tools\db-refresh\Sync-TestDatabase.ps1'; commit = 'abc123' }
+            }
             { Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute `
                 -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir 6>$null } | Should -Throw '*elevado*'
             Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 0
@@ -1361,22 +1378,50 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
             $id = (Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute -DataDir $script:dataDir).runId
             Invoke-DeployQueueDrain -DataDir $script:dataDir | Should -Be 1
             Should -Invoke -ModuleName PublishToIIS Request-DbRefresh -Times 1 -ParameterFilter {
-                $Direct -and $Execute -and $Environment -eq 'devecoesp1' -and $TestEmail -eq 'it@economitza.com' -and $TimeoutSeconds -ge 7200
+                $Direct -and $Execute -and $Environment -eq 'devecoesp1' -and $TestEmail -eq 'it@economitza.com' -and $TimeoutSeconds -ge 3600
             }
             $r = Get-DeployResult -RunId $id -DataDir $script:dataDir
             $r.kind | Should -Be 'dbrefresh'
             $r.message | Should -Be 'refrescada'
         }
 
-        It 'POST /api/dbrefresh encola (202) y solo un booleano JSON de verdad ejecuta' {
+        It 'POST /api/dbrefresh: solo un booleano JSON de verdad ejecuta, y el dry-run se lanza ya, sin cola ni drenador' {
+            Mock -ModuleName PublishToIIS Start-DbRefreshDryRunProcess { }
             $t = 'c' * 64
             $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir `
                 -Body '{"environment":"devecoesp1","testEmail":"it@economitza.com","tables":["A"],"execute":"true"}'
             $r.status | Should -Be 202
             $r.body.kind | Should -Be 'dbrefresh'
             $r.body.execute | Should -BeFalse
+            $r.body.lane | Should -Be 'dryrun'
+            $r.drainer | Should -Be ''
+            @(Get-DeployQueue -DataDir $script:dataDir).Count | Should -Be 0
+            (Get-DeployResult -RunId $r.body.runId -DataDir $script:dataDir).status | Should -Be 'running'
+            Should -Invoke -ModuleName PublishToIIS Start-DbRefreshDryRunProcess -Times 1 -ParameterFilter {
+                ($Arguments -join ' ') -like "*-RunId $($r.body.runId)*" -and ($Arguments -join ' ') -like '*-Tables A*' -and
+                ($Arguments -join ' ') -like '*-TestEmail it@economitza.com*'
+            }
+            $log = Get-DbRefreshDryRunLogPath -RunId $r.body.runId -DataDir $script:dataDir
+            New-Item -ItemType Directory -Path (Split-Path $log -Parent) -Force | Out-Null
+            Set-Content $log 'plan de tablas'
+            (Invoke-DeployEndpointRequest -Method GET -Path '/api/log' -Query @{ runId = $r.body.runId } -Token $t -ExpectedToken $t -DataDir $script:dataDir).text |
+                Should -Match 'plan de tablas'
             (Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir -Body '{}').status | Should -Be 400
             (Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir -Body '{"environment":"prod"}').status | Should -Be 400
+        }
+
+        It 'Request-DbRefresh sin -Execute se ejecuta al momento: ni cola ni tarea elevada' {
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshOrder {
+                [pscustomobject]@{ database = 'CCEspana'; dataSource = 'sql1'; sites = @([pscustomobject]@{ environment = 'devecoesp1' }) }
+            }
+            Mock -ModuleName PublishToIIS Add-DeployQueueItem { }
+            Mock -ModuleName PublishToIIS Start-PublishTask { }
+            $r = Request-DbRefresh -Environment devecoesp1 -TestEmail 'it@economitza.com' -DataDir $script:dataDir 6>$null
+            $r.status | Should -Be 'ok'
+            $r.message | Should -Match 'DRY-RUN'
+            Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshOrder -Times 1 -ParameterFilter { -not $Execute }
+            Should -Invoke -ModuleName PublishToIIS Add-DeployQueueItem -Times 0
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 0
         }
 
         It 'Request-RemoteDbRefresh hace POST a /api/dbrefresh con el cuerpo de la orden' {
@@ -1386,6 +1431,175 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
                 $b = [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json
                 $Uri -eq 'http://ep.test/api/dbrefresh' -and $b.environment -eq 'devecoesp1' -and $b.execute -eq $true -and $b.testEmail -eq 'it@economitza.com'
             }
+        }
+    }
+}
+
+Describe 'Carril de refresco, candado por BD e instantánea de las herramientas' {
+    BeforeEach {
+        $script:root = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_lane_" + [Guid]::NewGuid())
+        $script:dataDir = Join-Path $script:root 'data'
+        New-Item -ItemType Directory -Path $script:dataDir -Force | Out-Null
+        $script:token = 'd' * 64
+    }
+    AfterEach { Remove-Item $script:root -Recurse -Force -ErrorAction SilentlyContinue }
+
+    Context 'carriles' {
+        It 'cada carril tiene su cola, su ranura y sus tareas' {
+            $p = Get-Lane -Lane publish -DataDir $script:dataDir
+            $d = Get-Lane -Lane dbrefresh -DataDir $script:dataDir
+            $p.task | Should -Be 'Publish Local'
+            $d.task | Should -Be 'Publish DbRefresh'
+            $d.drainer | Should -Be 'Publish DbRefresh Drainer'
+            $d.queue | Should -Not -Be $p.queue
+            $d.order | Should -Be (Join-Path $script:dataDir 'dbrefresh-order.json')
+            $p.order | Should -Be (Join-Path $script:dataDir 'publish-order.json')
+        }
+
+        It 'con el carril registrado, el refresco va a su cola y el drenador de publicaciones no lo ve' {
+            Mock -ModuleName PublishToIIS Get-DbRefreshLane { 'dbrefresh' }
+            Mock -ModuleName PublishToIIS Request-Publish { [pscustomobject]@{ status = 'ok'; message = 'pub' } }
+            Mock -ModuleName PublishToIIS Request-DbRefresh { [pscustomobject]@{ status = 'ok'; message = 'refrescada' } }
+            $ref = Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -TestEmail 'it@economitza.com' -DataDir $script:dataDir
+            $pub = Add-DeployQueueItem -Environment devecoesp1 -Branch main -Execute -DataDir $script:dataDir
+            $ref.lane | Should -Be 'dbrefresh'
+            $ref.path | Should -BeLike "$((Get-Lane -Lane dbrefresh -DataDir $script:dataDir).queue)*"
+            $q = @(Get-DeployQueue -DataDir $script:dataDir)
+            @($q | ForEach-Object { "$($_.lane)/$($_.position)" }) | Should -Be @('publish/1', 'dbrefresh/1')
+            (Get-DeployResult -RunId $ref.runId -DataDir $script:dataDir).status | Should -Be 'queued'
+
+            Invoke-DeployQueueDrain -DataDir $script:dataDir | Should -Be 1
+            Should -Invoke -ModuleName PublishToIIS Request-DbRefresh -Times 0
+            Invoke-DeployQueueDrain -DataDir $script:dataDir -Lane dbrefresh | Should -Be 1
+            Should -Invoke -ModuleName PublishToIIS Request-DbRefresh -Times 1 -ParameterFilter {
+                $Direct -and $Lane -eq 'dbrefresh' -and $TaskName -eq 'Publish DbRefresh'
+            }
+            (Get-DeployResult -RunId $pub.runId -DataDir $script:dataDir).status | Should -Be 'ok'
+        }
+
+        It 'sin el carril registrado, el refresco sigue yendo por la cola de publicaciones' {
+            Mock -ModuleName PublishToIIS Get-DbRefreshLane { 'publish' }
+            (Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -TestEmail 'it@economitza.com' -DataDir $script:dataDir).lane |
+                Should -Be 'publish'
+        }
+
+        It 'el carril de refresco no admite publicaciones' {
+            { Add-DeployQueueItem -Environment devecoesp1 -Branch main -Lane dbrefresh -DataDir $script:dataDir } | Should -Throw '*solo admite*'
+        }
+
+        It 'POST /api/dbrefresh devuelve el drenador de su carril para que el listener lo despierte, y /api/log lee su transcript' {
+            Mock -ModuleName PublishToIIS Get-DbRefreshLane { 'dbrefresh' }
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir `
+                -Body '{"environment":"devecoesp1","testEmail":"it@economitza.com","execute":true}'
+            $r.status | Should -Be 202
+            $r.drainer | Should -Be 'Publish DbRefresh Drainer'
+            $r.body.lane | Should -Be 'dbrefresh'
+            Set-Content (Join-Path $script:dataDir 'dbrefresh-order.log') 'transcript del refresco'
+            Set-Content (Join-Path $script:dataDir 'publish-order.log') 'transcript de la publicacion'
+            (Invoke-DeployEndpointRequest -Method GET -Path '/api/log' -Query @{ lane = 'dbrefresh' } -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir).text |
+                Should -Match 'refresco'
+            (Invoke-DeployEndpointRequest -Method GET -Path '/api/log' -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir).text |
+                Should -Match 'publicacion'
+        }
+
+        It 'al arrancar el listener despierta el drenador de cada carril que tenga órdenes' {
+            Mock -ModuleName PublishToIIS Get-DbRefreshLane { 'dbrefresh' }
+            Mock -ModuleName PublishToIIS Start-PublishTask { }
+            Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -DataDir $script:dataDir | Out-Null
+            InModuleScope PublishToIIS -Parameters @{ d = $script:dataDir } { param($d) Resume-StrandedQueue -DataDir $d | Should -BeTrue }
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 1 -ParameterFilter { $TaskName -eq 'Publish DbRefresh Drainer' }
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 0 -ParameterFilter { $TaskName -eq 'Publish Queue Drainer' }
+        }
+    }
+
+    Context 'candado por BD' {
+        It 'con el candado puesto no entra otro refresco de la misma BD, y un candado de un proceso muerto está libre' {
+            InModuleScope PublishToIIS -Parameters @{ d = $script:dataDir; k = '(LOCAL)\|CCESPANA' } {
+                param($d, $k)
+                Enter-DbRefreshLock -Key $k -RunId 'r1' -Database CCEspana -DataDir $d | Out-Null
+                (Get-DbRefreshLock -Key $k -DataDir $d).runId | Should -Be 'r1'
+                { Enter-DbRefreshLock -Key $k -RunId 'r2' -Database CCEspana -DataDir $d } | Should -Throw '*ya se está refrescando*'
+                Exit-DbRefreshLock -Key $k -DataDir $d
+                Get-DbRefreshLock -Key $k -DataDir $d | Should -BeNullOrEmpty
+                # PID que no existe: el candado de un refresco muerto no bloquea
+                '{"key":"x","runId":"viejo","pid":999999}' | Set-Content (Get-DbRefreshLockPath -Key $k -DataDir $d)
+                Get-DbRefreshLock -Key $k -DataDir $d | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'una publicación deja parado el pool si su BD se está refrescando, y lo arranca si no' {
+            $site = Join-Path $script:root 'site'
+            New-Item -ItemType Directory -Path $site | Out-Null
+            '<configuration><connectionStrings><add name="centralcompresConnectionString" connectionString="Data Source=localhost;Initial Catalog=CCEspana;Integrated Security=True" /></connectionStrings></configuration>' |
+                Set-Content (Join-Path $site 'Web.config')
+            Mock -ModuleName PublishToIIS Start-IISAppPool { }
+            InModuleScope PublishToIIS -Parameters @{ d = $script:dataDir; s = $site } {
+                param($d, $s)
+                $key = (Get-SiteSqlTarget -WebConfigPath (Join-Path $s 'Web.config')).key
+                Enter-DbRefreshLock -Key $key -RunId 'r1' -Database CCEspana -DataDir $d | Out-Null
+                Start-SitePoolUnlessRefreshing -Destination $s -AppPoolName 'pool1' -DataDir $d 6>$null | Should -BeFalse
+                Exit-DbRefreshLock -Key $key -DataDir $d
+                Start-SitePoolUnlessRefreshing -Destination $s -AppPoolName 'pool1' -DataDir $d | Should -BeTrue
+            }
+            Should -Invoke -ModuleName PublishToIIS Start-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'pool1' }
+        }
+    }
+
+    Context 'instantánea de las herramientas' {
+        BeforeEach {
+            $script:repo = Join-Path $script:root 'repo'
+            New-Item -ItemType Directory -Path (Join-Path $script:repo 'tools\db-refresh'), (Join-Path $script:repo 'docs'), (Join-Path $script:repo 'Scheduling\tools') -Force | Out-Null
+            '{"sanitizeSqlFile":"docs/sanitize-test-db.sql","alignSqlFile":"Scheduling/tools/alinear.sql","testPasswordEnvFile":"tests/test.env"}' |
+                Set-Content (Join-Path $script:repo 'tools\db-refresh\config.json')
+            'exit 0' | Set-Content (Join-Path $script:repo 'tools\db-refresh\Sync-TestDatabase.ps1')
+            'SANEADO $(TestEmail)' | Set-Content (Join-Path $script:repo 'docs\sanitize-test-db.sql')
+            'ALINEADO' | Set-Content (Join-Path $script:repo 'Scheduling\tools\alinear.sql')
+            'NO VIAJA' | Set-Content (Join-Path $script:repo 'docs\otro.sql')
+            & git -C $script:repo init -q
+            & git -C $script:repo add -A
+            & git -C $script:repo -c user.name=t -c user.email=t@t commit -q -m inicial
+            # Fuera de git, como en el servidor
+            '{"server":"1.2.3.4"}' | Set-Content (Join-Path $script:repo 'tools\db-refresh\replica.connection.json')
+        }
+
+        It 'saca del commit las herramientas y los .sql que declara su config, y copia del árbol lo que no está en git' {
+            # Un cambio sin commitear (una publicación a medio checkout) no entra en la copia
+            'CAMBIADO A MEDIAS' | Set-Content (Join-Path $script:repo 'docs\sanitize-test-db.sql')
+            $c = New-DbRefreshSnapshot -Repo $script:repo -Destination (Join-Path $script:root 'copia')
+            $c.commit | Should -Match '^[0-9a-f]{40}$'
+            Test-Path $c.script | Should -BeTrue
+            (Get-Content (Join-Path $c.root 'docs\sanitize-test-db.sql') -Raw) | Should -Match 'SANEADO'
+            Test-Path (Join-Path $c.root 'Scheduling\tools\alinear.sql') | Should -BeTrue
+            Test-Path (Join-Path $c.root 'docs\otro.sql') | Should -BeFalse
+            Test-Path (Join-Path $c.root 'tools\db-refresh\replica.connection.json') | Should -BeTrue
+        }
+
+        It 'sin la sanitización en el commit no hay copia' {
+            & git -C $script:repo rm -q docs/sanitize-test-db.sql
+            & git -C $script:repo -c user.name=t -c user.email=t@t commit -q -m sin-sanitizar
+            { New-DbRefreshSnapshot -Repo $script:repo -Destination (Join-Path $script:root 'copia') } | Should -Throw '*sanitización*'
+        }
+    }
+
+    Context 'fallar rápido' {
+        It 'si la tarea no recoge la orden, se vuelve a disparar una vez y después se abandona' {
+            Mock -ModuleName PublishToIIS Start-PublishTask { }
+            Mock -ModuleName PublishToIIS Wait-ScheduledTaskIdle { }
+            $orden = Join-Path $script:dataDir 'publish-order.json'
+            '{"runId":"r-colgada"}' | Set-Content $orden
+            { Wait-PublishResult -DataDir $script:dataDir -RunId 'r-colgada' -OrderPath $orden -TaskName 'Publish Local' `
+                -ConsumeTimeoutSeconds 1 -TimeoutSeconds 30 -PollSeconds 1 -Quiet 6>$null } | Should -Throw '*no ha recogido la orden*'
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 1 -ParameterFilter { $TaskName -eq 'Publish Local' }
+        }
+
+        It 'una orden recogida no dispara nada y espera su resultado' {
+            Mock -ModuleName PublishToIIS Start-PublishTask { }
+            $orden = Join-Path $script:dataDir 'publish-order.json'
+            Set-Content "$orden.consumed" '{"runId":"r-ok"}'
+            '{"status":"ok","runId":"r-ok"}' | Set-Content (Join-Path $script:dataDir 'publish-order.result.json')
+            (Wait-PublishResult -DataDir $script:dataDir -RunId 'r-ok' -OrderPath $orden -TaskName 'Publish Local' -ConsumeTimeoutSeconds 1 -Quiet).status |
+                Should -Be 'ok'
+            Should -Invoke -ModuleName PublishToIIS Start-PublishTask -Times 0
         }
     }
 }

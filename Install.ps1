@@ -184,6 +184,18 @@ foreach ($baseTarget in $targets) {
 }
 
 # ------------------------------------------------------------
+# Carril de refresco de BD (tareas Publish DbRefresh y su drenador)
+# ------------------------------------------------------------
+# Va aquí y no en Run-PublishOrder.ps1: Update-PublishToIIS ejecuta este fichero
+# DESPUÉS del git pull, así que ya corre en su versión nueva, y elevado.
+
+$dbRefreshTasks = Join-Path $moduleRoot 'tools\Register-DbRefreshTasks.ps1'
+if (Test-Path $dbRefreshTasks) {
+    try { & $dbRefreshTasks }
+    catch { Write-Warning "No se pudieron registrar las tareas del carril de refresco: $($_.Exception.Message)" }
+}
+
+# ------------------------------------------------------------
 # Validación
 # ------------------------------------------------------------
 

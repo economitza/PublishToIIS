@@ -6,6 +6,26 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.9.0] - 2026-09-28
+
+### Added
+- **Carril propio para los refrescos de BD**: cola `dbqueue\`, drenador «Publish
+  DbRefresh Drainer» y tarea elevada «Publish DbRefresh» (dos horas de límite), que
+  `Install.ps1` registra con la identidad de sus parejas del carril de publicación. Un
+  refresco ya no bloquea ningún deploy.
+- **El dry-run de un refresco no espera turno**: no pasa por ninguna cola ni tarea
+  elevada; en remoto lo lanza el endpoint en un proceso aparte (`/api/log?runId=`).
+- **Candado por BD**: no entran dos refrescos de la misma BD, y una publicación de un
+  site cuya BD se está refrescando deja su pool parado para que lo arranque el refresco.
+- **Copia fija de las herramientas de refresco** sacada del commit con `git archive`:
+  una publicación que cambie de rama el checkout a mitad ya no puede cambiarle la
+  sanitización.
+
+### Fixed
+- **Una orden que la tarea no recoge ya no bloquea la cola hasta el timeout**: al minuto
+  se vuelve a disparar la tarea y, si tampoco la recoge, la orden termina en error. El
+  28/09 un refresco quedó así dos horas con la cola del 76 bloqueada detrás.
+
 ## [0.8.0] - 2026-09-28
 
 ### Added
