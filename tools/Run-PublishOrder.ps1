@@ -68,7 +68,7 @@ try {
         $despues = Get-RepoVersion -Repo $repo
         $commit = [string](& git -C $repo rev-parse --short HEAD 2>$null)
         Write-Host 'RESULT: OK'
-        Write-Result -Status 'ok' -Message "Módulo actualizado en $env:COMPUTERNAME: $antes -> $despues ($commit). El listener del endpoint se reinicia para cargar el código nuevo."
+        Write-Result -Status 'ok' -Message "Módulo actualizado en ${env:COMPUTERNAME}: $antes -> $despues ($commit). El listener del endpoint se reinicia para cargar el código nuevo."
         $restartEndpoint = $true
     }
     elseif ($order.kind -eq 'dbrefresh') {
