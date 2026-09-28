@@ -1410,6 +1410,19 @@ Describe 'Refresco de BD (kind=dbrefresh)' {
             (Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir -Body '{"environment":"prod"}').status | Should -Be 400
         }
 
+        It 'el script del dry-run remoto deja su resultado y su log aunque el refresco falle (Windows PowerShell 5.1, sin el módulo cargado)' {
+            # Es lo que lanza el endpoint en un proceso aparte: solo puede usar lo que el módulo exporta.
+            $script = Join-Path $PSScriptRoot '..\tools\Invoke-DbRefreshDryRun.ps1'
+            $cmd = "`$env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath','Machine'); & '$script' -RunId 'r-script' -Environment 'prod' -DataDir '$($script:dataDir)'"
+            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd *> $null
+            $resultado = Join-Path $script:dataDir 'results\r-script.json'
+            Test-Path $resultado | Should -BeTrue
+            $r = Get-Content $resultado -Raw | ConvertFrom-Json
+            $r.status | Should -Be 'error'
+            $r.message | Should -Match 'no permitido'
+            Test-Path (Get-DbRefreshDryRunLogPath -RunId 'r-script' -DataDir $script:dataDir) | Should -BeTrue
+        }
+
         It 'Request-DbRefresh sin -Execute se ejecuta al momento: ni cola ni tarea elevada' {
             Mock -ModuleName PublishToIIS Invoke-DbRefreshOrder {
                 [pscustomobject]@{ database = 'CCEspana'; dataSource = 'sql1'; sites = @([pscustomobject]@{ environment = 'devecoesp1' }) }

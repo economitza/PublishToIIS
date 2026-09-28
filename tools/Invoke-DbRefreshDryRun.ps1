@@ -16,7 +16,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\PublishToIIS.psd1') -Force
 
-$dir = Get-PublishDataDir -DataDir $DataDir
+# Get-PublishDataDir no se exporta: la carpeta de datos se resuelve igual que en el módulo.
+$dir = if ($DataDir) { $DataDir } else { Join-Path $env:ProgramData 'PublishToIIS' }
 $resultPath = Join-Path $dir "results\$RunId.json"
 $logPath = Get-DbRefreshDryRunLogPath -RunId $RunId -DataDir $dir
 New-Item -ItemType Directory -Path (Split-Path $logPath -Parent), (Split-Path $resultPath -Parent) -Force | Out-Null
