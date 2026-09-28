@@ -1014,6 +1014,402 @@ function Invoke-DeployOrder {
     return $plan
 }
 
+function Get-SiteSqlTarget {
+    # Servidor y BD de la cadena principal de un site, leídos de su Web.config (o
+    # del connections.config al que apunte por configSource). `key` identifica la
+    # BD física: dos sites con la misma key comparten base de datos.
+    param(
+        [Parameter(Mandatory)][string]$WebConfigPath,
+        [string]$Name = 'centralcompresConnectionString'
+    )
+    Add-Type -AssemblyName System.Data
+    $entry = Get-ConnectionStringNodes -WebConfigPath $WebConfigPath |
+        Where-Object { $_.node.GetAttribute('name') -eq $Name } | Select-Object -First 1
+    if (-not $entry) { return $null }
+    $b = New-Object System.Data.SqlClient.SqlConnectionStringBuilder($entry.node.GetAttribute('connectionString'))
+    $ds = $b.DataSource.Trim()
+    $machine = ($ds -split '[\\,]')[0].Trim()
+    $instance = if ($ds -match '\\([^,]+)') { $Matches[1].Trim() } else { '' }
+    if ($machine -in @('localhost', '.', '(local)', '127.0.0.1', $env:COMPUTERNAME)) { $machine = '(local)' }
+    [pscustomobject]@{
+        dataSource = $ds
+        database   = $b.InitialCatalog
+        key        = ('{0}\{1}|{2}' -f $machine, $instance, $b.InitialCatalog).ToUpperInvariant()
+        configPath = $entry.path
+    }
+}
+
+function Resolve-DbRefreshPlan {
+    <#
+    .SYNOPSIS
+        Resuelve, sin tocar nada, qué haría un refresco de BD de un entorno: qué BD, con qué script y qué sites se paran.
+
+    .DESCRIPTION
+        El refresco NO vive en el publicador: lo hace el script del propio repo
+        del site (tools\db-refresh\Sync-TestDatabase.ps1: esquema + datos desde la
+        réplica, sanitización de correos y contraseñas, usuarios de test). Aquí
+        solo se resuelve cómo llamarlo para un entorno:
+          - script y repo: los del checkout de origen del entorno;
+          - destino: la cadena del Web.config del site publicado (nunca un
+            parámetro a mano);
+          - credenciales de la réplica: las del checkout (gitignored) o, si no
+            están, %ProgramData%\PublishToIIS\replica.connection.json;
+          - sites a parar: el del entorno y cualquier otro del mismo servidor
+            cuyo Web.config apunte a la MISMA base de datos, porque el refresco
+            trunca tablas por debajo de todos ellos.
+
+    .OUTPUTS
+        PSCustomObject con el plan.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [string[]]$AllowedEnvironments,
+        # Para tests: definición del entorno y del resto de entornos del servidor
+        # en lugar de leerlos de environments.json.
+        [psobject]$Config,
+        [hashtable]$OtherEnvironments,
+        [string]$DataDir
+    )
+    $ErrorActionPreference = 'Stop'
+
+    if (-not $Config) {
+        $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+        if ($Environment -notin $allowed) {
+            throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')"
+        }
+        if (-not (Get-Command Get-PublishConfig -ErrorAction SilentlyContinue)) {
+            $maybeCfg = Join-Path $PSScriptRoot '..\config\config.ps1'
+            if (Test-Path $maybeCfg) { . $maybeCfg }
+        }
+        $Config = Get-PublishConfig -Environment $Environment
+    }
+    if ($null -eq $OtherEnvironments) {
+        $OtherEnvironments = @{}
+        $cfgFile = Join-Path $PSScriptRoot '..\config\environments.json'
+        $all = (Get-Content $cfgFile -Raw | ConvertFrom-Json).environments
+        foreach ($p in $all.PSObject.Properties) {
+            if ($p.Name -ne $Environment -and $p.Name -notin @('prod', 'staging')) { $OtherEnvironments[$p.Name] = $p.Value }
+        }
+    }
+    if (-not $Config.origin -or -not $Config.destination) { throw "El entorno '$Environment' no declara origin y destination." }
+
+    if (-not $TestEmail -and $Config.testEmail) { $TestEmail = [string]$Config.testEmail }
+    if (-not $TestEmail) {
+        throw "Falta -TestEmail: es el buzón que recibirá TODO el correo que genere la copia (o declara 'testEmail' en el entorno)."
+    }
+    if ($TestEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "TestEmail con formato inválido: '$TestEmail'" }
+    $Tables = @($Tables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($t in $Tables) { if ($t -notmatch '^[A-Za-z0-9_]+$') { throw "Nombre de tabla inválido: '$t'" } }
+
+    $repo = Split-Path ([string]$Config.origin).TrimEnd('\', '/') -Parent
+    $script = Join-Path $repo 'tools\db-refresh\Sync-TestDatabase.ps1'
+    if (-not (Test-Path $script)) {
+        throw "El checkout $repo no tiene tools\db-refresh\Sync-TestDatabase.ps1: publica antes una rama que lo incluya."
+    }
+    $replica = Join-Path $repo 'tools\db-refresh\replica.connection.json'
+    if (-not (Test-Path $replica)) {
+        $replica = Join-Path (Get-PublishDataDir -DataDir $DataDir) 'replica.connection.json'
+    }
+    if (-not (Test-Path $replica)) {
+        throw ("Sin credenciales de la réplica en este servidor. Copia replica.connection.json (plantilla en " +
+               "tools\db-refresh\replica.connection.json.template) a $(Join-Path $repo 'tools\db-refresh') o a " +
+               "$(Get-PublishDataDir -DataDir $DataDir). Queda fuera de git.")
+    }
+
+    $webConfig = Join-Path ([string]$Config.destination) 'Web.config'
+    if (-not (Test-Path $webConfig)) { throw "No existe ${webConfig}: el entorno tiene que estar publicado antes de refrescar su BD." }
+    $target = Get-SiteSqlTarget -WebConfigPath $webConfig
+    if (-not $target) { throw "$webConfig no tiene 'centralcompresConnectionString'." }
+
+    $pool = if ($Config.appPool) { [string]$Config.appPool } else { $Environment }
+    $sites = @([pscustomobject]@{ environment = $Environment; appPool = $pool; siteUrl = [string]$Config.siteUrl })
+    foreach ($name in ($OtherEnvironments.Keys | Sort-Object)) {
+        $o = $OtherEnvironments[$name]
+        if ($Config.server -and $o.server -and $o.server -ne $Config.server) { continue }
+        if (-not $o.destination) { continue }
+        $wc = Join-Path ([string]$o.destination) 'Web.config'
+        if (-not (Test-Path $wc)) { continue }
+        $t = $null
+        try { $t = Get-SiteSqlTarget -WebConfigPath $wc } catch { continue }
+        if ($t -and $t.key -eq $target.key) {
+            $sites += [pscustomobject]@{ environment = $name; appPool = $(if ($o.appPool) { [string]$o.appPool } else { $name }); siteUrl = [string]$o.siteUrl }
+        }
+    }
+
+    [pscustomobject]@{
+        environment        = $Environment
+        repo               = $repo
+        script             = $script
+        replicaCredentials = $replica
+        webConfig          = $webConfig
+        dataSource         = $target.dataSource
+        database           = $target.database
+        testEmail          = $TestEmail
+        tables             = $Tables
+        sites              = $sites
+    }
+}
+
+function Invoke-DbRefreshOrder {
+    <#
+    .SYNOPSIS
+        Refresca la BD de un entorno de test desde la réplica y la sanitiza (correos y contraseñas).
+
+    .DESCRIPTION
+        Ejecuta el tools\db-refresh\Sync-TestDatabase.ps1 del checkout del entorno
+        contra la BD de su Web.config (ver Resolve-DbRefreshPlan). Por defecto es
+        DRY-RUN: el propio script inventaría réplica y destino e imprime el plan,
+        con lo que valida conexión y credenciales sin tocar nada. Con -Execute
+        para los app pools de todos los sites que comparten esa BD, refresca y los
+        vuelve a arrancar (también si el refresco falla) y calienta el site.
+
+        La sanitización no es opcional: la impone el script, que se niega a
+        refrescar sin ella. Las guardas de destino (solo servidores de test, nunca
+        la réplica) también son suyas; aquí se añaden la lista blanca de entornos
+        y que nunca se toque prod/staging.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [switch]$Execute,
+        [string]$RequestedBy,
+        [string[]]$AllowedEnvironments,
+        [psobject]$Config,
+        [hashtable]$OtherEnvironments,
+        [string]$DataDir,
+        [switch]$SkipWarmup
+    )
+    $ErrorActionPreference = 'Stop'
+
+    $plan = Resolve-DbRefreshPlan -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+        -AllowedEnvironments $AllowedEnvironments -Config $Config -OtherEnvironments $OtherEnvironments -DataDir $DataDir
+    $plan | Add-Member -NotePropertyName mode -NotePropertyValue $(if ($Execute) { 'EXECUTE' } else { 'DRY-RUN' })
+    $plan | Add-Member -NotePropertyName requestedBy -NotePropertyValue $RequestedBy
+
+    Write-Host "== Refresco de BD ==" -ForegroundColor Cyan
+    Write-Host ("Entorno:  {0}  ({1})" -f $plan.environment, $plan.mode)
+    Write-Host ("BD:       {0} en {1}  (de {2})" -f $plan.database, $plan.dataSource, $plan.webConfig)
+    Write-Host ("Correo:   todo el de la copia irá a {0}" -f $plan.testEmail)
+    Write-Host ("Script:   {0}" -f $plan.script)
+    Write-Host ("Sites que comparten la BD (se paran con -Execute): {0}" -f (($plan.sites | ForEach-Object { "$($_.environment) [$($_.appPool)]" }) -join ', '))
+    if ($plan.tables) { Write-Host ("Tablas:   {0}" -f ($plan.tables -join ', ')) }
+
+    $scriptArgs = @('-TestEmail', $plan.testEmail, '-ConnectionsConfig', $plan.webConfig, '-ReplicaCredentials', $plan.replicaCredentials)
+    if ($plan.tables) { $scriptArgs += @('-Tables', ($plan.tables -join ',')) }
+    if ($Execute) { $scriptArgs += '-Execute' }
+
+    $stopped = @()
+    if ($Execute) {
+        if (-not (Test-ProcessElevated)) { throw 'El refresco con -Execute para app pools de IIS y requiere un proceso elevado (la tarea Publish Local).' }
+        foreach ($s in $plan.sites) {
+            Write-Host "Parando el app pool '$($s.appPool)'..." -ForegroundColor Yellow
+            Stop-IISAppPool -Name $s.appPool
+            $stopped += $s
+        }
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $exit = Invoke-DbRefreshScript -Script $plan.script -Arguments $scriptArgs
+        if ($exit -ne 0) { throw "Sync-TestDatabase.ps1 terminó con código $exit (detalle en su refresh.log, junto al script)." }
+    }
+    finally {
+        foreach ($s in $stopped) {
+            try { Write-Host "Arrancando el app pool '$($s.appPool)'..." -ForegroundColor Yellow; Start-IISAppPool -Name $s.appPool }
+            catch { Write-Warning "No se pudo arrancar '$($s.appPool)': $($_.Exception.Message)" }
+        }
+        $sw.Stop()
+        Write-Host ("Duración del refresco: {0:hh\:mm\:ss}" -f $sw.Elapsed) -ForegroundColor Cyan
+    }
+    if ($Execute -and -not $SkipWarmup) {
+        foreach ($s in $stopped | Where-Object { $_.siteUrl }) {
+            try { Invoke-SiteWarmup -Url $s.siteUrl | Out-Null } catch { Write-Warning "Warm-up de $($s.siteUrl): $($_.Exception.Message)" }
+        }
+    }
+    $plan | Add-Member -NotePropertyName elapsed -NotePropertyValue ('{0:hh\:mm\:ss}' -f $sw.Elapsed)
+    return $plan
+}
+
+function Test-ProcessElevated {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Invoke-DbRefreshScript {
+    # Lanza el script de refresco en un powershell.exe hijo: su `exit 1` no debe
+    # tumbar la tarea, y su salida tiene que acabar en el transcript de la orden
+    # (la de un proceso nativo no entra en Start-Transcript si no se reescribe).
+    param([Parameter(Mandatory)][string]$Script, [string[]]$Arguments)
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script @Arguments 2>&1 |
+        ForEach-Object { Write-Host $_ }
+    $LASTEXITCODE
+}
+
+function Write-DbRefreshOrder {
+    <#
+    .SYNOPSIS
+        Deja escrita una orden de REFRESCO DE BD (publish-order.json, kind=dbrefresh). Sin privilegios.
+
+    .DESCRIPTION
+        Misma mecánica que Write-PublishOrder, otro tipo de orden: la tarea
+        elevada 'Publish Local' la consume y ejecuta Invoke-DbRefreshOrder.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [switch]$Execute,
+        [string[]]$AllowedEnvironments,
+        [string]$DataDir,
+        [string]$RunId = [Guid]::NewGuid().ToString(),
+        [string]$RequestedBy
+    )
+    $ErrorActionPreference = 'Stop'
+    $orden = New-DbRefreshOrderBody -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+        -Execute:$Execute -AllowedEnvironments $AllowedEnvironments -RunId $RunId -RequestedBy $RequestedBy
+
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Remove-Item (Join-Path $dir 'publish-order.result.json') -Force -ErrorAction SilentlyContinue
+    $orderPath = Join-Path $dir 'publish-order.json'
+    $orden.requestedAt = (Get-Date).ToString('o')
+    [pscustomobject]$orden | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
+    [pscustomobject]@{ path = $orderPath; runId = $RunId }
+}
+
+function New-DbRefreshOrderBody {
+    # Validación común de una orden de refresco (orden local, cola y endpoint):
+    # entorno de la lista blanca —nunca ad hoc: el destino se lee del Web.config
+    # de un site ya dado de alta—, correo y tablas con formato estricto.
+    param(
+        [string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [switch]$Execute,
+        [string[]]$AllowedEnvironments,
+        [string]$RunId,
+        [string]$RequestedBy
+    )
+    if (-not $Environment) { throw "Una orden de refresco de BD necesita 'environment'." }
+    $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+    if ($Environment -notin $allowed) { throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')" }
+    if ($TestEmail -and $TestEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "TestEmail con formato inválido: '$TestEmail'" }
+    $Tables = @($Tables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($t in $Tables) { if ($t -notmatch '^[A-Za-z0-9_]+$') { throw "Nombre de tabla inválido: '$t'" } }
+    [ordered]@{
+        kind        = 'dbrefresh'
+        environment = $Environment
+        branch      = ''
+        testEmail   = [string]$TestEmail
+        tables      = $Tables
+        execute     = [bool]$Execute
+        runId       = $RunId
+        requestedBy = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
+    }
+}
+
+function Wait-DeployQueueItem {
+    # Sigue por runId una orden encolada hasta su desenlace: informa de la
+    # posición mientras espera turno y vuelca el log de la tarea mientras corre.
+    param(
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$DataDir,
+        [int]$TimeoutSeconds = 900,
+        [int]$PollSeconds = 2,
+        [switch]$Quiet
+    )
+    $logPath = Join-Path $DataDir 'publish-order.log'
+    $pos = 0
+    $stamp = [datetime]::MinValue
+    $anterior = ''
+    $limite = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $limite) {
+        $r = Get-DeployResult -RunId $RunId -DataDir $DataDir
+        $estado = if ($r) { [string]$r.status } else { '' }
+
+        if ($estado -eq 'queued' -and $estado -ne $anterior -and -not $Quiet) {
+            Write-Host "  esperando turno (posición $($r.position))..." -ForegroundColor DarkGray
+        }
+        if ($estado -eq 'running' -and -not $Quiet) {
+            $pos = Write-PublishLogTail -Path $logPath -Position $pos -Stamp ([ref]$stamp)
+        }
+        if ($estado -in @('ok', 'error')) {
+            if (-not $Quiet) { $pos = Write-PublishLogTail -Path $logPath -Position $pos -Stamp ([ref]$stamp) }
+            $color = if ($estado -eq 'ok') { 'Green' } else { 'Red' }
+            Write-Host "RESULT: $estado $($r.message)" -ForegroundColor $color
+            return $r
+        }
+        $anterior = $estado
+        Start-Sleep -Seconds $PollSeconds
+    }
+    throw "Tiempo agotado ($TimeoutSeconds s) esperando el resultado de la orden $RunId. Mira la cola con Get-DeployQueue."
+}
+
+function Request-DbRefresh {
+    <#
+    .SYNOPSIS
+        Pide SIN privilegios el refresco de la BD de un entorno de test (réplica -> test + sanitización).
+
+    .DESCRIPTION
+        Encola una orden kind=dbrefresh en la misma cola FIFO que las
+        publicaciones —así nunca coincide con un publish del mismo servidor— y
+        espera el resultado. La tarea elevada ejecuta Invoke-DbRefreshOrder, que
+        llama al tools\db-refresh\Sync-TestDatabase.ps1 del checkout del entorno
+        contra la BD del Web.config del site. Sin -Execute es un DRY-RUN: el
+        script inventaría réplica y destino y enseña el plan sin tocar nada.
+
+        Con -Direct se salta la cola (lo usa el drenador, que ya ES la cola).
+
+    .EXAMPLE
+        Request-DbRefresh -Environment devecoesp1 -TestEmail it@economitza.com
+
+    .EXAMPLE
+        Request-DbRefresh -Environment devecoesp1 -TestEmail it@economitza.com -Execute
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [switch]$Execute,
+        [string[]]$AllowedEnvironments,
+        [string]$TaskName = 'Publish Local',
+        [string]$DrainerTaskName = 'Publish Queue Drainer',
+        [string]$DataDir,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 7200,
+        [switch]$Quiet,
+        [string]$RequestedBy,
+        [switch]$Direct
+    )
+    $ErrorActionPreference = 'Stop'
+    $dir = Get-PublishDataDir -DataDir $DataDir
+
+    if (-not $Direct -and (Test-ScheduledTaskPresent -TaskName $DrainerTaskName)) {
+        $item = Add-DeployQueueItem -Kind dbrefresh -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+            -Execute:$Execute -AllowedEnvironments $AllowedEnvironments -DataDir $dir -RequestedBy $RequestedBy
+        $cola = if ($item.position -gt 1) { " (posición $($item.position) en la cola)" } else { '' }
+        Write-Host "Refresco de BD encolado (runId $($item.runId))$cola" -ForegroundColor Gray
+        Start-PublishTask -TaskName $DrainerTaskName -DataDir $dir
+        if ($NoWait) { return [pscustomobject]@{ status = 'queued'; kind = 'dbrefresh'; environment = $Environment; runId = $item.runId; position = $item.position } }
+        return Wait-DeployQueueItem -RunId $item.runId -DataDir $dir -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    }
+
+    $order = Write-DbRefreshOrder -Environment $Environment -TestEmail $TestEmail -Tables $Tables -Execute:$Execute `
+        -AllowedEnvironments $AllowedEnvironments -DataDir $dir -RequestedBy $RequestedBy
+    Write-Host "Orden de refresco escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
+    Start-PublishTask -TaskName $TaskName -DataDir $dir
+    if ($NoWait) { return [pscustomobject]@{ status = 'triggered'; kind = 'dbrefresh'; environment = $Environment; runId = $order.runId } }
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
+    Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
+    return $result
+}
+
 function Read-PublishOrder {
     <#
     .SYNOPSIS
@@ -1036,10 +1432,26 @@ function Read-PublishOrder {
         throw "No hay orden de publicación en '$Path'."
     }
     $raw = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-    # Tipo de orden: 'publish' (por defecto) o 'update' (actualizar el propio
-    # módulo en el servidor: git pull + reinstalar + reiniciar el listener).
+    # Tipo de orden: 'publish' (por defecto), 'update' (actualizar el propio
+    # módulo en el servidor: git pull + reinstalar + reiniciar el listener) o
+    # 'dbrefresh' (refrescar la BD de un entorno de test desde la réplica).
     $kind = if ($raw.kind) { [string]$raw.kind } else { 'publish' }
-    if ($kind -notin @('publish', 'update')) { throw "Tipo de orden desconocido: '$kind'." }
+    if ($kind -notin @('publish', 'update', 'dbrefresh')) { throw "Tipo de orden desconocido: '$kind'." }
+    if ($kind -eq 'dbrefresh') {
+        if (-not $raw.environment) { throw "La orden de refresco no indica 'environment'." }
+        return [pscustomobject]@{
+            kind        = 'dbrefresh'
+            environment = [string]$raw.environment
+            branch      = ''
+            testEmail   = [string]$raw.testEmail
+            tables      = @($raw.tables | Where-Object { $_ })
+            execute     = [bool]$raw.execute
+            overrideWebconfig = $false
+            runId       = [string]$raw.runId
+            requestedBy = [string]$raw.requestedBy
+            environmentDef = $null
+        }
+    }
     if ($kind -eq 'update') {
         return [pscustomobject]@{
             kind        = 'update'
@@ -1458,31 +1870,7 @@ function Request-PublishQueued {
         }
     }
 
-    $logPath = Join-Path $dir 'publish-order.log'
-    $pos = 0
-    $stamp = [datetime]::MinValue
-    $anterior = ''
-    $limite = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $limite) {
-        $r = Get-DeployResult -RunId $item.runId -DataDir $dir
-        $estado = if ($r) { [string]$r.status } else { '' }
-
-        if ($estado -eq 'queued' -and $estado -ne $anterior -and -not $Quiet) {
-            Write-Host "  esperando turno (posición $($r.position))..." -ForegroundColor DarkGray
-        }
-        if ($estado -eq 'running' -and -not $Quiet) {
-            $pos = Write-PublishLogTail -Path $logPath -Position $pos -Stamp ([ref]$stamp)
-        }
-        if ($estado -in @('ok', 'error')) {
-            if (-not $Quiet) { $pos = Write-PublishLogTail -Path $logPath -Position $pos -Stamp ([ref]$stamp) }
-            $color = if ($estado -eq 'ok') { 'Green' } else { 'Red' }
-            Write-Host "RESULT: $estado $($r.message)" -ForegroundColor $color
-            return $r
-        }
-        $anterior = $estado
-        Start-Sleep -Seconds $PollSeconds
-    }
-    throw "Tiempo agotado ($TimeoutSeconds s) esperando el resultado de la orden $($item.runId). Mira la cola con Get-DeployQueue."
+    Wait-DeployQueueItem -RunId $item.runId -DataDir $dir -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -Quiet:$Quiet
 }
 
 function Request-Publish {
@@ -1876,15 +2264,26 @@ function Add-DeployQueueItem {
         # environments.json solo por pasar por la cola.
         [string]$EnvironmentFile,
         $EnvironmentDef,
-        # 'publish' (entorno + rama) o 'update' (actualizar el módulo del
-        # servidor; sin entorno ni rama). Van por la MISMA cola: así nunca se
-        # actualiza el módulo a mitad de una publicación.
-        [ValidateSet('publish', 'update')][string]$Kind = 'publish'
+        # 'publish' (entorno + rama), 'update' (actualizar el módulo del
+        # servidor; sin entorno ni rama) o 'dbrefresh' (refrescar la BD de un
+        # entorno). Van por la MISMA cola: así nunca se actualiza el módulo ni se
+        # truncan tablas a mitad de una publicación.
+        [ValidateSet('publish', 'update', 'dbrefresh')][string]$Kind = 'publish',
+        # Solo kind=dbrefresh: buzón de la sanitización y tablas concretas.
+        [string]$TestEmail,
+        [string[]]$Tables
     )
     $ErrorActionPreference = 'Stop'
 
     $envDef = $null
-    if ($Kind -eq 'publish') {
+    $refresh = $null
+    if ($Kind -eq 'dbrefresh') {
+        $refresh = New-DbRefreshOrderBody -Environment $Environment -TestEmail $TestEmail -Tables $Tables `
+            -Execute:$Execute -AllowedEnvironments $AllowedEnvironments -RunId $RunId -RequestedBy $RequestedBy
+        $Branch = ''
+        $OverrideWebconfig = $false
+    }
+    elseif ($Kind -eq 'publish') {
         if ($EnvironmentFile) { $envDef = Read-AdHocEnvironment -Path $EnvironmentFile }
         elseif ($EnvironmentDef) { $envDef = Read-AdHocEnvironment -Definition $EnvironmentDef }
 
@@ -1940,6 +2339,7 @@ function Add-DeployQueueItem {
         requestedBy       = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
     }
     if ($envDef) { $item.environmentDef = $envDef }
+    if ($refresh) { $item.testEmail = $refresh.testEmail; $item.tables = $refresh.tables }
     [pscustomobject]$item | ConvertTo-Json -Compress -Depth 6 | Set-Content $file -Encoding UTF8
 
     [pscustomobject]@{ runId = $RunId; position = $ahead + 1; path = $file }
@@ -2052,6 +2452,13 @@ function Invoke-DeployQueueDrain {
             if ($kind -eq 'update') {
                 $res = Request-ModuleUpdate -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
             }
+            elseif ($kind -eq 'dbrefresh') {
+                # Un refresco copia la BD entera desde la réplica: su espera no
+                # puede ser la de una publicación.
+                $res = Request-DbRefresh -Environment ([string]$order.environment) -TestEmail ([string]$order.testEmail) `
+                    -Tables @($order.tables | Where-Object { $_ }) -Execute:([bool]$order.execute) -Direct `
+                    -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds ([Math]::Max($TimeoutSeconds, 7200)) -Quiet
+            }
             else {
                 # Un entorno ad hoc viaja como definición dentro del item; se
                 # vuelca a un fichero temporal para entrar por el mismo
@@ -2113,7 +2520,9 @@ function Invoke-DeployEndpointRequest {
         el drenador la publica cuando le toca · POST /api/update {requestedBy} →
         202 con runId; encola la actualización del propio módulo (git pull +
         reinstalar + reiniciar el listener), por la MISMA cola que los publish ·
-        GET /api/version (versión, commit y rama del código que sirve el endpoint) ·
+        POST /api/dbrefresh {environment, testEmail, tables, execute} → 202 con
+        runId; encola el refresco de la BD del entorno desde la réplica, con
+        sanitización (Invoke-DbRefreshOrder) · GET /api/version (versión, commit y rama del código que sirve el endpoint) ·
         GET /api/result?runId=... (queued / running / ok / error) · GET /api/queue
         (cola pendiente) · GET /api/log (cola del transcript de la publicación en curso).
     #>
@@ -2170,6 +2579,31 @@ function Invoke-DeployEndpointRequest {
         return [pscustomobject]@{ status = 202; body = @{
             status = 'queued'; kind = 'update'; runId = $item.runId; position = $item.position
             current = (Get-PublishToIISVersionInfo)
+            result = "/api/result?runId=$($item.runId)"
+        } }
+    }
+
+    if ($Method -eq 'POST' -and $Path -eq '/api/dbrefresh') {
+        try { $req = $Body | ConvertFrom-Json }
+        catch { return [pscustomobject]@{ status = 400; body = @{ error = 'Cuerpo JSON inválido.' } } }
+        if (-not $req -or -not $req.environment) {
+            return [pscustomobject]@{ status = 400; body = @{ error = "Falta 'environment' en la orden de refresco." } }
+        }
+        # Mismo criterio que /api/publish: solo un booleano JSON de verdad ejecuta.
+        $execute = ($req.execute -is [bool]) -and $req.execute
+        $requestedBy = (([string]$req.requestedBy) -replace '[^\p{L}\p{N}_.@\\\- ]', '').Trim()
+        if ($requestedBy.Length -gt 128) { $requestedBy = $requestedBy.Substring(0, 128) }
+        try {
+            $item = Add-DeployQueueItem -Kind dbrefresh -Environment ([string]$req.environment) `
+                -TestEmail ([string]$req.testEmail) -Tables @($req.tables | ForEach-Object { [string]$_ }) `
+                -Execute:$execute -RequestedBy $requestedBy -DataDir $dir
+        }
+        catch {
+            return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
+        }
+        return [pscustomobject]@{ status = 202; body = @{
+            status = 'queued'; kind = 'dbrefresh'; runId = $item.runId; position = $item.position
+            environment = [string]$req.environment; execute = $execute
             result = "/api/result?runId=$($item.runId)"
         } }
     }
@@ -2504,12 +2938,24 @@ function Request-RemotePublish {
     Write-Host "Orden encolada (runId $($trig.runId))$pos. La publicación corre en el servidor." -ForegroundColor Gray
     if ($NoWait) { return $trig }
 
+    Wait-RemoteResult -Url $Url -Headers $headers -RunId $trig.runId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+}
+
+function Wait-RemoteResult {
+    # Sondea /api/result de un endpoint remoto hasta ok/error.
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string]$RunId,
+        [int]$TimeoutSeconds = 1200,
+        [int]$PollSeconds = 5
+    )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastStatus = ''
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds $PollSeconds
         try {
-            $result = Invoke-RestMethod -Method Get -Uri "$Url/api/result?runId=$($trig.runId)" -Headers $headers
+            $result = Invoke-RestMethod -Method Get -Uri "$Url/api/result?runId=$RunId" -Headers $Headers
         }
         catch { continue } # un poll fallido (red, proxy reciclando) no aborta la espera
         if ($result.status -eq 'ok' -or $result.status -eq 'error') {
@@ -2524,7 +2970,70 @@ function Request-RemotePublish {
             Write-Host "  ...$($result.status)$detalle" -ForegroundColor DarkGray
         }
     }
-    throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $($trig.runId)). Mira $Url/api/log con el token."
+    throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $RunId). Mira $Url/api/log con el token."
+}
+
+function Request-RemoteDbRefresh {
+    <#
+    .SYNOPSIS
+        Refresca la BD de un entorno de test de un servidor remoto (réplica -> test + sanitización de correos y contraseñas).
+
+    .DESCRIPTION
+        POST a /api/dbrefresh del endpoint: el servidor encola el refresco en la
+        misma cola FIFO que las publicaciones y la tarea elevada ejecuta
+        Invoke-DbRefreshOrder (el tools\db-refresh\Sync-TestDatabase.ps1 del
+        checkout del entorno contra la BD del Web.config del site). Sin -Execute
+        es un DRY-RUN que valida conexión con réplica y destino y deja el plan en
+        el log. Con -ShowLog, al terminar trae la cola del transcript (/api/log),
+        que es donde está el plan de tablas y el detalle de cada fase.
+
+    .EXAMPLE
+        Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -TestEmail it@economitza.com -ShowLog
+
+    .EXAMPLE
+        Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -TestEmail it@economitza.com -Execute
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Server,
+        [string]$Url,
+        [string]$Token,
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$TestEmail,
+        [string[]]$Tables,
+        [switch]$Execute,
+        [switch]$NoWait,
+        [switch]$ShowLog,
+        [int]$TimeoutSeconds = 7200,
+        [int]$PollSeconds = 10,
+        [string]$RequestedBy = (Get-RequesterIdentity)
+    )
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    $Tables = @($Tables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $payload = [pscustomobject]@{
+        environment = $Environment; testEmail = $TestEmail; tables = $Tables
+        execute = [bool]$Execute; requestedBy = $RequestedBy
+    } | ConvertTo-Json -Compress
+    try {
+        $trig = Invoke-RestMethod -Method Post -Uri "$($ep.url)/api/dbrefresh" -Headers $ep.headers `
+            -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($payload))
+    }
+    catch {
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "El endpoint rechazó el refresco: $detail (¿el servidor corre una versión sin /api/dbrefresh? Request-RemoteUpdate primero)."
+    }
+    $pos = if ($trig.position -gt 1) { " (posición $($trig.position) en la cola)" } else { '' }
+    $modo = if ($Execute) { 'EXECUTE' } else { 'DRY-RUN' }
+    Write-Host "Refresco de BD de $Environment encolado en $modo (runId $($trig.runId))$pos." -ForegroundColor Gray
+    if ($NoWait) { return $trig }
+
+    $result = Wait-RemoteResult -Url $ep.url -Headers $ep.headers -RunId $trig.runId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+    if ($ShowLog) {
+        try { Invoke-RestMethod -Method Get -Uri "$($ep.url)/api/log" -Headers $ep.headers | Write-Host }
+        catch { Write-Warning "No se pudo leer /api/log: $($_.Exception.Message)" }
+    }
+    return $result
 }
 
 function Resolve-RemoteEndpoint {
@@ -3778,4 +4287,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh -Alias Publish-Update

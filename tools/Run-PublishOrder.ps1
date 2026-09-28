@@ -3,7 +3,8 @@
 # (la renombra a .consumed para que un /run accidental no re-publique) y
 # ejecuta Invoke-DeployOrder; si la orden es kind=update, en vez de publicar
 # actualiza el propio módulo (Update-PublishToIIS) y reinicia el listener del
-# endpoint para que cargue el código nuevo.
+# endpoint para que cargue el código nuevo; si es kind=dbrefresh, refresca la BD
+# del entorno desde la réplica con Invoke-DbRefreshOrder.
 #
 # Deja dos rastros para quien la disparó SIN privilegios (Request-Publish, el
 # dashboard o el job de CI), que no ve la consola de la tarea:
@@ -69,6 +70,15 @@ try {
         Write-Host 'RESULT: OK'
         Write-Result -Status 'ok' -Message "Módulo actualizado en $env:COMPUTERNAME: $antes -> $despues ($commit). El listener del endpoint se reinicia para cargar el código nuevo."
         $restartEndpoint = $true
+    }
+    elseif ($order.kind -eq 'dbrefresh') {
+        $plan = Invoke-DbRefreshOrder -Environment $order.environment -TestEmail $order.testEmail `
+            -Tables $order.tables -Execute:([bool]$order.execute) -RequestedBy $order.requestedBy
+        $sitios = ($plan.sites | ForEach-Object { $_.environment }) -join ', '
+        Write-Host 'RESULT: OK'
+        $done = if ($order.execute) { "BD $($plan.database) de $($order.environment) refrescada y sanitizada (correo a $($plan.testEmail)) en $($plan.elapsed); sites parados durante el refresco: $sitios." }
+                else { "DRY-RUN: plan de refresco de $($plan.database) ($($plan.dataSource)) para $($order.environment); sites que comparten la BD: $sitios. El plan de tablas está en el log." }
+        Write-Result -Status 'ok' -Message $done
     }
     else {
         $deployArgs = @{

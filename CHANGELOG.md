@@ -6,6 +6,22 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.8.0] - 2026-09-28
+
+### Added
+- **Refresco de la BD de un entorno de test desde el publicador** (`kind=dbrefresh`):
+  `Request-RemoteDbRefresh` / `Request-DbRefresh` (dry-run por defecto, `-Execute`
+  para aplicar) llaman al `tools\db-refresh\Sync-TestDatabase.ps1` del checkout del
+  entorno contra la BD que leen del `Web.config` del site: sincroniza desde la
+  réplica y sanitiza correos y contraseñas. Va por la misma cola FIFO que las
+  publicaciones y por `POST /api/dbrefresh`, y para durante el refresco los app
+  pools de todos los sites del servidor que comparten esa BD.
+
+### Changed
+- La espera de una orden encolada (`Wait-DeployQueueItem`) y la de una orden
+  remota (`Wait-RemoteResult`) salen a funciones propias, compartidas por
+  publicaciones y refrescos.
+
 ## [0.7.0] - 2026-09-20
 
 ### Changed

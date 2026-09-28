@@ -1183,6 +1183,171 @@ Describe 'Órdenes de actualización del módulo (kind=update)' {
     }
 }
 
+Describe 'Refresco de BD (kind=dbrefresh)' {
+    BeforeEach {
+        $script:root = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_db_" + [Guid]::NewGuid())
+        $script:dataDir = Join-Path $script:root 'data'
+        $script:repo = Join-Path $script:root 'repo'
+        New-Item -ItemType Directory -Path $script:dataDir, (Join-Path $script:repo 'CentralCompres'), (Join-Path $script:repo 'tools\db-refresh') -Force | Out-Null
+        Set-Content (Join-Path $script:repo 'tools\db-refresh\Sync-TestDatabase.ps1') 'exit 0'
+        Set-Content (Join-Path $script:repo 'tools\db-refresh\replica.connection.json') '{}'
+
+        function New-TestSite([string]$Name, [string]$ConnectionString, [switch]$ConfigSource) {
+            $dir = Join-Path $script:root $Name
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $add = "<add name=`"centralcompresConnectionString`" connectionString=`"$ConnectionString`" providerName=`"System.Data.SqlClient`" />"
+            if ($ConfigSource) {
+                "<configuration><connectionStrings configSource=`"connections.config`" /></configuration>" | Set-Content (Join-Path $dir 'Web.config')
+                "<connectionStrings>$add</connectionStrings>" | Set-Content (Join-Path $dir 'connections.config')
+            }
+            else {
+                "<configuration><connectionStrings>$add</connectionStrings></configuration>" | Set-Content (Join-Path $dir 'Web.config')
+            }
+            $dir
+        }
+        $script:esp1 = New-TestSite 'esp1' 'Data Source=localhost;Initial Catalog=CCEspana;Integrated Security=True' -ConfigSource
+        $script:esp3 = New-TestSite 'esp3' "Data Source=$env:COMPUTERNAME;Initial Catalog=ccespana;Integrated Security=True"
+        $script:esp2 = New-TestSite 'esp2' 'Data Source=localhost;Initial Catalog=CCEspana_esp2;Integrated Security=True'
+        $script:cfg = [pscustomobject]@{ server = 's76'; origin = (Join-Path $script:repo 'CentralCompres'); destination = $script:esp1; siteUrl = 'https://esp1.test' }
+        $script:otros = @{
+            devecoesp3 = [pscustomobject]@{ server = 's76'; destination = $script:esp3; appPool = 'pool3'; siteUrl = 'https://esp3.test' }
+            devecoesp2 = [pscustomobject]@{ server = 's76'; destination = $script:esp2 }
+            otroserver = [pscustomobject]@{ server = 'otro'; destination = $script:esp3 }
+        }
+    }
+    AfterEach { Remove-Item $script:root -Recurse -Force -ErrorAction SilentlyContinue }
+
+    Context 'plan' {
+        It 'lee la BD del Web.config del site (siguiendo configSource) y para también los sites del mismo servidor que la comparten' {
+            $p = Resolve-DbRefreshPlan -Environment devecoesp1 -TestEmail 'it@economitza.com' -Config $script:cfg -OtherEnvironments $script:otros -DataDir $script:dataDir
+            $p.database | Should -Be 'CCEspana'
+            $p.webConfig | Should -Be (Join-Path $script:esp1 'Web.config')
+            $p.script | Should -Be (Join-Path $script:repo 'tools\db-refresh\Sync-TestDatabase.ps1')
+            $p.replicaCredentials | Should -Be (Join-Path $script:repo 'tools\db-refresh\replica.connection.json')
+            # localhost y el nombre de la máquina son la misma instancia; otra BD u otro servidor, no
+            @($p.sites.environment) | Should -Be @('devecoesp1', 'devecoesp3')
+            @($p.sites.appPool) | Should -Be @('devecoesp1', 'pool3')
+        }
+
+        It 'toma el buzón del entorno si no se pasa, y sin ninguno se niega' {
+            $cfg = $script:cfg | Select-Object *; $cfg | Add-Member testEmail 'test@economitza.com'
+            (Resolve-DbRefreshPlan -Environment devecoesp1 -Config $cfg -OtherEnvironments @{} -DataDir $script:dataDir).testEmail | Should -Be 'test@economitza.com'
+            { Resolve-DbRefreshPlan -Environment devecoesp1 -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir } | Should -Throw '*TestEmail*'
+        }
+
+        It 'sin credenciales en el checkout usa las de la carpeta de datos, y sin ninguna se niega' {
+            Remove-Item (Join-Path $script:repo 'tools\db-refresh\replica.connection.json')
+            { Resolve-DbRefreshPlan -Environment devecoesp1 -TestEmail 'it@economitza.com' -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir } | Should -Throw '*credenciales de la réplica*'
+            Set-Content (Join-Path $script:dataDir 'replica.connection.json') '{}'
+            (Resolve-DbRefreshPlan -Environment devecoesp1 -TestEmail 'it@economitza.com' -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir).replicaCredentials |
+                Should -Be (Join-Path $script:dataDir 'replica.connection.json')
+        }
+
+        It 'rechaza tablas con nombres raros, un checkout sin el script y un entorno fuera de la lista blanca' {
+            { Resolve-DbRefreshPlan -Environment devecoesp1 -TestEmail 'it@economitza.com' -Tables 'Articles;DROP' -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir } | Should -Throw '*tabla inválido*'
+            { Resolve-DbRefreshPlan -Environment prod -TestEmail 'it@economitza.com' } | Should -Throw '*no permitido*'
+            Remove-Item (Join-Path $script:repo 'tools\db-refresh\Sync-TestDatabase.ps1')
+            { Resolve-DbRefreshPlan -Environment devecoesp1 -TestEmail 'it@economitza.com' -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir } | Should -Throw '*Sync-TestDatabase.ps1*'
+        }
+    }
+
+    Context 'ejecución' {
+        It 'en dry-run llama al script sin -Execute, con el Web.config del site, y no para ningún pool' {
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
+            Mock -ModuleName PublishToIIS Stop-IISAppPool { }
+            $p = Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Tables 'Articles,Families' `
+                -Config $script:cfg -OtherEnvironments $script:otros -DataDir $script:dataDir 6>$null
+            $p.mode | Should -Be 'DRY-RUN'
+            $esperado = Join-Path $script:esp1 'Web.config'
+            Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 1 -ParameterFilter {
+                ($Arguments -join ' ') -like "*-ConnectionsConfig $esperado*" -and
+                ($Arguments -join ' ') -like '*-Tables Articles,Families*' -and $Arguments -notcontains '-Execute'
+            }
+            Should -Invoke -ModuleName PublishToIIS Stop-IISAppPool -Times 0
+        }
+
+        It 'con -Execute para y arranca los pools de todos los sites de la BD aunque el script falle' {
+            Mock -ModuleName PublishToIIS Test-ProcessElevated { $true }
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 1 }
+            Mock -ModuleName PublishToIIS Stop-IISAppPool { }
+            Mock -ModuleName PublishToIIS Start-IISAppPool { }
+            Mock -ModuleName PublishToIIS Invoke-SiteWarmup { }
+            { Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute `
+                -Config $script:cfg -OtherEnvironments $script:otros -DataDir $script:dataDir 6>$null } | Should -Throw '*código 1*'
+            Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 1 -ParameterFilter { $Arguments -contains '-Execute' }
+            Should -Invoke -ModuleName PublishToIIS Stop-IISAppPool -Times 2
+            Should -Invoke -ModuleName PublishToIIS Start-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'devecoesp1' }
+            Should -Invoke -ModuleName PublishToIIS Start-IISAppPool -Times 1 -ParameterFilter { $Name -eq 'pool3' }
+        }
+
+        It 'con -Execute y sin elevación no toca nada' {
+            Mock -ModuleName PublishToIIS Test-ProcessElevated { $false }
+            Mock -ModuleName PublishToIIS Invoke-DbRefreshScript { 0 }
+            { Invoke-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute `
+                -Config $script:cfg -OtherEnvironments @{} -DataDir $script:dataDir 6>$null } | Should -Throw '*elevado*'
+            Should -Invoke -ModuleName PublishToIIS Invoke-DbRefreshScript -Times 0
+        }
+    }
+
+    Context 'órdenes, cola y endpoint' {
+        It 'Write-DbRefreshOrder escribe kind=dbrefresh y Read-PublishOrder la lee sin exigir rama' {
+            $o = Write-DbRefreshOrder -Environment devecoesp1 -TestEmail 'it@economitza.com' -Tables 'A,B' -Execute -DataDir $script:dataDir -RequestedBy 'PC\ana'
+            $l = Read-PublishOrder -Path $o.path
+            $l.kind | Should -Be 'dbrefresh'
+            $l.environment | Should -Be 'devecoesp1'
+            $l.testEmail | Should -Be 'it@economitza.com'
+            @($l.tables) | Should -Be @('A', 'B')
+            $l.execute | Should -BeTrue
+            $l.runId | Should -Be $o.runId
+        }
+
+        It 'la cola valida entorno, correo y tablas antes de encolar' {
+            { Add-DeployQueueItem -Kind dbrefresh -DataDir $script:dataDir } | Should -Throw "*'environment'*"
+            { Add-DeployQueueItem -Kind dbrefresh -Environment prod -DataDir $script:dataDir } | Should -Throw '*no permitido*'
+            { Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -TestEmail 'no-es-correo' -DataDir $script:dataDir } | Should -Throw '*TestEmail*'
+            { Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -Tables 'x y' -DataDir $script:dataDir } | Should -Throw '*tabla*'
+            $item = Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -TestEmail 'it@economitza.com' -Tables 'A' -DataDir $script:dataDir
+            $q = @(Get-DeployQueue -DataDir $script:dataDir)
+            $q[0].kind | Should -Be 'dbrefresh'
+            $raw = Get-Content $item.path -Raw | ConvertFrom-Json
+            $raw.testEmail | Should -Be 'it@economitza.com'
+            @($raw.tables) | Should -Be @('A')
+        }
+
+        It 'el drenador despacha el refresco a Request-DbRefresh directo y con espera larga' {
+            Mock -ModuleName PublishToIIS Request-DbRefresh { [pscustomobject]@{ status = 'ok'; message = 'refrescada' } }
+            $id = (Add-DeployQueueItem -Kind dbrefresh -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute -DataDir $script:dataDir).runId
+            Invoke-DeployQueueDrain -DataDir $script:dataDir | Should -Be 1
+            Should -Invoke -ModuleName PublishToIIS Request-DbRefresh -Times 1 -ParameterFilter {
+                $Direct -and $Execute -and $Environment -eq 'devecoesp1' -and $TestEmail -eq 'it@economitza.com' -and $TimeoutSeconds -ge 7200
+            }
+            $r = Get-DeployResult -RunId $id -DataDir $script:dataDir
+            $r.kind | Should -Be 'dbrefresh'
+            $r.message | Should -Be 'refrescada'
+        }
+
+        It 'POST /api/dbrefresh encola (202) y solo un booleano JSON de verdad ejecuta' {
+            $t = 'c' * 64
+            $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir `
+                -Body '{"environment":"devecoesp1","testEmail":"it@economitza.com","tables":["A"],"execute":"true"}'
+            $r.status | Should -Be 202
+            $r.body.kind | Should -Be 'dbrefresh'
+            $r.body.execute | Should -BeFalse
+            (Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir -Body '{}').status | Should -Be 400
+            (Invoke-DeployEndpointRequest -Method POST -Path '/api/dbrefresh' -Token $t -ExpectedToken $t -DataDir $script:dataDir -Body '{"environment":"prod"}').status | Should -Be 400
+        }
+
+        It 'Request-RemoteDbRefresh hace POST a /api/dbrefresh con el cuerpo de la orden' {
+            Mock -ModuleName PublishToIIS Invoke-RestMethod { [pscustomobject]@{ runId = 'd1'; position = 1 } }
+            (Request-RemoteDbRefresh -Url 'http://ep.test' -Token 't' -Environment devecoesp1 -TestEmail 'it@economitza.com' -Execute -NoWait 6>$null).runId | Should -Be 'd1'
+            Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+                $b = [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json
+                $Uri -eq 'http://ep.test/api/dbrefresh' -and $b.environment -eq 'devecoesp1' -and $b.execute -eq $true -and $b.testEmail -eq 'it@economitza.com'
+            }
+        }
+    }
+}
+
 Describe 'Get-SiteDeployInfo' {
     It 'devuelve null si el site no tiene sello' {
         Get-SiteDeployInfo -Destination $TestDrive | Should -BeNullOrEmpty

@@ -137,6 +137,37 @@ Uso rápido:
   5.1 es quien ejecuta `Install.ps1` y el registro de la tarea. Hay dos pruebas
   en `tests/` que fallan si aparece un fichero sin BOM o con mojibake ya escrito.
 
+## Refrescar la BD de un entorno de test
+
+`Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -TestEmail it@economitza.com`
+(o `Request-DbRefresh` en la propia máquina) copia a la BD del entorno los datos
+de la réplica de producción y la sanitiza: todo el correo de negocio pasa a
+`-TestEmail` y las contraseñas a la de test. Sin `-Execute` es un **dry-run** que
+inventaría réplica y destino (valida conexión y credenciales) y deja el plan de
+tablas en el log; `-ShowLog` lo trae al terminar. Con `-Execute` lo aplica.
+
+El publicador no refresca nada por sí mismo: orquesta el
+`tools\db-refresh\Sync-TestDatabase.ps1` del propio repo del site, que es quien
+sabe de esquema, exclusiones y sanitización (y se niega a refrescar sin ella).
+Lo que resuelve el publicador (`Resolve-DbRefreshPlan`):
+
+- **Destino**: la `centralcompresConnectionString` del `Web.config` del site
+  publicado (siguiendo `configSource`). Nunca se escribe a mano.
+- **Script**: el del checkout de origen del entorno (el que se publica).
+- **Credenciales de la réplica**: `tools\db-refresh\replica.connection.json` del
+  checkout o, si no está, `%ProgramData%\PublishToIIS\replica.connection.json`.
+  Fuera de git: se copian una vez a mano en cada servidor.
+- **Sites a parar**: el del entorno y cualquier otro del mismo servidor cuyo
+  `Web.config` apunte a la misma BD, porque el refresco trunca tablas por debajo
+  de todos ellos. Se vuelven a arrancar aunque el refresco falle, y se calientan.
+
+La orden va por la misma cola FIFO que las publicaciones (`kind=dbrefresh`,
+`POST /api/dbrefresh`), así que nunca coincide con un publish en el mismo
+servidor. Solo entornos de la lista blanca (nunca `prod`/`staging` ni ad hoc) y,
+además, las guardas del script: servidor de destino en `allowedTargetServers` y
+jamás la propia réplica. `-TestEmail` es obligatorio salvo que el entorno
+declare `testEmail` en `environments.json`.
+
 ## Hotfix en caliente (iterar sin republicar)
 
 `Publish` reconstruye el site entero y lo activa con un swap de carpetas: es lo
