@@ -43,6 +43,14 @@
       "templateSite": "devecoesp2",
       "responsable": "Marc"
     },
+    "devecoesp-audit": {
+      "server": "deployments-76",
+      "origin": "E:\\git\\central-de-compres\\CentralCompres",
+      "destination": "E:\\wwwrootDevecoEspAudit",
+      "siteUrl": "https://devecoesp-audit.economitza.com",
+      "templateSite": "devecoesp1",
+      "responsable": "Joaquim"
+    },
     "devecoand2": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
