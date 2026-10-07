@@ -6,6 +6,15 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.10.0] - 2026-10-07
+
+### Fixed
+- **El web.config preservado lleva el `<runtime>` del build**: las redirecciones de
+  ensamblados y los ensamblados de compilacion de las vistas dependen de las DLL que
+  se publican, no del entorno. Conservarlas del servidor dejaba el site con un
+  `FileLoadException` (System.Memory 4.0.1.1 al exportar a Excel) en cuanto el build
+  subia de version una DLL. El resto del web.config del servidor se sigue conservando.
+
 ## [0.9.0] - 2026-09-28
 
 ### Added

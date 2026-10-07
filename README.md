@@ -25,6 +25,12 @@ Uso rápido:
   Con -OverrideWebconfig el web.config del servidor queda guardado al lado como
   `web.config.previous` para poder comparar o restaurar.
 
+  Al preservar, lo que depende de los binarios del build viaja con el build: el
+  `<runtime>` (redirecciones de ensamblados) y los `system.web/compilation/assemblies`
+  que le falten al del servidor. El resto (appSettings, conexiones, customErrors...)
+  es del servidor. Sin esto, un build que cambia de version una DLL rompia el site
+  hasta editar su web.config a mano (System.Memory de NPOI 2.7.6, 05 y 07/10/2026).
+
 - Sello de versión: cada Publish escribe `deploy-info.json` (rama, commit, fechas,
   entorno, quién publica) en la raíz del site — consultable en `GET /deploy-info.json`.
   También invocable a mano: `New-DeployInfo -ProjectPath <workingCopy> -OutputDir <dir> -Environment <env>`

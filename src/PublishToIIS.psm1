@@ -128,8 +128,77 @@ function Protect-ProductionWebConfig {
         return 'overridden'
     }
 
+    $buildBound = Get-BuildBoundWebConfigMerge -ServerWebConfig $TargetWebConfig -BuildWebConfig $ReleasingWebConfig
+    if ($buildBound) {
+        $buildBound.Document.Save($ReleasingWebConfig)
+        if ($buildBound.Changes) { Write-Host "web.config del servidor conservado; del build: $($buildBound.Changes -join ', ')" }
+        return 'preserved'
+    }
+
     Copy-Item $TargetWebConfig $ReleasingWebConfig -Force
     return 'preserved'
+}
+
+function Get-BuildBoundWebConfigMerge {
+    <#
+    .SYNOPSIS
+        El web.config del servidor con lo que depende de los binarios del build.
+
+    .DESCRIPTION
+        Las redirecciones de ensamblados (<runtime>) y los ensamblados con los que se compilan las
+        vistas (system.web/compilation/assemblies) van ligados a las DLL que trae el build, no al
+        entorno. Conservarlos del servidor rompia el site en cuanto el build cambiaba la version de
+        una DLL (System.Memory de NPOI 2.7.6: FileLoadException al exportar a Excel). Se toma el
+        web.config del servidor y se le pone el <runtime> del build (si lo trae) y los ensamblados de
+        compilacion que le falten. Devuelve $null si alguno de los dos no es un <configuration>
+        (connections.config, ficheros vacios): entonces se copia el del servidor tal cual.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServerWebConfig,
+        [Parameter(Mandatory)][string]$BuildWebConfig
+    )
+
+    $server = New-Object System.Xml.XmlDocument
+    $build = New-Object System.Xml.XmlDocument
+    $server.PreserveWhitespace = $true
+    try {
+        $server.Load($ServerWebConfig)
+        $build.Load($BuildWebConfig)
+    }
+    catch { return $null }
+    if (-not $server.DocumentElement -or $server.DocumentElement.Name -ne 'configuration' -or
+        -not $build.DocumentElement -or $build.DocumentElement.Name -ne 'configuration') { return $null }
+
+    $changes = @()
+
+    $buildRuntime = $build.SelectSingleNode('/configuration/runtime')
+    if ($buildRuntime) {
+        $imported = $server.ImportNode($buildRuntime, $true)
+        $serverRuntime = $server.SelectSingleNode('/configuration/runtime')
+        if ($serverRuntime) {
+            if ($serverRuntime.OuterXml -ne $imported.OuterXml) { $changes += '<runtime>' }
+            $null = $server.DocumentElement.ReplaceChild($imported, $serverRuntime)
+        }
+        else {
+            $null = $server.DocumentElement.AppendChild($imported)
+            $changes += '<runtime>'
+        }
+    }
+
+    $buildAssemblies = $build.SelectNodes('/configuration/system.web/compilation/assemblies/add')
+    $serverAssemblies = $server.SelectSingleNode('/configuration/system.web/compilation/assemblies')
+    if ($buildAssemblies.Count -and $serverAssemblies) {
+        $present = @{}
+        foreach ($add in $serverAssemblies.SelectNodes('add')) { $present[$add.GetAttribute('assembly')] = $true }
+        foreach ($add in $buildAssemblies) {
+            $name = $add.GetAttribute('assembly')
+            if ($present.ContainsKey($name)) { continue }
+            $null = $serverAssemblies.AppendChild($server.ImportNode($add, $true))
+            $changes += "compilation: $(($name -split ',')[0])"
+        }
+    }
+
+    [pscustomobject]@{ Document = $server; Changes = $changes }
 }
 
 # ─── Aprovisionamiento de sites IIS desde una plantilla ─────────────────────

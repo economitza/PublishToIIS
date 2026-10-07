@@ -920,6 +920,105 @@ Describe 'Protect-ProductionWebConfig' {
     }
 }
 
+Describe 'Protect-ProductionWebConfig: lo ligado a los binarios viaja con el build' {
+    # Las redirecciones de ensamblados (<runtime>) y los ensamblados de compilacion de Razor
+    # dependen de las DLL del build, no del entorno: conservarlas del servidor rompia el site
+    # cada vez que el build cambiaba de version una DLL (System.Memory de NPOI 2.7.6, 07/10/2026).
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:tmp | Out-Null
+        $script:targetCfg = Join-Path $script:tmp 'target_web.config'
+        $script:releasingCfg = Join-Path $script:tmp 'releasing_web.config'
+        Set-Content $script:targetCfg -Encoding UTF8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <appSettings>
+    <add key="UrlApiEconomitza" value="https://servidor.example/" />
+  </appSettings>
+  <system.web>
+    <compilation debug="false" targetFramework="4.8">
+      <assemblies>
+        <add assembly="System.Web.Abstractions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31BF3856AD364E35" />
+      </assemblies>
+    </compilation>
+  </system.web>
+  <runtime>
+    <assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+      <dependentAssembly>
+        <assemblyIdentity name="System.Memory" publicKeyToken="cc7b13ffcd2ddd51" culture="neutral" />
+        <bindingRedirect oldVersion="0.0.0.0-4.0.1.1" newVersion="4.0.1.1" />
+      </dependentAssembly>
+    </assemblyBinding>
+  </runtime>
+</configuration>
+'@
+        Set-Content $script:releasingCfg -Encoding UTF8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <appSettings>
+    <add key="UrlApiEconomitza" value="https://repo.example/" />
+  </appSettings>
+  <system.web>
+    <compilation debug="true" targetFramework="4.8">
+      <assemblies>
+        <add assembly="System.Web.Abstractions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31BF3856AD364E35" />
+        <add assembly="netstandard, Version=2.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51" />
+      </assemblies>
+    </compilation>
+  </system.web>
+  <runtime>
+    <assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+      <dependentAssembly>
+        <assemblyIdentity name="System.Memory" publicKeyToken="cc7b13ffcd2ddd51" culture="neutral" />
+        <bindingRedirect oldVersion="0.0.0.0-4.0.1.2" newVersion="4.0.1.2" />
+      </dependentAssembly>
+    </assemblyBinding>
+  </runtime>
+</configuration>
+'@
+    }
+
+    AfterEach {
+        Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'conserva la configuracion del servidor y toma <runtime> del build' {
+        $result = Protect-ProductionWebConfig -TargetWebConfig $script:targetCfg -ReleasingWebConfig $script:releasingCfg
+        $result | Should -Be 'preserved'
+        [xml]$merged = Get-Content $script:releasingCfg -Raw
+        $merged.configuration.appSettings.add.value | Should -Be 'https://servidor.example/'
+        $merged.configuration.'system.web'.compilation.debug | Should -Be 'false'
+        $merged.configuration.runtime.assemblyBinding.dependentAssembly.bindingRedirect.newVersion | Should -Be '4.0.1.2'
+    }
+
+    It 'anade los ensamblados de compilacion que solo trae el build sin quitar los del servidor' {
+        Protect-ProductionWebConfig -TargetWebConfig $script:targetCfg -ReleasingWebConfig $script:releasingCfg | Out-Null
+        [xml]$merged = Get-Content $script:releasingCfg -Raw
+        $assemblies = @($merged.configuration.'system.web'.compilation.assemblies.add | ForEach-Object { $_.assembly })
+        $assemblies.Count | Should -Be 2
+        ($assemblies -like 'netstandard,*').Count | Should -Be 1
+    }
+
+    It 'pone el <runtime> del build aunque el servidor no tuviera ninguno' {
+        [xml]$server = Get-Content $script:targetCfg -Raw
+        $null = $server.configuration.RemoveChild($server.configuration.runtime)
+        $server.Save($script:targetCfg)
+        Protect-ProductionWebConfig -TargetWebConfig $script:targetCfg -ReleasingWebConfig $script:releasingCfg | Out-Null
+        [xml]$merged = Get-Content $script:releasingCfg -Raw
+        $merged.configuration.runtime.assemblyBinding.dependentAssembly.bindingRedirect.newVersion | Should -Be '4.0.1.2'
+        $merged.configuration.appSettings.add.value | Should -Be 'https://servidor.example/'
+    }
+
+    It 'deja el build como esta si el servidor no tiene <runtime> que sustituir ni el build lo trae' {
+        [xml]$build = Get-Content $script:releasingCfg -Raw
+        $null = $build.configuration.RemoveChild($build.configuration.runtime)
+        $build.Save($script:releasingCfg)
+        Protect-ProductionWebConfig -TargetWebConfig $script:targetCfg -ReleasingWebConfig $script:releasingCfg | Out-Null
+        [xml]$merged = Get-Content $script:releasingCfg -Raw
+        $merged.configuration.runtime.assemblyBinding.dependentAssembly.bindingRedirect.newVersion | Should -Be '4.0.1.1'
+    }
+}
+
 Describe 'Publish preserva connections.config como el web.config' {
     It 'Protect-ProductionWebConfig sirve para connections.config: preserva el del site sobre el del build' {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_conn_" + [Guid]::NewGuid())
