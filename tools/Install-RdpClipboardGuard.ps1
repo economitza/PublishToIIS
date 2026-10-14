@@ -23,9 +23,40 @@
 param(
     [string]$Dir = (Join-Path $env:ProgramData 'RdpClipboardGuard'),
     [string]$TaskName = 'RDP - Reiniciar portapapeles',
-    [string]$Hotkey = 'CTRL+ALT+V'
+    [string]$Hotkey = 'CTRL+ALT+V',
+    # Solo enseña el estado (rdpclip de cada sesión, directivas que apagan el portapapeles
+    # del escritorio remoto, la tarea y el portapapeles de esta sesión) sin cambiar nada.
+    [switch]$Diagnose
 )
 $ErrorActionPreference = 'Stop'
+
+if ($Diagnose) {
+    $sesion = (Get-Process -Id $PID).SessionId
+    Write-Host "Esta consola: $env:USERDOMAIN\$env:USERNAME, sesión $sesion" -ForegroundColor Cyan
+    Write-Host '-- rdpclip.exe --' -ForegroundColor Cyan
+    $clips = @(Get-CimInstance Win32_Process -Filter "Name='rdpclip.exe'")
+    if (-not $clips) { Write-Host '  NINGUNO: sin rdpclip no hay portapapeles compartido' -ForegroundColor Red }
+    foreach ($c in $clips) {
+        $o = Invoke-CimMethod -InputObject $c -MethodName GetOwner
+        Write-Host ("  pid {0}, sesión {1}, {2}\{3}, desde {4:HH:mm:ss}{5}" -f $c.ProcessId, $c.SessionId, $o.Domain, $o.User,
+            $c.CreationDate, $(if ($c.SessionId -eq $sesion) { '  <- la tuya' }))
+    }
+    Write-Host '-- directivas (1 = portapapeles del escritorio remoto apagado) --' -ForegroundColor Cyan
+    foreach ($k in 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services',
+                   'HKCU:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services',
+                   'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp') {
+        $p = Get-ItemProperty $k -ErrorAction SilentlyContinue
+        Write-Host ("  {0}: fDisableClip={1} fDisableCdm={2}" -f $k, $p.fDisableClip, $p.fDisableCdm)
+    }
+    Write-Host '-- tarea --' -ForegroundColor Cyan
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($info) { Write-Host ("  '{0}': última {1}, resultado 0x{2:X}" -f $TaskName, $info.LastRunTime, $info.LastTaskResult) }
+    else { Write-Host "  '$TaskName' no está registrada" }
+    Write-Host '-- portapapeles de esta sesión --' -ForegroundColor Cyan
+    $texto = Get-Clipboard -Raw -ErrorAction SilentlyContinue
+    Write-Host ("  {0}" -f $(if ($texto) { "hay texto: $($texto.Length) caracteres (no se enseña)" } else { 'vacío o sin texto' }))
+    return
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { throw 'Lánzalo en una consola elevada: registra una tarea para todos los usuarios y escribe en el escritorio público.' }
