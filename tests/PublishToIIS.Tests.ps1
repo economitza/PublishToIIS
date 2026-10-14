@@ -2723,3 +2723,20 @@ Describe 'Entornos aspnetcore (la API)' {
         $cfg.seedAppSettings.Queues.Environment | Should -Be 'deveco-api-marc'
     }
 }
+
+Describe 'Add-DeployInfoStaticRoute (aspnetcore)' {
+    It 'añade una sola vez la ruta estática de deploy-info.json y conserva el resto del web.config' {
+        $f = Join-Path $TestDrive 'web.config'
+        '<configuration><location path="." inheritInChildApplications="false"><system.webServer><handlers><add name="aspNetCore" path="*" verb="*" modules="AspNetCoreModuleV2" resourceType="Unspecified" /></handlers><aspNetCore processPath=".\api.exe" hostingModel="inprocess" /></system.webServer></location></configuration>' |
+            Set-Content $f -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ f = $f } {
+            Add-DeployInfoStaticRoute -WebConfigPath $f | Should -BeTrue
+            Add-DeployInfoStaticRoute -WebConfigPath $f | Should -BeFalse
+            [xml]$x = Get-Content $f -Raw
+            @($x.SelectNodes("/configuration/location[@path='deploy-info.json']")).Count | Should -Be 1
+            $x.SelectSingleNode("/configuration/location[@path='deploy-info.json']//handlers/add").modules | Should -Be 'StaticFileModule'
+            $x.SelectSingleNode("/configuration/location[@path='.']//aspNetCore").processPath | Should -Be '.\api.exe'
+            Add-DeployInfoStaticRoute -WebConfigPath (Join-Path $TestDrive 'no.config') | Should -BeFalse
+        }
+    }
+}

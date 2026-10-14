@@ -6,6 +6,16 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.12.6] - 2026-10-14
+
+### Added
+- **Los entornos aspnetcore sirven `/deploy-info.json` desde IIS**: el publish añade al
+  `web.config` una `<location>` que deja ese fichero al `StaticFileModule`. Antes solo lo
+  enseñaban las ramas de la API que ya traen su `DeployInfoController` (el de `main`), y
+  una rama más antigua daba 404 aunque el sello estuviera en el site.
+- `Install-AspNetCorePrereqs.ps1` clona por HTTPS con el token de GitLab (cabecera en la
+  config de ese clon, protegida) y lo lee del portapapeles; `Install-RdpClipboardGuard.ps1 -Diagnose`.
+
 ## [0.12.1] - 2026-10-14
 
 ### Added

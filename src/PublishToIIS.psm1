@@ -173,6 +173,33 @@ function Protect-SiteSettings {
     $preserved
 }
 
+function Add-DeployInfoStaticRoute {
+    <#
+    .SYNOPSIS
+        aspnetcore: que IIS sirva /deploy-info.json como fichero estático, sin pasar por la aplicación.
+    .DESCRIPTION
+        En el e-market el sello lo sirve IIS por ser un fichero del site; en una API todo va al
+        ASP.NET Core Module, y solo las ramas que traen su DeployInfoController (el de main desde
+        octubre de 2026) lo enseñaban. Con una <location> que deja a deploy-info.json en manos del
+        StaticFileModule, cualquier rama publicada dice qué build sirve. Idempotente: devuelve
+        $true solo si ha añadido la ruta.
+    #>
+    param([Parameter(Mandatory)][string]$WebConfigPath)
+    if (-not (Test-Path $WebConfigPath)) { return $false }
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.Load($WebConfigPath)
+    if (-not $xml.DocumentElement -or $xml.DocumentElement.Name -ne 'configuration') { return $false }
+    if ($xml.SelectSingleNode("/configuration/location[@path='deploy-info.json']")) { return $false }
+    $fragmento = $xml.CreateDocumentFragment()
+    $fragmento.InnerXml = '<location path="deploy-info.json"><system.webServer><handlers><clear />' +
+        '<add name="StaticFile" path="*" verb="GET,HEAD" modules="StaticFileModule" resourceType="File" requireAccess="Read" />' +
+        '</handlers></system.webServer></location>'
+    [void]$xml.DocumentElement.AppendChild($fragmento)
+    $xml.Save($WebConfigPath)
+    $true
+}
+
 function Merge-JsonSettings {
     <#
     .SYNOPSIS
@@ -1129,6 +1156,9 @@ function Publish {
             if ($OverrideWebconfig) { Write-Host "BUILD configuration PUBLISHED (-OverrideWebconfig); site copies saved as *.previous" -ForegroundColor Yellow }
             elseif ($preserved) { Write-Host "Site configuration preserved: $($preserved -join ', ')" -ForegroundColor Green }
             else { Write-Host "No site configuration found; publishing the build one" -ForegroundColor Yellow }
+            if (Add-DeployInfoStaticRoute -WebConfigPath $releasingWebConfig) {
+                Write-Host "web.config: deploy-info.json served by IIS as a static file" -ForegroundColor Green
+            }
         }
         else {
             Write-Host "Running MSBuild publish into releasing directory..." -ForegroundColor Yellow
