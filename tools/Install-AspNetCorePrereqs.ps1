@@ -17,7 +17,8 @@
 
     El token es de GitLab con permiso de leer paquetes: un token de acceso personal con alcance
     `read_api` o un token de despliegue del proyecto economitzadbnuget con `read_package_registry`.
-    Se pide por consola si no se pasa.
+    Si no se pasa -NuGetToken, se lee del portapapeles: pegar en la consola de un escritorio
+    remoto falla a menudo aunque el portapapeles llegue.
 
 .EXAMPLE
     .\tools\Install-AspNetCorePrereqs.ps1 -DryRun
@@ -123,8 +124,20 @@ elseif ($DryRun) {
 else {
     if (Test-Path $nugetConfig) { throw "$nugetConfig ya existe sin el registro de GitLab: revísalo a mano en vez de pisarlo." }
     if (-not $NuGetUser) { $NuGetUser = Read-Host 'Usuario de GitLab del token (o el del token de despliegue)' }
-    if (-not $NuGetToken) { $NuGetToken = Read-Host -AsSecureString 'Token de GitLab (read_api o read_package_registry)' }
-    $plano = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($NuGetToken))
+    if ($NuGetToken) {
+        $plano = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($NuGetToken))
+    }
+    else {
+        # Pegar en la consola de un escritorio remoto falla a menudo aunque el portapapeles
+        # llegue (el Bloc de notas sí pega): el token se lee directamente del portapapeles.
+        Read-Host 'Copia el token de GitLab en tu equipo y pulsa Intro aquí (se lee del portapapeles)' | Out-Null
+        $plano = ([string](Get-Clipboard -Raw)).Trim()
+        if ($plano -notmatch '^[A-Za-z0-9._-]{20,}$') {
+            throw "El portapapeles no tiene un token de GitLab ($($plano.Length) caracteres, o con espacios). Cópialo otra vez y relanza."
+        }
+        Set-Clipboard -Value ' '   # que el token no se quede en el portapapeles
+        Write-Host "      token leído del portapapeles ($($plano.Length) caracteres) y portapapeles vaciado" -ForegroundColor Gray
+    }
     $esc = [Security.SecurityElement]::Escape($plano)
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
