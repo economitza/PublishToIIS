@@ -72,21 +72,41 @@ else {
 
 # 2) Clon de la API, con el protocolo del clon del e-market
 $apiDir = Join-Path $GitRoot $ApiRepo
+$webDir = Join-Path $GitRoot $WebRepo
+# Un clon cortado a medias (Ctrl+C) deja la carpeta sin HEAD: se rehace.
+if ((Test-Path (Join-Path $apiDir '.git')) -and -not $DryRun) {
+    & git -C $apiDir rev-parse --verify --quiet HEAD *> $null
+    if ($LASTEXITCODE) {
+        Write-Warning "$apiDir es un clon a medias (sin HEAD): se borra y se vuelve a clonar."
+        Remove-Item $apiDir -Recurse -Force
+    }
+}
 if (Test-Path (Join-Path $apiDir '.git')) {
     Write-Host "[2/4] Clon ya presente: $apiDir ($(git -C $apiDir remote get-url origin))" -ForegroundColor Gray
 }
 else {
-    $webUrl = (git -C (Join-Path $GitRoot $WebRepo) remote get-url origin).Trim()
+    $webUrl = (git -C $webDir remote get-url origin).Trim()
     $apiUrl = if ($webUrl -match '^(git@[^:]+:)') { "$($Matches[1])$ApiRepoPath" }
               elseif ($webUrl -match '^(https?://[^/]+/)') { "$($Matches[1])$ApiRepoPath" }
               else { throw "No reconozco el remoto del e-market ('$webUrl') para deducir el de la API." }
+    $sshCmd = (git -C $webDir config --get core.sshCommand)
+    Write-Host "      e-market: $webUrl$(if ($sshCmd) { " (core.sshCommand: $sshCmd)" })" -ForegroundColor Gray
     if ($DryRun) {
-        Write-Host "[2/4] Clonaría $apiUrl en $apiDir (el e-market usa $webUrl)" -ForegroundColor Yellow
+        Write-Host "[2/4] Clonaría $apiUrl en $apiDir" -ForegroundColor Yellow
     }
     else {
+        Write-Host "[2/4] Clonando $apiUrl en $apiDir..." -ForegroundColor Yellow
+        # Sin preguntas: una petición de credenciales, de passphrase o de host key dejaba
+        # el clon colgado en «Cloning into...» sin decir nada. Así falla y dice por qué.
         $env:GIT_TERMINAL_PROMPT = '0'
+        $env:GCM_INTERACTIVE = 'never'
+        $env:GIT_SSH_COMMAND = "$(if ($sshCmd) { $sshCmd } else { 'ssh' }) -oBatchMode=yes -oStrictHostKeyChecking=accept-new -oConnectTimeout=20"
         git clone $apiUrl $apiDir
-        if ($LASTEXITCODE) { throw "git clone $apiUrl falló ($LASTEXITCODE)." }
+        if ($LASTEXITCODE) {
+            throw ("git clone $apiUrl falló ($LASTEXITCODE). Comprueba con este mismo usuario si el e-market sí puede: " +
+                   "'git -C $webDir fetch'. Si ese funciona y este no, esta cuenta no tiene acceso a $ApiRepoPath en GitLab " +
+                   "(p. ej. una clave de despliegue dada de alta solo en el proyecto del e-market).")
+        }
         Write-Host "[2/4] Clonado $apiUrl en $apiDir" -ForegroundColor Green
     }
 }
