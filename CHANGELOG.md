@@ -6,6 +6,28 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.12.0] - 2026-10-14
+
+### Added
+- **Entornos `kind: aspnetcore` (la API)**: el mismo publicador, la misma cola y la
+  misma puerta remota publican también proyectos ASP.NET Core. Compila con
+  `dotnet publish`; en el swap se conservan `web.config` y los `appsettings*.json`
+  del site (del `<aspNetCore>`, `processPath`, `arguments` y `hostingModel` vienen
+  del build) y `Logs\` pasa de una publicación a la siguiente. Al aprovisionar desde
+  `templateSite` se siembran el `web.config` y los `appsettings*.json` de la
+  plantilla, `databaseMap` se aplica a sus `ConnectionStrings` y `seedAppSettings`
+  se fusiona en el `appsettings.<ASPNETCORE_ENVIRONMENT>.json`. El pool queda en
+  AlwaysRunning y sin apagado por inactividad, y el site con precarga. Primer
+  entorno: `deveco-api-marc`.
+- `templateSite` acepta también el host que sirve la plantilla
+  (`devecoesp1api.economitza.com`), además del nombre del site en IIS.
+- `tools\Install-AspNetCorePrereqs.ps1`: prepara un servidor una vez (SDK de .NET,
+  clon de la API y `NuGet.Config` con el registro de GitLab donde está EconomitzaDB).
+
+### Changed
+- `Invoke-Hotfix` rechaza los entornos que no son `mvc`: copia vistas y `bin` del
+  e-market y no sabe nada de una API.
+
 ## [0.11.0] - 2026-10-14
 
 ### Added

@@ -110,6 +110,28 @@ Uso rápido:
   siempre: aprovisionar es una decisión declarada, no un efecto de una ruta mal
   escrita.
 
+- Tipo de proyecto: `kind` en la entrada del entorno. Por defecto `mvc` (el
+  e-market: MSBuild, `Web.config` y `connections.config` del site). Con
+  `aspnetcore` (la API) compila con `dotnet publish`, conserva `web.config` y los
+  `appsettings*.json` del site (del `<aspNetCore>` solo el ejecutable y el
+  alojamiento vienen del build) y mantiene `Logs\` entre publicaciones. Al
+  aprovisionar siembra esos ficheros de la plantilla y escribe `seedAppSettings`
+  en el `appsettings.<ASPNETCORE_ENVIRONMENT>.json`:
+
+      "deveco-api-marc": {
+        "server": "deployments-76", "kind": "aspnetcore",
+        "origin": "E:\\git\\central-compres-api\\central-de-compres-integracio",
+        "destination": "E:\\wwwrootDevecoApiMarc",
+        "siteUrl": "https://deveco-api-marc.economitza.com",
+        "templateSite": "devecoesp1api.economitza.com",
+        "seedAppSettings": { "BackgroundServices": { "PriceImportEnabled": false } }
+      }
+
+  `templateSite` vale como nombre del site o como el host que sirve. El servidor
+  necesita una vez el SDK de .NET, el clon del repo y la fuente NuGet privada:
+  `tools\Install-AspNetCorePrereqs.ps1` (elevado, con el usuario de la tarea
+  «Publish Local»; `-DryRun` enseña lo que haría).
+
 - Actualizar el publicador de un servidor SIN RDP: `Request-RemoteUpdate -Server
   deployments-76`. Encola una orden `kind=update` en la misma cola que los
   despliegues (nunca coincide con un publish), la tarea elevada hace `git pull`
@@ -299,4 +321,11 @@ Integración en solución .NET Framework:
   lo correcto, no un fallo; (c) el warm-up de `esp.emkt.test` entra por **http**: ese site
   renegocia la conexión TLS y `HttpWebRequest` no lo soporta aunque `curl` sí.
 - **Versión por push (para módulos versionados; estrenada en PublishToIIS):** cada push **incrementa en 1 el tercer dígito** (patch) de la versión — la versión es, de facto, un contador de push. Con salto de `-Minor`/`-Major` se sube ese nivel y se reinician los de abajo, y a partir de ahí se sigue sumando patch por push. En PublishToIIS lo hace `tools\Push-Release.ps1` (sube el `ModuleVersion` del `.psd1`, commitea `chore(release): vX.Y.Z` y pushea en un paso; `-Minor`/`-Major`/`-DryRun`): **los push de ese repo van por ese helper**. La versión vigente la dice el `ModuleVersion` del `.psd1` (0.4.6 el 02/09/2026). Gotcha tras un pull/push del módulo: «Publish Endpoint» (listener) y «Publish Dashboard» (pythonw) son procesos largos y siguen con el código viejo hasta reiniciar sus tareas (`Stop-/Start-ScheduledTask`); el drenador y «Publish Local» importan el módulo en cada ejecución y se actualizan solos. Lo mismo aplica al servidor 76 tras el pull.
+- **Entornos `aspnetcore` (0.12.0)**: lo que cambia frente al e-market está en
+  `Resolve-PublishKind`, `Get-SiteConfigFiles`, `Get-RuntimeFolders` y `Protect-SiteSettings`.
+  `seedAppSettings` y `databaseMap` solo se aplican al **sembrar** (primer publish de un site
+  nuevo): después la configuración es del servidor y se edita allí. Sin SDK en el servidor el
+  publish falla al empezar con «no tiene ningún SDK» (el Hosting Bundle solo trae el runtime);
+  si falla el restore de EconomitzaDB, falta `E:\git\NuGet.Config` o su token ha caducado
+  (`tools\Install-AspNetCorePrereqs.ps1`). Un aspnetcore no se hotfixea: se republica.
 - **`nuget restore` y checkout del servidor**: Desde la v0.5.3 del publicador (14/09/2026, `Restore-NuGetPackages`), `Publish` hace `nuget restore` del proyecto antes de MSBuild (nuget.exe del PATH, de `%ProgramData%\PublishToIIS` o descargado de dist.nuget.org), así que el 76 ya compila ramas que estrenan paquetes (MailKit de SI-2498). Y desde la v0.5.4 (mismo día) el checkout del servidor se REPONE a `origin/<rama>` con `git checkout -B`: antes un `pull --ff-only` fallaba con código 128 tras un rebase + push forzado de la rama (pasó con `main_SI-2504` el 14/09) y la publicación no arrancaba.

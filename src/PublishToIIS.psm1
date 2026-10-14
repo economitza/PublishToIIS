@@ -27,13 +27,208 @@ function Grant-RuntimeFolderWrite {
     }
 
     # IIS_IUSRS cubre a la identidad del grupo de aplicaciones sea cual sea su nombre.
-    $raiz = Join-Path $SitePath 'Upload'
-    & icacls $raiz /grant 'IIS_IUSRS:(OI)(CI)M' /T | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "No se pudo dar escritura a IIS_IUSRS en $raiz (icacls $LASTEXITCODE): las subidas de ficheros fallaran."
-    } else {
-        Write-Host "Runtime folders ready (write granted on $raiz)" -ForegroundColor Green
+    # El permiso se da en cada carpeta de primer nivel y lo heredan las de dentro.
+    foreach ($primerNivel in @($Folders | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique)) {
+        $raiz = Join-Path $SitePath $primerNivel
+        & icacls $raiz /grant 'IIS_IUSRS:(OI)(CI)M' /T | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "No se pudo dar escritura a IIS_IUSRS en $raiz (icacls $LASTEXITCODE): lo que la aplicacion escriba ahi fallara."
+        } else {
+            Write-Host "Runtime folder ready (write granted on $raiz)" -ForegroundColor Green
+        }
     }
+}
+
+# ─── Tipos de proyecto ──────────────────────────────────────────────────────
+# `kind` en la entrada del entorno: 'mvc' (por defecto: el e-market, MSBuild y la
+# configuración del site en Web.config + connections.config) o 'aspnetcore' (la API:
+# dotnet publish y la configuración del site en web.config + appsettings*.json).
+# Todo lo que cambia entre los dos tipos se resuelve con estas funciones.
+
+function Resolve-PublishKind {
+    param($Kind)
+    $k = if ($Kind) { ([string]$Kind).Trim().ToLowerInvariant() } else { 'mvc' }
+    if ($k -notin @('mvc', 'aspnetcore')) { throw "kind '$Kind' no soportado: 'mvc' (por defecto) o 'aspnetcore'." }
+    $k
+}
+
+function Get-SiteConfigFiles {
+    <#
+    .SYNOPSIS
+        Ficheros de configuración que son del site y no del build: se siembran desde
+        la plantilla al aprovisionar y se preservan en cada swap.
+    .DESCRIPTION
+        aspnetcore: web.config y los appsettings*.json de la raíz de -Path (los que
+        tenga ese site; sin -Path, solo web.config). mvc: Web.config y connections.config.
+    #>
+    param([Parameter(Mandatory)][string]$Kind, [string]$Path)
+    if ((Resolve-PublishKind $Kind) -eq 'aspnetcore') {
+        $files = @('web.config')
+        if ($Path -and (Test-Path $Path)) {
+            $files += @(Get-ChildItem -Path $Path -Filter 'appsettings*.json' -File | Sort-Object Name | ForEach-Object { $_.Name })
+        }
+        return $files
+    }
+    @('Web.config', 'connections.config')
+}
+
+function Get-RuntimeFolders {
+    # Carpetas donde escribe la aplicación en ejecución (IIS_IUSRS con modificación).
+    # La API escribe el log de Serilog en Logs\ y el PDF de los pedidos en Upload\pdf
+    # antes de subirlo a S3 (UploadsFiles de su appsettings).
+    param([Parameter(Mandatory)][string]$Kind)
+    if ((Resolve-PublishKind $Kind) -eq 'aspnetcore') { return @('Logs', 'Upload', 'Upload\pdf', 'Upload\tmp') }
+    @('Upload', 'Upload\tmp')
+}
+
+function Get-DotNet {
+    <#
+    .SYNOPSIS
+        Localiza dotnet y comprueba que tiene SDK: el Hosting Bundle de IIS solo trae
+        el runtime, que sirve la API pero no la compila.
+    #>
+    $cmd = Get-Command dotnet -ErrorAction SilentlyContinue
+    $exe = if ($cmd) { $cmd.Source } else { Join-Path $env:ProgramFiles 'dotnet\dotnet.exe' }
+    if (-not (Test-Path $exe)) { throw 'dotnet no encontrado: instala el SDK de .NET que pida el proyecto.' }
+    $sdks = @(& $exe --list-sdks 2>$null)
+    if (-not $sdks) { throw "dotnet ($exe) no tiene ningún SDK instalado: el Hosting Bundle solo trae el runtime. Instala el SDK de .NET que pida el proyecto." }
+    $exe
+}
+
+function Get-AspNetCoreWebConfigMerge {
+    <#
+    .SYNOPSIS
+        aspnetcore: el web.config del servidor con lo que depende del build.
+    .DESCRIPTION
+        Del elemento <aspNetCore> son del build processPath, arguments y hostingModel
+        (el ejecutable y cómo se aloja cambian con la versión de .NET o el nombre del
+        ensamblado); el resto, incluidas las variables de entorno, es del servidor.
+        Devuelve $null si alguno de los dos no tiene <aspNetCore>: entonces se copia
+        el del servidor tal cual.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServerWebConfig,
+        [Parameter(Mandatory)][string]$BuildWebConfig
+    )
+    $server = New-Object System.Xml.XmlDocument
+    $build = New-Object System.Xml.XmlDocument
+    $server.PreserveWhitespace = $true
+    try {
+        $server.Load($ServerWebConfig)
+        $build.Load($BuildWebConfig)
+    }
+    catch { return $null }
+    $serverNode = $server.SelectSingleNode('//system.webServer/aspNetCore')
+    $buildNode = $build.SelectSingleNode('//system.webServer/aspNetCore')
+    if (-not $serverNode -or -not $buildNode) { return $null }
+
+    $changes = @()
+    foreach ($attr in 'processPath', 'arguments', 'hostingModel') {
+        $valor = $buildNode.GetAttribute($attr)
+        if (-not $buildNode.HasAttribute($attr)) {
+            if ($serverNode.HasAttribute($attr)) { $serverNode.RemoveAttribute($attr); $changes += $attr }
+            continue
+        }
+        if ($serverNode.GetAttribute($attr) -ne $valor) {
+            $serverNode.SetAttribute($attr, $valor)
+            $changes += $attr
+        }
+    }
+    [pscustomobject]@{ Document = $server; Changes = $changes }
+}
+
+function Protect-SiteSettings {
+    <#
+    .SYNOPSIS
+        aspnetcore: la configuración del site (web.config y appsettings*.json de su raíz)
+        gana a la del build.
+    .DESCRIPTION
+        Lo que el site no tiene se queda como venga del build. Del web.config, lo ligado
+        al build viaja con el build (Get-AspNetCoreWebConfigMerge). Con -Override se
+        publica la configuración del build y la del site queda al lado como
+        <fichero>.previous. Devuelve los ficheros preservados.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ReleasingDir,
+        [switch]$Override
+    )
+    $preserved = @()
+    foreach ($name in Get-SiteConfigFiles -Kind aspnetcore -Path $Destination) {
+        $site = Join-Path $Destination $name
+        if (-not (Test-Path $site)) { continue }
+        $rel = Join-Path $ReleasingDir $name
+        if ($Override) {
+            Copy-Item $site "$rel.previous" -Force
+            continue
+        }
+        $merge = if ($name -eq 'web.config' -and (Test-Path $rel)) { Get-AspNetCoreWebConfigMerge -ServerWebConfig $site -BuildWebConfig $rel }
+        if ($merge) {
+            $merge.Document.Save($rel)
+            if ($merge.Changes) { Write-Host "web.config del servidor conservado; del build: $($merge.Changes -join ', ')" }
+        }
+        else { Copy-Item $site $rel -Force }
+        $preserved += $name
+    }
+    $preserved
+}
+
+function Merge-JsonSettings {
+    <#
+    .SYNOPSIS
+        Fusiona -Settings sobre el JSON de -Path (lo crea si no existe): los objetos se
+        mezclan clave a clave y el resto se sustituye. Las claves no distinguen
+        mayúsculas, como en la configuración de ASP.NET Core.
+    .DESCRIPTION
+        Es lo que deja a un site aspnetcore recién aprovisionado con lo propio de su
+        entorno (seedAppSettings) sobre la configuración copiada de la plantilla.
+        Devuelve las rutas de las claves escritas (p. ej. 'Queues:Environment').
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Settings
+    )
+    $over = $Settings | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $base = [pscustomobject]@{}
+    if (Test-Path $Path) {
+        $raw = [IO.File]::ReadAllText($Path)
+        if ($raw.Trim()) {
+            try { $base = $raw | ConvertFrom-Json }
+            catch { throw "No se puede leer '$Path' como JSON (¿comentarios?): $($_.Exception.Message)" }
+        }
+    }
+    $written = New-Object System.Collections.Generic.List[string]
+    $merge = {
+        param($Target, $Source, $Prefix)
+        foreach ($p in $Source.PSObject.Properties) {
+            $clave = if ($Prefix) { "${Prefix}:$($p.Name)" } else { $p.Name }
+            $actual = $Target.PSObject.Properties[$p.Name]
+            if ($actual -and $actual.Value -is [pscustomobject] -and $p.Value -is [pscustomobject]) {
+                & $merge $actual.Value $p.Value $clave
+            }
+            elseif ($actual) { $actual.Value = $p.Value; $written.Add($clave) }
+            else { $Target | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value; $written.Add($clave) }
+        }
+    }
+    & $merge $base $over ''
+    [IO.File]::WriteAllText($Path, ($base | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+    @($written)
+}
+
+function Get-AspNetCoreEnvironmentName {
+    # ASPNETCORE_ENVIRONMENT de las variables de entorno del web.config: es lo que decide
+    # qué appsettings.<entorno>.json lee la API. Sin ella, ASP.NET Core usa Production.
+    param([Parameter(Mandatory)][string]$WebConfigPath)
+    if (Test-Path $WebConfigPath) {
+        try {
+            $xml = New-Object System.Xml.XmlDocument
+            $xml.Load($WebConfigPath)
+            $var = $xml.SelectSingleNode("//aspNetCore/environmentVariables/environmentVariable[@name='ASPNETCORE_ENVIRONMENT']")
+            if ($var -and $var.GetAttribute('value')) { return $var.GetAttribute('value') }
+        }
+        catch { }
+    }
+    'Production'
 }
 function Get-MSBuild {
     $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
@@ -296,11 +491,7 @@ function Set-ConnectionStringCatalog {
     $docs = @{}
     foreach ($e in $entries) {
         $cs = $e.node.GetAttribute('connectionString')
-        $new = [regex]::Replace($cs, '(?i)(Initial Catalog|Database)\s*=\s*([^;]+)', {
-            param($m)
-            $db = $m.Groups[2].Value.Trim()
-            if ($DatabaseMap.ContainsKey($db)) { "$($m.Groups[1].Value)=$($DatabaseMap[$db])" } else { $m.Value }
-        }.GetNewClosure())
+        $new = Set-CatalogInConnectionString -ConnectionString $cs -DatabaseMap $DatabaseMap
         if ($new -ne $cs) {
             $e.node.SetAttribute('connectionString', $new)
             $docs[$e.path] = $e.doc
@@ -308,6 +499,39 @@ function Set-ConnectionStringCatalog {
         }
     }
     foreach ($p in $docs.Keys) { $docs[$p].Save($p) }
+    $changed
+}
+
+function Set-CatalogInConnectionString {
+    # Sustituye el catálogo (Initial Catalog / Database) de UNA cadena si es clave del mapa.
+    param([string]$ConnectionString, [Parameter(Mandatory)][hashtable]$DatabaseMap)
+    [regex]::Replace($ConnectionString, '(?i)(Initial Catalog|Database)\s*=\s*([^;]+)', {
+        param($m)
+        $db = $m.Groups[2].Value.Trim()
+        if ($DatabaseMap.ContainsKey($db)) { "$($m.Groups[1].Value)=$($DatabaseMap[$db])" } else { $m.Value }
+    }.GetNewClosure())
+}
+
+function Set-JsonConnectionStringCatalog {
+    <#
+    .SYNOPSIS
+        aspnetcore: Set-ConnectionStringCatalog sobre la sección ConnectionStrings de un
+        appsettings*.json. Devuelve el número de cadenas modificadas.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$DatabaseMap
+    )
+    if (-not (Test-Path $Path)) { return 0 }
+    $json = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    if (-not $json.ConnectionStrings) { return 0 }
+    $changed = 0
+    foreach ($p in $json.ConnectionStrings.PSObject.Properties) {
+        $new = Set-CatalogInConnectionString -ConnectionString ([string]$p.Value) -DatabaseMap $DatabaseMap
+        if ($new -ne $p.Value) { $p.Value = $new; $changed++ }
+    }
+    if ($changed) { [IO.File]::WriteAllText($Path, ($json | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding($false))) }
     $changed
 }
 
@@ -407,14 +631,24 @@ function Initialize-IisSite {
              certificado de la plantilla si cubre el host (wildcard) o el primero
              válido de LocalMachine\My. Si ya hay un site con ese host header bajo
              OTRO nombre, se usa ese (no se crea un segundo).
-          4) siembra de Web.config y connections.config desde la carpeta de la
-             plantilla (Publish los preserva en cada swap, como en los servidores)
-             y, con -DatabaseMap, cambio del catálogo de las cadenas de conexión
-             sembradas para que el site nazca con SU base de datos
+          4) siembra de la configuración del site desde la carpeta de la
+             plantilla (Publish la preserva en cada swap, como en los servidores):
+             Web.config y connections.config, o en un aspnetcore web.config y sus
+             appsettings*.json. Con -DatabaseMap, cambio del catálogo de las cadenas
+             de conexión sembradas para que el site nazca con SU base de datos; con
+             -SeedAppSettings (aspnetcore), lo propio del entorno fusionado en el
+             appsettings.<ASPNETCORE_ENVIRONMENT>.json sembrado
           5) si la plantilla conecta a SQL local con Integrated Security, réplica
              del acceso del pool plantilla al nuevo (login + usuarios + roles)
           6) con -HostsIp, entrada "<ip> <hostname>" en el archivo hosts (solo
              tiene sentido en el portátil; en un servidor con DNS no se pasa)
+
+        -TemplateSite es el nombre del site plantilla o el host que sirve (p. ej.
+        devecoesp1api.economitza.com), para no depender de cómo se llamó al crearlo.
+        Con -Kind aspnetcore el pool se crea sin código administrado si no hay
+        plantilla, siempre en AlwaysRunning y sin apagado por inactividad, y el site
+        con precarga: sin eso la API no arranca hasta la primera petición y se apaga
+        a los 20 minutos, y con ella el consumidor de la cola de importaciones.
 
         Requiere privilegios de administrador (IIS). Devuelve un objeto con lo
         que se ha hecho (`actions`) y el app pool efectivo del site.
@@ -431,9 +665,12 @@ function Initialize-IisSite {
         [string]$TemplateSite,
         $DatabaseMap,
         [string]$HostsIp,
-        [switch]$SkipSqlAccess
+        [switch]$SkipSqlAccess,
+        [string]$Kind = 'mvc',
+        $SeedAppSettings
     )
     $ErrorActionPreference = 'Stop'
+    $Kind = Resolve-PublishKind $Kind
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) { throw 'Initialize-IisSite requiere privilegios de administrador (IIS).' }
     Import-Module WebAdministration -ErrorAction Stop
@@ -446,8 +683,13 @@ function Initialize-IisSite {
     $templatePath = $null
     if ($TemplateSite) {
         $template = Get-Website -Name $TemplateSite -ErrorAction SilentlyContinue
-        if (-not $template) { throw "El site plantilla '$TemplateSite' no existe en este IIS." }
+        if (-not $template) {
+            $porHost = Get-WebBinding | Where-Object bindingInformation -match ":$([regex]::Escape($TemplateSite))$" | Select-Object -First 1
+            if ($porHost -and $porHost.ItemXPath -match "@name='([^']+)'") { $template = Get-Website -Name $Matches[1] -ErrorAction SilentlyContinue }
+        }
+        if (-not $template) { throw "El site plantilla '$TemplateSite' no existe en este IIS (ni como nombre de site ni como host de un binding)." }
         $templatePath = [Environment]::ExpandEnvironmentVariables([string]$template.physicalPath)
+        Write-Host "Plantilla: site '$($template.name)' ($templatePath)" -ForegroundColor Gray
     }
     $templateHttps = if ($template) {
         $template.bindings.Collection | Where-Object protocol -eq 'https' | Select-Object -First 1
@@ -480,15 +722,23 @@ function Initialize-IisSite {
         Write-Host "[2/6] App pool ya existe: $AppPoolName" -ForegroundColor Gray
     } else {
         New-WebAppPool -Name $AppPoolName | Out-Null
-        $runtime = 'v4.0'; $pipeline = 'Integrated'
+        # aspnetcore sin plantilla: sin código administrado (lo aloja el ASP.NET Core Module)
+        $runtime = if ($Kind -eq 'aspnetcore') { '' } else { 'v4.0' }
+        $pipeline = 'Integrated'
         if ($template) {
             $tp = Get-Item "IIS:\AppPools\$($template.applicationPool)" -ErrorAction SilentlyContinue
             if ($tp) { $runtime = $tp.managedRuntimeVersion; $pipeline = [string]$tp.managedPipelineMode }
         }
         Set-ItemProperty "IIS:\AppPools\$AppPoolName" managedRuntimeVersion $runtime
         Set-ItemProperty "IIS:\AppPools\$AppPoolName" managedPipelineMode $pipeline
+        $extra = ''
+        if ($Kind -eq 'aspnetcore') {
+            Set-ItemProperty "IIS:\AppPools\$AppPoolName" startMode 'AlwaysRunning'
+            Set-ItemProperty "IIS:\AppPools\$AppPoolName" processModel.idleTimeout ([TimeSpan]::Zero)
+            $extra = ', AlwaysRunning, sin apagado por inactividad'
+        }
         $actions.Add("app pool $AppPoolName")
-        Write-Host "[2/6] App pool creado: $AppPoolName ($runtime, $pipeline)" -ForegroundColor Green
+        Write-Host "[2/6] App pool creado: $AppPoolName ($(if ($runtime) { $runtime } else { 'sin código administrado' }), $pipeline$extra)" -ForegroundColor Green
     }
 
     # 3) site + bindings + certificado
@@ -506,6 +756,7 @@ function Initialize-IisSite {
         $found = Find-SiteCertificate -TemplateHttpsBinding $templateHttps -Target $HostName
         $httpsBinding = Get-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostName
         $httpsBinding.AddSslCertificate($found.cert.Thumbprint, $found.store)
+        if ($Kind -eq 'aspnetcore') { Set-ItemProperty "IIS:\Sites\$Name" -Name applicationDefaults.preloadEnabled -Value $true }
         $site = Get-Website -Name $Name
         $actions.Add("site $Name ($HostName, cert $($found.source))")
         Write-Host ("[3/6] Site creado: {0} -> {1} (http+https SNI, cert '{2}' de {3}, caduca {4:yyyy-MM-dd})" -f `
@@ -514,7 +765,7 @@ function Initialize-IisSite {
 
     # 4) siembra de la configuración de la plantilla (Publish la preserva en el swap)
     $seeded = @()
-    foreach ($file in 'Web.config', 'connections.config') {
+    foreach ($file in (Get-SiteConfigFiles -Kind $Kind -Path $templatePath)) {
         $dest = Join-Path $Destination $file
         if (Test-Path $dest) { continue }
         if (-not $templatePath) { continue }
@@ -528,7 +779,13 @@ function Initialize-IisSite {
         $actions.Add("config sembrada desde '$TemplateSite': $($seeded -join ', ')")
         Write-Host "[4/6] Sembrado desde '$TemplateSite': $($seeded -join ', ')" -ForegroundColor Green
         if ($DatabaseMap) {
-            $n = Set-ConnectionStringCatalog -WebConfigPath (Join-Path $Destination 'Web.config') -DatabaseMap $DatabaseMap
+            $n = if ($Kind -eq 'aspnetcore') {
+                ($seeded | Where-Object { $_ -like 'appsettings*.json' } |
+                    ForEach-Object { Set-JsonConnectionStringCatalog -Path (Join-Path $Destination $_) -DatabaseMap $DatabaseMap } |
+                    Measure-Object -Sum).Sum
+            } else {
+                Set-ConnectionStringCatalog -WebConfigPath (Join-Path $Destination 'Web.config') -DatabaseMap $DatabaseMap
+            }
             $desc = ($DatabaseMap.Keys | ForEach-Object { "$_ -> $($DatabaseMap[$_])" }) -join ', '
             if ($n -gt 0) {
                 $actions.Add("catálogo de BD cambiado en $n cadena(s): $desc")
@@ -537,14 +794,22 @@ function Initialize-IisSite {
                 Write-Warning "[4/6] databaseMap ($desc) no casó con ninguna cadena de conexión sembrada."
             }
         }
+        if ($Kind -eq 'aspnetcore' -and $SeedAppSettings) {
+            $aspEnv = Get-AspNetCoreEnvironmentName -WebConfigPath (Join-Path $Destination 'web.config')
+            $settingsFile = "appsettings.$aspEnv.json"
+            $claves = Merge-JsonSettings -Path (Join-Path $Destination $settingsFile) -Settings $SeedAppSettings
+            $actions.Add("$settingsFile del entorno: $($claves -join ', ')")
+            Write-Host "[4/6] $settingsFile con lo propio del entorno: $($claves -join ', ')" -ForegroundColor Green
+        }
     } elseif ($templatePath) {
         Write-Host "[4/6] Configuración ya presente en el destino (se preservará)" -ForegroundColor Gray
     } else {
         Write-Host "[4/6] Sin plantilla: el publish usará la configuración del repo" -ForegroundColor Yellow
     }
 
-    # 5) acceso SQL del app pool (Integrated Security contra la instancia local)
-    if ($template -and -not $SkipSqlAccess) {
+    # 5) acceso SQL del app pool (Integrated Security contra la instancia local; las
+    #    cadenas de un aspnetcore viven en appsettings y usan usuario SQL)
+    if ($template -and -not $SkipSqlAccess -and $Kind -ne 'aspnetcore') {
         $sqlServers = Get-LocalIntegratedSqlServers -WebConfigPath (Join-Path $Destination 'Web.config')
         if (-not $sqlServers) {
             Write-Host "[5/6] La configuración no conecta a SQL local con Integrated Security: nada que replicar" -ForegroundColor Gray
@@ -724,7 +989,13 @@ function Publish {
         # databaseMap) cuando no se pasan explícitos.
         [string]$TemplateSite,
         [string]$HostName,
-        $DatabaseMap
+        $DatabaseMap,
+        # Tipo de proyecto (ver Resolve-PublishKind): 'mvc' por defecto, 'aspnetcore'
+        # para la API. Sale del campo `kind` del entorno si no se pasa.
+        [string]$Kind,
+        # aspnetcore: lo propio del entorno que se escribe al aprovisionar en su
+        # appsettings.<entorno>.json (campo `seedAppSettings` del entorno).
+        $SeedAppSettings
     )
 
     # Check for admin privileges
@@ -763,13 +1034,22 @@ function Publish {
         if (-not $HostName -and $cfg.hostName) { $HostName = [string]$cfg.hostName }
         if (-not $HostName -and $cfg.siteUrl) { $HostName = ([Uri][string]$cfg.siteUrl).Host }
         if (-not $DatabaseMap -and $cfg.databaseMap) { $DatabaseMap = $cfg.databaseMap }
+        if (-not $Kind -and $cfg.kind) { $Kind = [string]$cfg.kind }
+        if (-not $SeedAppSettings -and $cfg.seedAppSettings) { $SeedAppSettings = $cfg.seedAppSettings }
     }
     if (-not $ProjectPath -or -not $Destination) {
         throw "Publish necesita ProjectPath y Destination (explícitos o por -Environment en environments.json)."
     }
+    $Kind = Resolve-PublishKind $Kind
 
-    $msbuild = Get-MSBuild
-    Write-Host "Using MSBuild: $msbuild" -ForegroundColor Yellow
+    if ($Kind -eq 'aspnetcore') {
+        $dotnet = Get-DotNet
+        Write-Host "Using dotnet: $dotnet (SDK $((& $dotnet --version).Trim()))" -ForegroundColor Yellow
+    }
+    else {
+        $msbuild = Get-MSBuild
+        Write-Host "Using MSBuild: $msbuild" -ForegroundColor Yellow
+    }
 
     $parentDir = Split-Path $Destination -Parent
     $siteName = Split-Path $Destination -Leaf
@@ -787,7 +1067,7 @@ function Publish {
         $iisSiteName = if ($Environment) { $Environment } else { $siteName }
         Write-Host "Aprovisionando site '$iisSiteName' ($HostName) desde la plantilla '$TemplateSite'..." -ForegroundColor Yellow
         $prov = Initialize-IisSite -Name $iisSiteName -AppPoolName $AppPoolName -Destination $Destination `
-            -HostName $HostName -TemplateSite $TemplateSite -DatabaseMap $DatabaseMap
+            -HostName $HostName -TemplateSite $TemplateSite -DatabaseMap $DatabaseMap -Kind $Kind -SeedAppSettings $SeedAppSettings
         $AppPoolName = $prov.appPool
         if ($prov.actions.Count) { Write-Host ("Aprovisionado: " + ($prov.actions -join '; ')) -ForegroundColor Green }
         else { Write-Host "Site ya aprovisionado; nada que crear." -ForegroundColor Gray }
@@ -815,8 +1095,6 @@ function Publish {
 
         New-Item -ItemType Directory -Path $releasingDir | Out-Null
 
-        Write-Host "Running MSBuild publish into releasing directory..." -ForegroundColor Yellow
-
         # Resolve ProjectPath: if it's a folder, find a .csproj inside
         if (Test-Path $ProjectPath -PathType Container) {
             $csproj = Get-ChildItem -Path $ProjectPath -Filter *.csproj -Recurse -File | Select-Object -First 1
@@ -833,41 +1111,63 @@ function Publish {
             Write-Host "Extra MSBuild properties: $($extraProps -join ' ')" -ForegroundColor Gray
         }
 
-        Restore-NuGetPackages -ProjectFile $projectToBuild
+        if ($Kind -eq 'aspnetcore') {
+            # dotnet publish restaura los paquetes (PackageReference) de las fuentes NuGet
+            # de la máquina: una privada (EconomitzaDB en el registro de GitLab) tiene que
+            # estar dada de alta en un NuGet.Config que vea quien ejecuta la tarea.
+            Write-Host "Running dotnet publish into releasing directory..." -ForegroundColor Yellow
+            & $dotnet publish $projectToBuild -c $Configuration -o $releasingDir --nologo -v minimal @extraProps
+            if ($LASTEXITCODE -ne 0) {
+                throw "dotnet publish failed with exit code $LASTEXITCODE."
+            }
+            Write-Host "dotnet publish completed" -ForegroundColor Green
 
-        & $msbuild $projectToBuild `
-            /p:Configuration=$Configuration `
-            /p:DeployOnBuild=true `
-            /p:PublishUrl="$releasingDir" `
-            /p:WebPublishMethod=FileSystem `
-            /p:DeployTarget=WebPublish `
-            @extraProps `
-            /v:minimal
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "MSBuild failed with exit code $LASTEXITCODE."
+            # La configuración del site (web.config y appsettings*.json) gana a la del
+            # build; con -OverrideWebconfig se publica la del build y la del site queda
+            # como <fichero>.previous.
+            $preserved = Protect-SiteSettings -Destination $Destination -ReleasingDir $releasingDir -Override:$OverrideWebconfig
+            if ($OverrideWebconfig) { Write-Host "BUILD configuration PUBLISHED (-OverrideWebconfig); site copies saved as *.previous" -ForegroundColor Yellow }
+            elseif ($preserved) { Write-Host "Site configuration preserved: $($preserved -join ', ')" -ForegroundColor Green }
+            else { Write-Host "No site configuration found; publishing the build one" -ForegroundColor Yellow }
         }
+        else {
+            Write-Host "Running MSBuild publish into releasing directory..." -ForegroundColor Yellow
+            Restore-NuGetPackages -ProjectFile $projectToBuild
 
-        Write-Host "MSBuild publish completed" -ForegroundColor Green
+            & $msbuild $projectToBuild `
+                /p:Configuration=$Configuration `
+                /p:DeployOnBuild=true `
+                /p:PublishUrl="$releasingDir" `
+                /p:WebPublishMethod=FileSystem `
+                /p:DeployTarget=WebPublish `
+                @extraProps `
+                /v:minimal
 
-        # web.config: por defecto se preserva el de producción; con -OverrideWebconfig
-        # se publica el del repo y el de producción queda como web.config.previous.
-        $webConfigResult = Protect-ProductionWebConfig -TargetWebConfig $targetWebConfig `
-            -ReleasingWebConfig $releasingWebConfig -Override:$OverrideWebconfig
-        switch ($webConfigResult) {
-            'preserved'  { Write-Host "Production web.config preserved (repo one discarded)" -ForegroundColor Green }
-            'overridden' { Write-Host "REPO web.config PUBLISHED (-OverrideWebconfig); production copy saved as web.config.previous" -ForegroundColor Yellow }
-            default      { Write-Host "No production web.config found; publishing the repo one" -ForegroundColor Yellow }
-        }
-        # connections.config va aparte del Web.config (configSource) y en el repo
-        # está gitignored: sin esto cada publish arrastraba el del ORIGEN a todos
-        # los sites construidos desde él (misma BD para todos). Misma política que
-        # el web.config: el del site se preserva; -OverrideWebconfig publica el del build.
-        $connResult = Protect-ProductionWebConfig -TargetWebConfig (Join-Path $Destination 'connections.config') `
-            -ReleasingWebConfig (Join-Path $releasingDir 'connections.config') -Override:$OverrideWebconfig
-        switch ($connResult) {
-            'preserved'  { Write-Host "Site connections.config preserved" -ForegroundColor Green }
-            'overridden' { Write-Host "BUILD connections.config PUBLISHED (-OverrideWebconfig); site copy saved as connections.config.previous" -ForegroundColor Yellow }
+            if ($LASTEXITCODE -ne 0) {
+                throw "MSBuild failed with exit code $LASTEXITCODE."
+            }
+
+            Write-Host "MSBuild publish completed" -ForegroundColor Green
+
+            # web.config: por defecto se preserva el de producción; con -OverrideWebconfig
+            # se publica el del repo y el de producción queda como web.config.previous.
+            $webConfigResult = Protect-ProductionWebConfig -TargetWebConfig $targetWebConfig `
+                -ReleasingWebConfig $releasingWebConfig -Override:$OverrideWebconfig
+            switch ($webConfigResult) {
+                'preserved'  { Write-Host "Production web.config preserved (repo one discarded)" -ForegroundColor Green }
+                'overridden' { Write-Host "REPO web.config PUBLISHED (-OverrideWebconfig); production copy saved as web.config.previous" -ForegroundColor Yellow }
+                default      { Write-Host "No production web.config found; publishing the repo one" -ForegroundColor Yellow }
+            }
+            # connections.config va aparte del Web.config (configSource) y en el repo
+            # está gitignored: sin esto cada publish arrastraba el del ORIGEN a todos
+            # los sites construidos desde él (misma BD para todos). Misma política que
+            # el web.config: el del site se preserva; -OverrideWebconfig publica el del build.
+            $connResult = Protect-ProductionWebConfig -TargetWebConfig (Join-Path $Destination 'connections.config') `
+                -ReleasingWebConfig (Join-Path $releasingDir 'connections.config') -Override:$OverrideWebconfig
+            switch ($connResult) {
+                'preserved'  { Write-Host "Site connections.config preserved" -ForegroundColor Green }
+                'overridden' { Write-Host "BUILD connections.config PUBLISHED (-OverrideWebconfig); site copy saved as connections.config.previous" -ForegroundColor Yellow }
+            }
         }
 
         # Sello de versión del despliegue: viaja dentro de releasing/ y por tanto con el swap
@@ -898,12 +1198,23 @@ function Publish {
         $swapCompleted = $true
         Write-Host "Directory swap completed" -ForegroundColor Green
 
+        # El log de la API vive en el site: el swap estrena carpeta y, sin moverlo, cada
+        # publicación borraría el de las anteriores con la carpeta previous.
+        if ($Kind -eq 'aspnetcore') {
+            $logsPrevios = Join-Path $previousDir 'Logs'
+            if ((Test-Path $logsPrevios) -and -not (Test-Path (Join-Path $Destination 'Logs'))) {
+                Move-Item $logsPrevios (Join-Path $Destination 'Logs')
+                Write-Host "Logs kept from the previous release" -ForegroundColor Green
+            }
+        }
+
         # La aplicacion escribe en Upload\tmp (ficheros que sube el usuario, excels
         # temporales). Esa carpeta es contenido de ejecucion: no viaja en la publicacion y el
         # swap estrena carpeta, asi que se recrea vacia y hereda los permisos del padre. Si el
         # padre no da escritura al proceso de IIS, la aplicacion crea la carpeta pero no puede
         # escribir en ella y las importaciones mueren con «Access to the path ... is denied».
-        Grant-RuntimeFolderWrite -SitePath $Destination
+        # La API escribe ademas su log en Logs\ (Serilog no avisa si no puede).
+        Grant-RuntimeFolderWrite -SitePath $Destination -Folders (Get-RuntimeFolders -Kind $Kind)
     }
     catch {
         Write-Host "Publish failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -1031,13 +1342,17 @@ function Invoke-DeployOrder {
         if ($cfg.hostName) { $pubArgs.HostName = [string]$cfg.hostName }
         elseif ($cfg.siteUrl) { $pubArgs.HostName = ([Uri][string]$cfg.siteUrl).Host }
         if ($cfg.databaseMap) { $pubArgs.DatabaseMap = $cfg.databaseMap }
+        if ($cfg.kind) { $pubArgs.Kind = [string]$cfg.kind }
+        if ($cfg.seedAppSettings) { $pubArgs.SeedAppSettings = $cfg.seedAppSettings }
     }
+    $kind = Resolve-PublishKind $cfg.kind
     if ($OverrideWebconfig) { $pubArgs.OverrideWebconfig = $true }
     if ($Configuration) { $pubArgs.Configuration = $Configuration }
     if ($RequestedBy) { $pubArgs.RequestedBy = $RequestedBy }
 
     $plan = [pscustomobject]@{
         environment       = $Environment
+        kind              = $kind
         branch            = $Branch
         requestedBy       = $RequestedBy
         repo              = $repo
@@ -4120,6 +4435,9 @@ function Get-HotfixTarget {
     }
     if (-not $def.origin -or -not $def.destination) {
         throw "El entorno '$nombre' no declara origin/destination."
+    }
+    if ((Resolve-PublishKind $def.kind) -ne 'mvc') {
+        throw "El hotfix copia vistas y bin del e-market (kind mvc); '$nombre' es kind '$($def.kind)': se republica entero."
     }
 
     $origen = ([string]$def.origin).TrimEnd('\', '/')

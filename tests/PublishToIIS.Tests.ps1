@@ -2590,3 +2590,136 @@ Describe 'Invoke-DeployQueueDrain con entorno ad hoc' {
         Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+Describe 'Entornos aspnetcore (la API)' {
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_core_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path (Join-Path $script:tmp 'site') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:tmp 'rel') -Force | Out-Null
+    }
+    AfterEach { Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'Resolve-PublishKind: mvc por defecto, aspnetcore sin distinguir mayúsculas y nada más' {
+        InModuleScope PublishToIIS {
+            Resolve-PublishKind $null | Should -Be 'mvc'
+            Resolve-PublishKind 'AspNetCore' | Should -Be 'aspnetcore'
+            { Resolve-PublishKind 'node' } | Should -Throw '*no soportado*'
+        }
+    }
+
+    It 'la configuración del site y las carpetas de ejecución dependen del tipo' {
+        $site = Join-Path $script:tmp 'site'
+        '{}' | Set-Content (Join-Path $site 'appsettings.json')
+        '{}' | Set-Content (Join-Path $site 'appsettings.Production.json')
+        '{}' | Set-Content (Join-Path $site 'otro.json')
+        InModuleScope PublishToIIS -Parameters @{ site = $site } {
+            Get-SiteConfigFiles -Kind mvc | Should -Be @('Web.config', 'connections.config')
+            Get-SiteConfigFiles -Kind aspnetcore -Path $site | Should -Be @('web.config', 'appsettings.json', 'appsettings.Production.json')
+            Get-RuntimeFolders -Kind aspnetcore | Should -Contain 'Logs'
+            Get-RuntimeFolders -Kind mvc | Should -Not -Contain 'Logs'
+        }
+    }
+
+    It 'Protect-SiteSettings: gana la configuración del site; lo que el site no tiene se queda como en el build' {
+        $site = Join-Path $script:tmp 'site'; $rel = Join-Path $script:tmp 'rel'
+        '{"ConnectionStrings":{"DefaultConnection":"SITE"}}' | Set-Content (Join-Path $site 'appsettings.Production.json')
+        '{"ConnectionStrings":{"DefaultConnection":"BUILD"}}' | Set-Content (Join-Path $rel 'appsettings.Production.json')
+        '{"Logging":{}}' | Set-Content (Join-Path $rel 'appsettings.Development.json')
+        InModuleScope PublishToIIS -Parameters @{ site = $site; rel = $rel } {
+            $r = Protect-SiteSettings -Destination $site -ReleasingDir $rel
+            $r | Should -Be @('appsettings.Production.json')
+            (Get-Content (Join-Path $rel 'appsettings.Production.json') -Raw) | Should -Match 'SITE'
+            Test-Path (Join-Path $rel 'appsettings.Development.json') | Should -BeTrue
+        }
+    }
+
+    It 'Protect-SiteSettings -Override publica la del build y deja la del site como .previous' {
+        $site = Join-Path $script:tmp 'site'; $rel = Join-Path $script:tmp 'rel'
+        'SITE' | Set-Content (Join-Path $site 'appsettings.json')
+        'BUILD' | Set-Content (Join-Path $rel 'appsettings.json')
+        InModuleScope PublishToIIS -Parameters @{ site = $site; rel = $rel } {
+            Protect-SiteSettings -Destination $site -ReleasingDir $rel -Override | Should -BeNullOrEmpty
+            (Get-Content (Join-Path $rel 'appsettings.json') -Raw).Trim() | Should -Be 'BUILD'
+            (Get-Content (Join-Path $rel 'appsettings.json.previous') -Raw).Trim() | Should -Be 'SITE'
+        }
+    }
+
+    It 'del web.config el ejecutable y el alojamiento son del build; las variables de entorno, del site' {
+        $site = Join-Path $script:tmp 'site'; $rel = Join-Path $script:tmp 'rel'
+        @'
+<configuration><location path="." inheritInChildApplications="false"><system.webServer>
+  <aspNetCore processPath=".\viejo.exe" hostingModel="outofprocess" stdoutLogEnabled="false">
+    <environmentVariables><environmentVariable name="ASPNETCORE_ENVIRONMENT" value="Production" /></environmentVariables>
+  </aspNetCore>
+</system.webServer></location></configuration>
+'@ | Set-Content (Join-Path $site 'web.config')
+        '<configuration><location path="."><system.webServer><aspNetCore processPath=".\nuevo.exe" hostingModel="inprocess" /></system.webServer></location></configuration>' |
+            Set-Content (Join-Path $rel 'web.config')
+        InModuleScope PublishToIIS -Parameters @{ site = $site; rel = $rel } {
+            Protect-SiteSettings -Destination $site -ReleasingDir $rel | Should -Be @('web.config')
+            [xml]$x = Get-Content (Join-Path $rel 'web.config') -Raw
+            $nodo = $x.SelectSingleNode('//aspNetCore')
+            $nodo.processPath | Should -Be '.\nuevo.exe'
+            $nodo.hostingModel | Should -Be 'inprocess'
+            $nodo.SelectSingleNode("environmentVariables/environmentVariable[@name='ASPNETCORE_ENVIRONMENT']").value | Should -Be 'Production'
+            Get-AspNetCoreEnvironmentName -WebConfigPath (Join-Path $rel 'web.config') | Should -Be 'Production'
+            Get-AspNetCoreEnvironmentName -WebConfigPath (Join-Path $rel 'no.config') | Should -Be 'Production'
+        }
+    }
+
+    It 'Merge-JsonSettings mezcla en profundidad, sin distinguir mayúsculas, y crea el fichero si falta' {
+        $f = Join-Path $script:tmp 'site\appsettings.Production.json'
+        '{"Queues":{"Environment":"devecoesp1"},"BackgroundServices":{"PriceImportEnabled":true,"Otro":1},"Swagger":{"ShowAllEndpoints":true}}' |
+            Set-Content $f
+        InModuleScope PublishToIIS -Parameters @{ f = $f } {
+            $claves = Merge-JsonSettings -Path $f -Settings ([pscustomobject]@{
+                    queues             = [pscustomobject]@{ Environment = 'deveco-api-marc' }
+                    BackgroundServices = @{ PriceImportEnabled = $false }
+                })
+            $claves | Should -Be @('queues:Environment', 'BackgroundServices:PriceImportEnabled')
+            $j = Get-Content $f -Raw | ConvertFrom-Json
+            $j.Queues.Environment | Should -Be 'deveco-api-marc'
+            $j.BackgroundServices.PriceImportEnabled | Should -BeFalse
+            $j.BackgroundServices.Otro | Should -Be 1
+            $j.Swagger.ShowAllEndpoints | Should -BeTrue
+
+            $nuevo = Join-Path (Split-Path $f) 'appsettings.Staging.json'
+            Merge-JsonSettings -Path $nuevo -Settings @{ A = @{ B = 'c' } } | Should -Be @('A')
+            (Get-Content $nuevo -Raw | ConvertFrom-Json).A.B | Should -Be 'c'
+        }
+    }
+
+    It 'Set-JsonConnectionStringCatalog cambia el catálogo de ConnectionStrings y no toca el resto' {
+        $f = Join-Path $script:tmp 'site\appsettings.Production.json'
+        '{"ConnectionStrings":{"DefaultConnection":"Server=x;Initial Catalog=CCEspana;User ID=u","Logs":"Server=x;Database=Logs"},"Otro":"Initial Catalog=CCEspana"}' |
+            Set-Content $f
+        InModuleScope PublishToIIS -Parameters @{ f = $f } {
+            Set-JsonConnectionStringCatalog -Path $f -DatabaseMap @{ ccespana = 'CCEspana_marc' } | Should -Be 1
+            $j = Get-Content $f -Raw | ConvertFrom-Json
+            $j.ConnectionStrings.DefaultConnection | Should -Match 'Initial Catalog=CCEspana_marc;'
+            $j.ConnectionStrings.Logs | Should -Match 'Database=Logs'
+            $j.Otro | Should -Be 'Initial Catalog=CCEspana'
+            Set-JsonConnectionStringCatalog -Path (Join-Path (Split-Path $f) 'no.json') -DatabaseMap @{ a = 'b' } | Should -Be 0
+        }
+    }
+
+    It 'Invoke-DeployOrder (dry-run) dice el tipo: aspnetcore para la API, mvc para el e-market' {
+        (Invoke-DeployOrder -Environment 'deveco-api-marc' -Branch 'main_SI-2066' 6>$null).kind | Should -Be 'aspnetcore'
+        (Invoke-DeployOrder -Environment 'devecoesp1' -Branch 'main' 6>$null).kind | Should -Be 'mvc'
+    }
+
+    It 'el hotfix rechaza un entorno aspnetcore antes de tocar nada' {
+        $envFile = Join-Path $script:tmp '.publish-env.json'
+        [pscustomobject]@{ name = 'wt-api-hotfix'; kind = 'aspnetcore'; origin = 'C:\no\existe'; destination = 'C:\tampoco' } |
+            ConvertTo-Json | Set-Content $envFile -Encoding UTF8
+        { Get-HotfixTarget -EnvironmentFile $envFile } | Should -Throw '*se republica entero*'
+    }
+
+    It 'la entrada de deveco-api-marc declara lo que necesita una API nueva' {
+        $cfg = Get-PublishConfig -Environment 'deveco-api-marc'
+        $cfg.kind | Should -Be 'aspnetcore'
+        $cfg.templateSite | Should -Not -BeNullOrEmpty
+        $cfg.seedAppSettings.BackgroundServices.PriceImportEnabled | Should -BeFalse
+        $cfg.seedAppSettings.Queues.Environment | Should -Be 'deveco-api-marc'
+    }
+}
