@@ -58,6 +58,19 @@
       "siteUrl": "https://devecoand2.economitza.com",
       "responsable": "Marc"
     },
+    "deveco-api-marc": {
+      "server": "deployments-76",
+      "kind": "aspnetcore",
+      "origin": "E:\\git\\central-compres-api\\central-de-compres-integracio",
+      "destination": "E:\\wwwrootDevecoApiMarc",
+      "siteUrl": "https://deveco-api-marc.economitza.com",
+      "templateSite": "devecoesp1api.economitza.com",
+      "seedAppSettings": {
+        "Queues": { "Environment": "deveco-api-marc" },
+        "BackgroundServices": { "PriceImportEnabled": false }
+      },
+      "responsable": "Marc"
+    },
     "deveco": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
