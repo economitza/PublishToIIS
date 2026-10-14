@@ -6,6 +6,14 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.12.1] - 2026-10-14
+
+### Added
+- `tools\Install-RdpClipboardGuard.ps1`: el portapapeles compartido del escritorio remoto
+  deja de quedarse muerto en el servidor. Reinicia `rdpclip.exe` en la sesión de cada
+  usuario al iniciar sesión y en cada reconexión remota, y deja en el escritorio un
+  acceso directo «Reiniciar portapapeles» (Ctrl+Alt+V) para cuando falle a media sesión.
+
 ## [0.12.0] - 2026-10-14
 
 ### Added

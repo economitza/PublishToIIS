@@ -132,6 +132,12 @@ Uso rápido:
   `tools\Install-AspNetCorePrereqs.ps1` (elevado, con el usuario de la tarea
   «Publish Local»; `-DryRun` enseña lo que haría).
 
+- Portapapeles del escritorio remoto: si copiar en el equipo local y pegar en el
+  servidor deja de funcionar, es `rdpclip.exe` colgado en la sesión del servidor.
+  `tools\Install-RdpClipboardGuard.ps1` (elevado, una vez por servidor) lo reinicia
+  solo al iniciar sesión y en cada reconexión, y deja el acceso directo
+  «Reiniciar portapapeles» (Ctrl+Alt+V) en el escritorio para reiniciarlo a mano.
+
 - Actualizar el publicador de un servidor SIN RDP: `Request-RemoteUpdate -Server
   deployments-76`. Encola una orden `kind=update` en la misma cola que los
   despliegues (nunca coincide con un publish), la tarea elevada hace `git pull`
