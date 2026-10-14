@@ -859,6 +859,46 @@ Describe 'Tokens por servidor y Get-DeployServerUrl' {
     }
 }
 
+Describe 'Cliente remoto en Linux (sin ProgramData ni COMPUTERNAME)' {
+    BeforeEach {
+        $script:prev = @{}
+        foreach ($v in 'ProgramData', 'COMPUTERNAME', 'USERNAME', 'XDG_DATA_HOME') {
+            $script:prev[$v] = [Environment]::GetEnvironmentVariable($v)
+        }
+    }
+    AfterEach {
+        foreach ($v in $script:prev.Keys) { [Environment]::SetEnvironmentVariable($v, $script:prev[$v]) }
+    }
+
+    It 'Get-PublishDataDir usa ProgramData cuando existe' {
+        $env:ProgramData = 'C:\PD'
+        InModuleScope PublishToIIS { Get-PublishDataDir } | Should -Be (Join-Path 'C:\PD' 'PublishToIIS')
+    }
+
+    It 'Get-PublishDataDir cae a XDG_DATA_HOME, y si no a ~/.local/share' {
+        $env:ProgramData = $null
+        $env:XDG_DATA_HOME = Join-Path $TestDrive 'xdg'
+        InModuleScope PublishToIIS { Get-PublishDataDir } | Should -Be (Join-Path (Join-Path $TestDrive 'xdg') 'PublishToIIS')
+        $env:XDG_DATA_HOME = $null
+        InModuleScope PublishToIIS { Get-PublishDataDir } | Should -Be (Join-Path (Join-Path $HOME '.local/share') 'PublishToIIS')
+    }
+
+    It 'Get-RequesterIdentity cae al nombre de la máquina y del usuario del proceso' {
+        $env:COMPUTERNAME = $null
+        $env:USERNAME = $null
+        InModuleScope PublishToIIS { Get-RequesterIdentity } |
+            Should -Be "$([Environment]::MachineName)\$([Environment]::UserName)"
+    }
+
+    It 'Get-DeployToken lee el token del registro de la carpeta de datos por defecto' {
+        $env:ProgramData = $null
+        $env:XDG_DATA_HOME = Join-Path $TestDrive 'xdg-tok'
+        Set-DeployToken -Server 'srvL' -Token 'tok-L'
+        Get-DeployToken -Server 'srvL' | Should -Be 'tok-L'
+        Test-Path (Join-Path $TestDrive 'xdg-tok/PublishToIIS/tokens/srvL.txt') | Should -BeTrue
+    }
+}
+
 Describe 'Register-Dashboard' {
     It 'localiza el repo y ejecuta el script de registro del dashboard' {
         $fakeRepo = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_dash_" + [Guid]::NewGuid())

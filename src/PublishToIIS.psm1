@@ -1882,15 +1882,21 @@ function Get-RequesterIdentity {
     # Quién pide la publicación, como EQUIPO\usuario del proceso actual. Es el
     # valor por defecto de -RequestedBy en toda la cadena: quien lo recibe de
     # fuera (endpoint, cola, orden) conserva el recibido y solo cae aquí si falta.
-    "$env:COMPUTERNAME\$env:USERNAME"
+    # Linux (cliente remoto) no define COMPUTERNAME ni USERNAME.
+    $equipo = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
+    $usuario = if ($env:USERNAME) { $env:USERNAME } else { [Environment]::UserName }
+    "$equipo\$usuario"
 }
 
 function Get-PublishDataDir {
     # Carpeta de intercambio entre el proceso SIN privilegios (que deja la orden)
-    # y la tarea elevada 'Publish Local' (que la consume).
+    # y la tarea elevada 'Publish Local' (que la consume). En Linux, donde solo
+    # se usa como cliente remoto (tokens\), la carpeta de datos del usuario (XDG).
     param([string]$DataDir)
     if ($DataDir) { return $DataDir }
-    Join-Path $env:ProgramData 'PublishToIIS'
+    if ($env:ProgramData) { return Join-Path $env:ProgramData 'PublishToIIS' }
+    $base = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $HOME '.local/share' }
+    Join-Path $base 'PublishToIIS'
 }
 
 function Get-AllowedEnvironments {

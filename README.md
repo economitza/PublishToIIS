@@ -79,6 +79,10 @@ Uso rápido:
       Request-RemotePublish -Url https://deployments-76.economitza.com `
           -Environment devecoesp1 -Branch main_deploy-20260901 -Execute
 
+  El cliente remoto funciona también desde Linux con pwsh 7 (clon del repo e
+  `Import-Module <clon>/PublishToIIS.psd1`): `Set-DeployToken` guarda allí el
+  token en `~/.local/share/PublishToIIS/tokens/` (o bajo `$XDG_DATA_HOME`).
+
   Piezas sueltas, por si se quiere disparar a mano o desde otro lenguaje:
   `Write-PublishOrder` deja `%ProgramData%\PublishToIIS\publish-order.json`
   (`{"environment":"...","branch":"...","execute":true}`), `schtasks /run /tn

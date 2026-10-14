@@ -6,6 +6,16 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.11.0] - 2026-10-14
+
+### Added
+- **Cliente remoto desde Linux** (pwsh 7): `Request-RemotePublish`,
+  `Request-RemoteDbRefresh`, `Request-RemoteUpdate` y `Get-RemoteDeployVersion`
+  funcionan desde un equipo Linux. Sin `ProgramData`, el registro de tokens va a
+  `$XDG_DATA_HOME/PublishToIIS` (o `~/.local/share/PublishToIIS`), y sin
+  `COMPUTERNAME`/`USERNAME` el `requestedBy` sale de la máquina y el usuario del
+  proceso. Publicar en local sigue siendo solo Windows.
+
 ## [0.10.0] - 2026-10-07
 
 ### Fixed
