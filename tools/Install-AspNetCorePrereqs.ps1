@@ -9,16 +9,19 @@
       1) SDK de .NET del canal indicado (el Hosting Bundle de IIS solo trae el runtime, que sirve
          la API pero no la compila), instalado con dotnet-install.ps1 en la carpeta de dotnet.
       2) Clon del repo de la API junto al del e-market (por defecto E:\git\central-compres-api),
-         con el mismo protocolo (SSH o HTTPS) que el clon del e-market, que ya sabe autenticarse.
+         con el mismo protocolo (SSH o HTTPS) que el clon del e-market. Por HTTPS se autentica
+         con el token de GitLab, guardado solo en la configuración de ESE clon (cabecera
+         http.extraHeader) y con acceso solo para administradores y SYSTEM: la credencial que
+         use el e-market no se toca.
       3) NuGet.Config en la carpeta común de los clones (E:\git\NuGet.Config) con el registro
          NuGet de GitLab, donde el CI publica EconomitzaDB. dotnet lo encuentra subiendo desde el
          proyecto, sea cual sea el usuario. Acceso solo para administradores y SYSTEM: lleva el token.
       4) Comprobación: dotnet restore del proyecto de la API.
 
-    El token es de GitLab con permiso de leer paquetes: un token de acceso personal con alcance
-    `read_api` o un token de despliegue del proyecto economitzadbnuget con `read_package_registry`.
-    Si no se pasa -NuGetToken, se lee del portapapeles: pegar en la consola de un escritorio
-    remoto falla a menudo aunque el portapapeles llegue.
+    El token es un token de acceso personal de GitLab con `read_repository` (clonar por HTTPS) y
+    `read_api` (paquetes NuGet); se comprueban sus alcances antes de usarlo. Si no se pasa
+    -GitLabToken, se lee del portapapeles: pegar en la consola de un escritorio remoto falla a
+    menudo aunque el portapapeles llegue.
 
 .EXAMPLE
     .\tools\Install-AspNetCorePrereqs.ps1 -DryRun
@@ -32,22 +35,63 @@ param(
     [string]$ApiRepo = 'central-compres-api',
     [string]$ApiRepoPath = 'economitza/api/central-compres-api.git',
     [string]$ApiProject = 'central-de-compres-integracio\central-de-compres-integracio.csproj',
+    [string]$GitLabUrl = 'https://git.rcassociats.com',
     [string]$NuGetFeedUrl = 'https://git.rcassociats.com/api/v4/projects/218/packages/nuget/index.json',
-    # Usuario de GitLab del token personal, o el usuario del token de despliegue
-    [string]$NuGetUser,
-    [securestring]$NuGetToken,
+    # Usuario de GitLab dueño del token
+    [string]$GitLabUser,
+    [securestring]$GitLabToken,
     [string]$PublishTaskName = 'Publish Local',
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin -and -not $DryRun) { throw 'Lánzalo en una consola elevada (instala el SDK y protege el NuGet.Config).' }
+if (-not $isAdmin -and -not $DryRun) { throw 'Lánzalo en una consola elevada (instala el SDK y protege los ficheros con el token).' }
 
 $yo = "$env:USERDOMAIN\$env:USERNAME"
 $tarea = Get-ScheduledTask -TaskName $PublishTaskName -ErrorAction SilentlyContinue
 if ($tarea -and $tarea.Principal.UserId -and ($tarea.Principal.UserId -notlike "*$env:USERNAME")) {
     Write-Warning "La tarea '$PublishTaskName' corre como '$($tarea.Principal.UserId)' y tú eres '$yo': el clon tiene que hacerlo ese usuario (sus claves SSH o credenciales de git)."
+}
+
+function Protect-SecretFile([string]$Path) {
+    # Solo administradores y SYSTEM (por SID: los nombres de grupo cambian con el idioma)
+    & icacls $Path /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+    if ($LASTEXITCODE) { throw "icacls no pudo proteger $Path ($LASTEXITCODE)." }
+}
+
+$script:credencial = $null
+function Get-GitLabCredential {
+    <# Usuario y token, pedidos una vez y con sus alcances comprobados en GitLab. #>
+    if ($script:credencial) { return $script:credencial }
+    $usuario = if ($GitLabUser) { $GitLabUser } else { Read-Host 'Usuario de GitLab dueño del token' }
+    if ($GitLabToken) {
+        $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($GitLabToken))
+    }
+    else {
+        # Pegar en la consola de un escritorio remoto falla a menudo aunque el portapapeles
+        # llegue (el Bloc de notas sí pega): el token se lee directamente del portapapeles.
+        Read-Host 'Copia el token de GitLab en tu equipo y pulsa Intro aquí (se lee del portapapeles)' | Out-Null
+        $token = ([string](Get-Clipboard -Raw)).Trim()
+        if ($token -notmatch '^[A-Za-z0-9._-]{20,}$') {
+            throw "El portapapeles no tiene un token de GitLab ($($token.Length) caracteres, o con espacios). Cópialo otra vez y relanza."
+        }
+        Set-Clipboard -Value ' '   # que el token no se quede en el portapapeles
+        Write-Host "      token leído del portapapeles ($($token.Length) caracteres) y portapapeles vaciado" -ForegroundColor Gray
+    }
+    try {
+        $info = Invoke-RestMethod -Uri "$GitLabUrl/api/v4/personal_access_tokens/self" -Headers @{ 'PRIVATE-TOKEN' = $token } -UseBasicParsing
+    }
+    catch { throw "GitLab no acepta el token ($($_.Exception.Message)): ¿caducado, revocado o mal copiado?" }
+    $faltan = @('read_repository', 'read_api') | Where-Object { $_ -notin $info.scopes -and 'api' -notin $info.scopes }
+    if ($faltan) {
+        throw ("Al token '$($info.name)' le faltan alcances: $($faltan -join ', ') (tiene: $($info.scopes -join ', ')). " +
+               "Crea uno con read_repository y read_api en $GitLabUrl/-/user_settings/personal_access_tokens y revoca este.")
+    }
+    Write-Host "      token '$($info.name)' válido ($($info.scopes -join ', '), caduca $($info.expires_at))" -ForegroundColor Gray
+    $script:credencial = [pscustomobject]@{ user = $usuario; token = $token }
+    $script:credencial
 }
 
 # 1) SDK
@@ -63,7 +107,6 @@ elseif ($DryRun) {
 }
 else {
     $installer = Join-Path $env:TEMP 'dotnet-install.ps1'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri 'https://dot.net/v1/dotnet-install.ps1' -OutFile $installer -UseBasicParsing
     & $installer -Channel $SdkChannel -InstallDir $dotnetDir -NoPath
     $sdkCanal = @(& $dotnet --list-sdks) | Where-Object { $_ -like "$SdkChannel.*" } | Select-Object -First 1
@@ -74,8 +117,8 @@ else {
 # 2) Clon de la API, con el protocolo del clon del e-market
 $apiDir = Join-Path $GitRoot $ApiRepo
 $webDir = Join-Path $GitRoot $WebRepo
-# Un clon cortado a medias (Ctrl+C) deja la carpeta sin HEAD: se rehace.
-if ((Test-Path (Join-Path $apiDir '.git')) -and -not $DryRun) {
+# Un clon cortado a medias (Ctrl+C, credenciales rechazadas) deja la carpeta sin HEAD: se rehace.
+if ((Test-Path $apiDir) -and -not $DryRun) {
     & git -C $apiDir rev-parse --verify --quiet HEAD *> $null
     if ($LASTEXITCODE) {
         Write-Warning "$apiDir es un clon a medias (sin HEAD): se borra y se vuelve a clonar."
@@ -87,13 +130,14 @@ if (Test-Path (Join-Path $apiDir '.git')) {
 }
 else {
     $webUrl = (git -C $webDir remote get-url origin).Trim()
+    $https = $webUrl -match '^https?://'
     $apiUrl = if ($webUrl -match '^(git@[^:]+:)') { "$($Matches[1])$ApiRepoPath" }
-              elseif ($webUrl -match '^(https?://[^/]+/)') { "$($Matches[1])$ApiRepoPath" }
+              elseif ($https) { "$($GitLabUrl.TrimEnd('/'))/$ApiRepoPath" }
               else { throw "No reconozco el remoto del e-market ('$webUrl') para deducir el de la API." }
     $sshCmd = (git -C $webDir config --get core.sshCommand)
-    Write-Host "      e-market: $webUrl$(if ($sshCmd) { " (core.sshCommand: $sshCmd)" })" -ForegroundColor Gray
+    Write-Host "      e-market: $(($webUrl -replace '//[^@/]+@', '//')) $(if ($sshCmd) { "(core.sshCommand: $sshCmd)" })" -ForegroundColor Gray
     if ($DryRun) {
-        Write-Host "[2/4] Clonaría $apiUrl en $apiDir" -ForegroundColor Yellow
+        Write-Host "[2/4] Clonaría $apiUrl en $apiDir$(if ($https) { ' con el token de GitLab' })" -ForegroundColor Yellow
     }
     else {
         Write-Host "[2/4] Clonando $apiUrl en $apiDir..." -ForegroundColor Yellow
@@ -102,11 +146,27 @@ else {
         $env:GIT_TERMINAL_PROMPT = '0'
         $env:GCM_INTERACTIVE = 'never'
         $env:GIT_SSH_COMMAND = "$(if ($sshCmd) { $sshCmd } else { 'ssh' }) -oBatchMode=yes -oStrictHostKeyChecking=accept-new -oConnectTimeout=20"
-        git clone $apiUrl $apiDir
+        $cabecera = $null
+        if ($https) {
+            # La credencial que use el e-market no vale para la API (aquí falló con 128): este clon
+            # lleva su propia cabecera con el token, sin tocar el gestor de credenciales.
+            $cred = Get-GitLabCredential
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($cred.user):$($cred.token)"))
+            $cabecera = "Authorization: Basic $basic"
+            git -c "http.extraHeader=$cabecera" -c credential.helper= clone $apiUrl $apiDir
+        }
+        else {
+            git clone $apiUrl $apiDir
+        }
         if ($LASTEXITCODE) {
-            throw ("git clone $apiUrl falló ($LASTEXITCODE). Comprueba con este mismo usuario si el e-market sí puede: " +
-                   "'git -C $webDir fetch'. Si ese funciona y este no, esta cuenta no tiene acceso a $ApiRepoPath en GitLab " +
-                   "(p. ej. una clave de despliegue dada de alta solo en el proyecto del e-market).")
+            throw ("git clone $apiUrl falló ($LASTEXITCODE). " +
+                   $(if ($https) { "Con un token válido y con read_repository, es que tu usuario no tiene acceso a $ApiRepoPath en GitLab." }
+                     else { "Comprueba con este mismo usuario si el e-market sí puede ('git -C $webDir fetch'); si ese funciona y este no, la clave SSH no tiene acceso a $ApiRepoPath." }))
+        }
+        if ($cabecera) {
+            # Para los fetch del publicador: la cabecera en la config de ESE clon, protegida
+            git -C $apiDir config http.extraHeader $cabecera
+            Protect-SecretFile (Join-Path $apiDir '.git\config')
         }
         Write-Host "[2/4] Clonado $apiUrl en $apiDir" -ForegroundColor Green
     }
@@ -119,26 +179,11 @@ if ($yaEsta) {
     Write-Host "[3/4] $nugetConfig ya declara el registro de GitLab" -ForegroundColor Gray
 }
 elseif ($DryRun) {
-    Write-Host "[3/4] Escribiría $nugetConfig con el registro $NuGetFeedUrl (token pedido por consola; solo administradores y SYSTEM)" -ForegroundColor Yellow
+    Write-Host "[3/4] Escribiría $nugetConfig con el registro $NuGetFeedUrl (con el token; solo administradores y SYSTEM)" -ForegroundColor Yellow
 }
 else {
     if (Test-Path $nugetConfig) { throw "$nugetConfig ya existe sin el registro de GitLab: revísalo a mano en vez de pisarlo." }
-    if (-not $NuGetUser) { $NuGetUser = Read-Host 'Usuario de GitLab del token (o el del token de despliegue)' }
-    if ($NuGetToken) {
-        $plano = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($NuGetToken))
-    }
-    else {
-        # Pegar en la consola de un escritorio remoto falla a menudo aunque el portapapeles
-        # llegue (el Bloc de notas sí pega): el token se lee directamente del portapapeles.
-        Read-Host 'Copia el token de GitLab en tu equipo y pulsa Intro aquí (se lee del portapapeles)' | Out-Null
-        $plano = ([string](Get-Clipboard -Raw)).Trim()
-        if ($plano -notmatch '^[A-Za-z0-9._-]{20,}$') {
-            throw "El portapapeles no tiene un token de GitLab ($($plano.Length) caracteres, o con espacios). Cópialo otra vez y relanza."
-        }
-        Set-Clipboard -Value ' '   # que el token no se quede en el portapapeles
-        Write-Host "      token leído del portapapeles ($($plano.Length) caracteres) y portapapeles vaciado" -ForegroundColor Gray
-    }
-    $esc = [Security.SecurityElement]::Escape($plano)
+    $cred = Get-GitLabCredential
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Lo escribe PublishToIIS\tools\Install-AspNetCorePrereqs.ps1: fuentes NuGet para los clones de $GitRoot. -->
@@ -148,14 +193,14 @@ else {
   </packageSources>
   <packageSourceCredentials>
     <gitlab-economitza>
-      <add key="Username" value="$NuGetUser" />
-      <add key="ClearTextPassword" value="$esc" />
+      <add key="Username" value="$([Security.SecurityElement]::Escape($cred.user))" />
+      <add key="ClearTextPassword" value="$([Security.SecurityElement]::Escape($cred.token))" />
     </gitlab-economitza>
   </packageSourceCredentials>
 </configuration>
 "@
     [IO.File]::WriteAllText($nugetConfig, $xml, (New-Object System.Text.UTF8Encoding($false)))
-    & icacls $nugetConfig /inheritance:r /grant:r 'BUILTIN\Administrators:F' 'NT AUTHORITY\SYSTEM:F' | Out-Null
+    Protect-SecretFile $nugetConfig
     Write-Host "[3/4] Escrito $nugetConfig (solo administradores y SYSTEM)" -ForegroundColor Green
 }
 
