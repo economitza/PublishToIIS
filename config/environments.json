@@ -43,6 +43,14 @@
       "templateSite": "devecoesp2",
       "responsable": "Marc"
     },
+    "deveco-archeology-esp": {
+      "server": "deployments-76",
+      "origin": "E:\\git\\central-de-compres\\CentralCompres",
+      "destination": "E:\\wwwrootDevecoArcheologyEsp",
+      "siteUrl": "https://deveco-archeology-esp.economitza.com",
+      "templateSite": "devecoesp2",
+      "responsable": "Joaquim"
+    },
     "devecoesp-audit": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
