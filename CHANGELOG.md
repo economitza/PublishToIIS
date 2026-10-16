@@ -6,6 +6,19 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.13.2] - 2026-10-16
+
+### Added
+- **Entorno `deveco-experimental-and`** en `config\environments.json` (Andorra, plantilla
+  `devecoand1`): la rama experimental de favoritos por centro deja de publicarse con un
+  entorno ad hoc.
+
+### Fixed
+- **Publicar por rama no pierde commits locales**: si la rama local del origen lleva commits
+  que origin no tiene (un worktree de trabajo sin pushear), antes de reponerla con
+  `checkout -B` se guardan en `refs/publish-backup/<rama>/<fecha>` y se avisa de cómo
+  recuperarlos. Antes se quedaban solo en el reflog y el árbol cambiaba a mitad de trabajo.
+
 ## [0.13.1] - 2026-10-16
 
 ### Fixed
