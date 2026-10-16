@@ -1990,6 +1990,11 @@ function New-DbRefreshSnapshot {
     $cfg = $cfgText | ConvertFrom-Json
 
     $rutas = @('tools/db-refresh') + @(@($cfg.sanitizeSqlFile, $cfg.alignSqlFile) | Where-Object { $_ })
+    # La fase de IDENTITY (Repair-IdentityColumns.ps1) lee del modelo de la web qué claves genera la
+    # BD (DCModel.dbml y las entidades mapeadas a mano): sin él se cae al final del refresco.
+    $modelo = 'CentralCompres/Models'
+    & git -C $Repo cat-file -e "${sha}:$modelo" 2>$null
+    if (-not $LASTEXITCODE) { $rutas += $modelo }
     if (Test-Path $Destination) { Remove-Item $Destination -Recurse -Force }
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $zip = Join-Path $Destination 'snapshot.zip'

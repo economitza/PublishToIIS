@@ -1758,6 +1758,23 @@ Describe 'Carril de refresco, candado por BD e instantánea de las herramientas'
             Test-Path (Join-Path $c.root 'tools\db-refresh\replica.connection.json') | Should -BeTrue
         }
 
+        It 'lleva el modelo de la web, que la fase de IDENTITY lee, si el commit lo trae' {
+            New-Item -ItemType Directory -Path (Join-Path $script:repo 'CentralCompres\Models\Model') -Force | Out-Null
+            '<Database />' | Set-Content (Join-Path $script:repo 'CentralCompres\Models\Model\DCModel.dbml')
+            'class X {}' | Set-Content (Join-Path $script:repo 'CentralCompres\Models\Entidad.cs')
+            & git -C $script:repo add -A
+            & git -C $script:repo -c user.name=t -c user.email=t@t commit -q -m modelo
+            $c = New-DbRefreshSnapshot -Repo $script:repo -Destination (Join-Path $script:root 'copia')
+            Test-Path (Join-Path $c.root 'CentralCompres\Models\Model\DCModel.dbml') | Should -BeTrue
+            Test-Path (Join-Path $c.root 'CentralCompres\Models\Entidad.cs') | Should -BeTrue
+        }
+
+        It 'sin modelo en el commit la copia se hace igual' {
+            $c = New-DbRefreshSnapshot -Repo $script:repo -Destination (Join-Path $script:root 'copia')
+            Test-Path $c.script | Should -BeTrue
+            Test-Path (Join-Path $c.root 'CentralCompres') | Should -BeFalse
+        }
+
         It 'sin la sanitización en el commit no hay copia' {
             & git -C $script:repo rm -q docs/sanitize-test-db.sql
             & git -C $script:repo -c user.name=t -c user.email=t@t commit -q -m sin-sanitizar
