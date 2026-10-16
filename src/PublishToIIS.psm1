@@ -911,6 +911,7 @@ function New-DeployInfo {
     )
 
     $branch = $null; $commit = $null; $commitFull = $null; $commitDate = $null
+    $detached = $false; $containedIn = $null
 
     $git = Get-Command git -ErrorAction SilentlyContinue
     if ($git) {
@@ -924,6 +925,18 @@ function New-DeployInfo {
             $commitFull = ("$(& git -C $ProjectPath rev-parse HEAD 2>$null)").Trim()
             $commit = ("$(& git -C $ProjectPath rev-parse --short=9 HEAD 2>$null)").Trim()
             $commitDate = ("$(& git -C $ProjectPath show -s --format=%cI HEAD 2>$null)").Trim()
+            if ($branch -eq 'HEAD') {
+                # Publicado por commit (HEAD desacoplado). La rama solo se anota si alguna de
+                # origin tiene ESE commit en la punta: «la última rama que lo contiene» sería,
+                # para un commit viejo, la -next de hoy, y el sello diría que sirve la -next.
+                # Dónde está el commit lo dice containedIn: rama más cercana y distancia (main~312).
+                $detached = $true
+                $puntas = @(& git -C $ProjectPath for-each-ref --points-at HEAD --format='%(refname:short)' refs/remotes/origin |
+                    Where-Object { $_ -and $_ -notin @('origin', 'origin/HEAD') })
+                $branch = if ($puntas.Count) { $puntas[0] -replace '^origin/', '' } else { '' }
+                $cercana = "$(& git -C $ProjectPath name-rev --name-only --refs='refs/remotes/origin/*' --exclude='refs/remotes/origin/HEAD' HEAD)".Trim()
+                if ($cercana -and $cercana -ne 'undefined') { $containedIn = $cercana -replace '^(remotes/)?origin/', '' }
+            }
         }
     }
 
@@ -934,6 +947,8 @@ function New-DeployInfo {
 
     $info = [pscustomobject]@{
         branch      = $branch
+        detached    = [bool]$detached
+        containedIn = $containedIn
         commit      = $commit
         commitFull  = $commitFull
         commitDate  = $commitDate
@@ -999,6 +1014,114 @@ function Restore-NuGetPackages {
     & $nuget restore $ProjectFile -SolutionDirectory $solutionDir -NonInteractive
     if ($LASTEXITCODE -ne 0) { throw "nuget restore failed with exit code $LASTEXITCODE." }
 }
+
+function Clear-PriorBuildWrites {
+    <#
+    .SYNOPSIS
+        Olvida lo que escribió la build anterior del proyecto (obj\*\*.FileListAbsolute.txt).
+    .DESCRIPTION
+        El origen del servidor es un clon compartido por todos los entornos y conserva obj\
+        entre publicaciones. El IncrementalClean de MSBuild borra de bin\ lo que escribió la
+        build anterior y la actual ya no escribe: al publicar un commit viejo después de main,
+        borraba DLL que ese commit lleva versionadas en bin\ (MvcCheckBoxList.dll) y las vistas
+        dejaban de compilar. Sin la lista, no borra nada; lo compilado en obj\ sigue sirviendo.
+    #>
+    param([Parameter(Mandatory)][string]$ProjectFile)
+    $obj = Join-Path (Split-Path $ProjectFile -Parent) 'obj'
+    if (-not (Test-Path $obj)) { return }
+    Get-ChildItem -Path $obj -Recurse -File -Filter *.FileListAbsolute.txt -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+function Write-BuildOutput {
+    <#
+    .SYNOPSIS
+        Pasa la salida de MSBuild/dotnet al host y guarda las primeras líneas de error.
+    .DESCRIPTION
+        Con «MSBuild failed with exit code 1» a secas, quien publica en remoto no sabe por qué
+        ha fallado. Las líneas de error viajan en el mensaje del resultado (Format-BuildErrors).
+        Escribir con Write-Host deja además la salida en el transcript (GET /api/log).
+    #>
+    param(
+        [Parameter(ValueFromPipeline)]$Line,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Errors,
+        [int]$Max = 5
+    )
+    process {
+        $texto = "$Line"
+        Write-Host $texto
+        if ($Errors.Count -lt $Max -and $texto -match ':\s*error\s*[A-Z]{0,4}\d*\s*:') {
+            $limpio = ($texto -replace '\s*\[[^\]]+proj\]\s*$', '').Trim()
+            if ($limpio.Length -gt 400) { $limpio = $limpio.Substring(0, 400) + '...' }
+            if (-not $Errors.Contains($limpio)) { $Errors.Add($limpio) }
+        }
+    }
+}
+
+function Format-BuildErrors {
+    # Sufijo del mensaje de fallo de la build: ' Errores: a | b', o vacío si no se capturó ninguno.
+    param([System.Collections.Generic.List[string]]$Errors)
+    if (-not $Errors -or $Errors.Count -eq 0) { return '' }
+    return ' Errores: ' + ($Errors -join ' | ')
+}
+
+function Test-CommitRef {
+    # Un SHA de commit, abreviado (7+) o completo: se publica con HEAD desacoplado.
+    param([string]$Ref)
+    return [bool]($Ref -match '^[0-9a-fA-F]{7,40}$')
+}
+
+function Invoke-RefCheckout {
+    <#
+    .SYNOPSIS
+        Deja la copia de despliegue en la referencia pedida (hecho ya el fetch).
+
+    .DESCRIPTION
+        Una rama de origin se crea o se REPONE a su punta (checkout -B): la copia del
+        servidor es de despliegue, no un sitio de trabajo, y con checkout + pull --ff-only
+        una rama reescrita en origin (rebase + push forzado) fallaba con código 128.
+
+        Un SHA (Test-CommitRef) que no sea el nombre de una rama de origin se publica
+        tal cual, con HEAD desacoplado: publicar un commit no obliga a crear una rama.
+        Tiene que estar en alguna rama de origin, que es lo que trae el fetch.
+
+        Después repone los ficheros versionados que falten en el árbol: un checkout a la
+        misma punta no los recupera, y una build anterior pudo borrarlos de bin\.
+
+    .OUTPUTS
+        'branch' o 'commit'.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$Ref
+    )
+    $esRama = [bool]("$(& git -C $Repo rev-parse --verify --quiet "refs/remotes/origin/$Ref")".Trim())
+    if (-not $esRama -and (Test-CommitRef $Ref)) {
+        $sha = "$(& git -C $Repo rev-parse --verify --quiet "${Ref}^{commit}")".Trim()
+        if (-not $sha) {
+            throw "El commit '$Ref' no está en $Repo tras el fetch: ¿está pusheado a alguna rama de origin?"
+        }
+        & git -C $Repo -c advice.detachedHead=false checkout --detach $sha | Write-Host
+        if ($LASTEXITCODE) { throw "git checkout --detach $sha falló (código $LASTEXITCODE)." }
+        $modo = 'commit'
+    }
+    else {
+        & git -C $Repo checkout -B $Ref "origin/$Ref" | Write-Host
+        if ($LASTEXITCODE) { throw "git checkout -B $Ref origin/$Ref falló (código $LASTEXITCODE): ¿existe la rama en origin?" }
+        $modo = 'branch'
+    }
+    $borrados = @(& git -C $Repo -c core.quotepath=off ls-files --deleted | Where-Object { $_ })
+    if ($borrados.Count) {
+        Write-Host "Reponiendo $($borrados.Count) fichero(s) versionado(s) que faltaban: $(($borrados | Select-Object -First 5) -join ', ')" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $borrados.Count; $i += 100) {
+            $lote = $borrados[$i..([Math]::Min($i + 99, $borrados.Count - 1))]
+            & git -C $Repo checkout -- @lote | Write-Host
+            if ($LASTEXITCODE) { throw "No se pudieron reponer los ficheros versionados borrados (código $LASTEXITCODE)." }
+        }
+    }
+    return $modo
+}
+
 function Publish {
     param(
         [string]$ProjectPath,
@@ -1143,9 +1266,11 @@ function Publish {
             # de la máquina: una privada (EconomitzaDB en el registro de GitLab) tiene que
             # estar dada de alta en un NuGet.Config que vea quien ejecuta la tarea.
             Write-Host "Running dotnet publish into releasing directory..." -ForegroundColor Yellow
-            & $dotnet publish $projectToBuild -c $Configuration -o $releasingDir --nologo -v minimal @extraProps
+            $erroresBuild = New-Object System.Collections.Generic.List[string]
+            & $dotnet publish $projectToBuild -c $Configuration -o $releasingDir --nologo -v minimal @extraProps |
+                Write-BuildOutput -Errors $erroresBuild
             if ($LASTEXITCODE -ne 0) {
-                throw "dotnet publish failed with exit code $LASTEXITCODE."
+                throw "dotnet publish failed with exit code $LASTEXITCODE.$(Format-BuildErrors $erroresBuild)"
             }
             Write-Host "dotnet publish completed" -ForegroundColor Green
 
@@ -1163,7 +1288,9 @@ function Publish {
         else {
             Write-Host "Running MSBuild publish into releasing directory..." -ForegroundColor Yellow
             Restore-NuGetPackages -ProjectFile $projectToBuild
+            Clear-PriorBuildWrites -ProjectFile $projectToBuild
 
+            $erroresBuild = New-Object System.Collections.Generic.List[string]
             & $msbuild $projectToBuild `
                 /p:Configuration=$Configuration `
                 /p:DeployOnBuild=true `
@@ -1171,10 +1298,10 @@ function Publish {
                 /p:WebPublishMethod=FileSystem `
                 /p:DeployTarget=WebPublish `
                 @extraProps `
-                /v:minimal
+                /v:minimal | Write-BuildOutput -Errors $erroresBuild
 
             if ($LASTEXITCODE -ne 0) {
-                throw "MSBuild failed with exit code $LASTEXITCODE."
+                throw "MSBuild failed with exit code $LASTEXITCODE.$(Format-BuildErrors $erroresBuild)"
             }
 
             Write-Host "MSBuild publish completed" -ForegroundColor Green
@@ -1384,6 +1511,7 @@ function Invoke-DeployOrder {
         environment       = $Environment
         kind              = $kind
         branch            = $Branch
+        checkout          = if (Test-CommitRef $Branch) { 'commit, HEAD desacoplado (si no hay rama con ese nombre)' } else { 'rama, punta de origin' }
         requestedBy       = $RequestedBy
         repo              = $repo
         origin            = $cfg.origin
@@ -1413,11 +1541,9 @@ function Invoke-DeployOrder {
     try {
         & git -C $repo fetch --prune
         if ($LASTEXITCODE) { throw "git fetch falló (código $LASTEXITCODE). Si pide credenciales u host key, ejecuta 'git -C $repo fetch' una vez a mano con el mismo usuario." }
-        # El checkout del servidor es una copia de despliegue, no un sitio de trabajo: la rama local
-        # se crea o se REPONE a la punta de origin (checkout -B). Con checkout + pull --ff-only, una
-        # rama reescrita en origin (rebase + push forzado) fallaba con código 128 y no se publicaba.
-        & git -C $repo checkout -B $Branch "origin/$Branch"
-        if ($LASTEXITCODE) { throw "git checkout -B $Branch origin/$Branch falló (código $LASTEXITCODE): ¿existe la rama en origin?" }
+        # Rama: se repone a la punta de origin. SHA: HEAD desacoplado (Invoke-RefCheckout).
+        $modo = Invoke-RefCheckout -Repo $repo -Ref $Branch
+        Write-Host "Checkout hecho ($modo)." -ForegroundColor Gray
     }
     finally {
         $env:GIT_TERMINAL_PROMPT = $gitEnvPrev.GIT_TERMINAL_PROMPT
@@ -2631,6 +2757,18 @@ function Request-PublishQueued {
     Wait-DeployQueueItem -RunId $item.runId -DataDir $dir -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -Quiet:$Quiet
 }
 
+function Resolve-PublishRef {
+    # -Branch o -Commit, uno de los dos: la referencia que viaja en la orden.
+    param([string]$Branch, [string]$Commit)
+    if ($Branch -and $Commit) { throw 'Indica -Branch o -Commit, no los dos.' }
+    if ($Commit) {
+        if (-not (Test-CommitRef $Commit)) { throw "-Commit '$Commit' no es un SHA (7 a 40 caracteres hexadecimales)." }
+        return $Commit
+    }
+    if (-not $Branch) { throw 'Indica -Branch <rama> o -Commit <sha>.' }
+    return $Branch
+}
+
 function Request-Publish {
     <#
     .SYNOPSIS
@@ -2666,7 +2804,10 @@ function Request-Publish {
     [CmdletBinding()]
     param(
         [string]$Environment,
-        [Parameter(Mandatory)][string]$Branch,
+        [string]$Branch,
+        # Alternativa a -Branch: publica ese commit (SHA de 7 a 40 hex) con HEAD
+        # desacoplado, sin necesidad de rama. Viaja en el campo branch de la orden.
+        [string]$Commit,
         [switch]$Execute,
         [switch]$OverrideWebconfig,
         [string[]]$AllowedEnvironments,
@@ -2688,6 +2829,8 @@ function Request-Publish {
     )
 
     $ErrorActionPreference = 'Stop'
+
+    $Branch = Resolve-PublishRef -Branch $Branch -Commit $Commit
 
     if (-not $Direct -and (Test-ScheduledTaskPresent -TaskName $DrainerTaskName)) {
         return Request-PublishQueued -Environment $Environment -Branch $Branch `
@@ -3305,7 +3448,7 @@ function Invoke-DeployEndpointRequest {
         HttpListener delante.
 
         Rutas: GET /health (sin token) · GET /api/environments ·
-        POST /api/publish {environment, branch, execute, overrideWebconfig} →
+        POST /api/publish {environment, branch (rama o SHA), execute, overrideWebconfig} →
         202 con runId; la orden se ENCOLA (nunca se rechaza por otra en marcha) y
         el drenador la publica cuando le toca · POST /api/update {requestedBy} →
         202 con runId; encola la actualización del propio módulo (git pull +
@@ -3716,7 +3859,10 @@ function Request-RemotePublish {
         [string]$Server,
         [string]$Url,
         [string]$Environment,
-        [Parameter(Mandatory)][string]$Branch,
+        [string]$Branch,
+        # Alternativa a -Branch: publica ese commit (SHA de 7 a 40 hex) con HEAD
+        # desacoplado, sin necesidad de rama. Viaja en el campo branch de la orden.
+        [string]$Commit,
         [switch]$Execute,
         [switch]$OverrideWebconfig,
         # Entorno ad hoc de un worktree efímero: su definición viaja en el cuerpo
@@ -3732,6 +3878,8 @@ function Request-RemotePublish {
         [string]$RequestedBy = (Get-RequesterIdentity)
     )
     $ErrorActionPreference = 'Stop'
+
+    $Branch = Resolve-PublishRef -Branch $Branch -Commit $Commit
 
     if ($Server) {
         if (-not $Url)   { $Url = Get-DeployServerUrl -Server $Server }

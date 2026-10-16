@@ -79,6 +79,18 @@ Uso rápido:
       Request-RemotePublish -Url https://deployments-76.economitza.com `
           -Environment devecoesp1 -Branch main_deploy-20260901 -Execute
 
+  Para publicar un commit concreto no hace falta rama: `-Commit <sha>` (o el
+  SHA, de 7 a 40 caracteres hexadecimales, en `-Branch` o en el dashboard)
+  hace checkout con HEAD desacoplado. Basta con que el commit esté en alguna
+  rama de origin. En el `deploy-info.json`, `detached` es `true`; `branch` es
+  la rama de origin que tiene ese commit en la punta, o va vacía, y entonces
+  `containedIn` dice dónde está (`main~312`).
+
+      Request-RemotePublish -Server deployments-76 -Environment devecoesp1 -Commit a7282e491 -Execute
+
+  Si la build falla, el mensaje del resultado trae sus primeras líneas de
+  error; la salida entera está en el transcript (`GET /api/log`).
+
   El cliente remoto funciona también desde Linux con pwsh 7 (clon del repo e
   `Import-Module <clon>/PublishToIIS.psd1`): `Set-DeployToken` guarda allí el
   token en `~/.local/share/PublishToIIS/tokens/` (o bajo `$XDG_DATA_HOME`).

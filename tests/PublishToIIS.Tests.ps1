@@ -2740,3 +2740,136 @@ Describe 'Add-DeployInfoStaticRoute (aspnetcore)' {
         }
     }
 }
+
+
+Describe 'Publicar un commit sin rama (Invoke-RefCheckout y el sello)' {
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_ref_" + [Guid]::NewGuid())
+        $script:origen = Join-Path $script:tmp 'origen'
+        $script:clon = Join-Path $script:tmp 'clon'
+        New-Item -ItemType Directory -Path $script:origen | Out-Null
+        git -C $script:origen init --quiet --initial-branch=main
+        Set-Content -Path (Join-Path $script:origen 'a.txt') -Value 'uno'
+        git -C $script:origen add a.txt
+        git -C $script:origen -c user.email=t@t -c user.name=t commit -m 'uno' --quiet
+        $script:shaViejo = "$(git -C $script:origen rev-parse HEAD)".Trim()
+        Set-Content -Path (Join-Path $script:origen 'a.txt') -Value 'dos'
+        git -C $script:origen -c user.email=t@t -c user.name=t commit -am 'dos' --quiet
+        $script:shaPunta = "$(git -C $script:origen rev-parse HEAD)".Trim()
+        git clone --quiet $script:origen $script:clon
+        $script:out = Join-Path $script:tmp 'out'
+        New-Item -ItemType Directory -Path $script:out | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'una rama se repone a la punta de origin' {
+        InModuleScope PublishToIIS -Parameters @{ clon = $script:clon } {
+            Invoke-RefCheckout -Repo $clon -Ref 'main' 6>$null | Should -Be 'branch'
+        }
+        "$(git -C $script:clon rev-parse --abbrev-ref HEAD)".Trim() | Should -Be 'main'
+        "$(git -C $script:clon rev-parse HEAD)".Trim() | Should -Be $script:shaPunta
+    }
+
+    It 'un SHA se publica con HEAD desacoplado, sin crear rama' {
+        $corto = $script:shaViejo.Substring(0, 9)
+        InModuleScope PublishToIIS -Parameters @{ clon = $script:clon; ref = $corto } {
+            Invoke-RefCheckout -Repo $clon -Ref $ref 6>$null | Should -Be 'commit'
+        }
+        "$(git -C $script:clon rev-parse HEAD)".Trim() | Should -Be $script:shaViejo
+        "$(git -C $script:clon rev-parse --abbrev-ref HEAD)".Trim() | Should -Be 'HEAD'
+        @(git -C $script:clon branch --list $corto).Count | Should -Be 0
+    }
+
+    It 'un SHA que no está en origin falla diciendo que no está' {
+        { InModuleScope PublishToIIS -Parameters @{ clon = $script:clon } {
+                Invoke-RefCheckout -Repo $clon -Ref 'deadbeef1'
+            } } | Should -Throw '*no está en*'
+    }
+
+    It 'repone los ficheros versionados que una build anterior borró del árbol' {
+        Remove-Item (Join-Path $script:clon 'a.txt')
+        InModuleScope PublishToIIS -Parameters @{ clon = $script:clon } {
+            Invoke-RefCheckout -Repo $clon -Ref 'main' 6>$null | Out-Null
+        }
+        Get-Content (Join-Path $script:clon 'a.txt') | Should -Be 'dos'
+    }
+
+    It 'el sello deja la rama vacía y dice dónde está el commit si no es la punta de ninguna rama' {
+        git -C $script:clon -c advice.detachedHead=false checkout --quiet --detach $script:shaViejo
+        $info = New-DeployInfo -ProjectPath $script:clon -OutputDir $script:out -Environment 'e'
+        $info.detached | Should -BeTrue
+        $info.branch | Should -Be ''
+        $info.containedIn | Should -Be 'main~1'
+        $info.commitFull | Should -Be $script:shaViejo
+    }
+
+    It 'el sello anota la rama cuya punta es el commit publicado' {
+        git -C $script:clon -c advice.detachedHead=false checkout --quiet --detach $script:shaPunta
+        $info = New-DeployInfo -ProjectPath $script:clon -OutputDir $script:out -Environment 'e'
+        $info.detached | Should -BeTrue
+        $info.branch | Should -Be 'main'
+    }
+
+    It 'publicado por rama, el sello no cambia: detached falso y sin containedIn' {
+        $info = New-DeployInfo -ProjectPath $script:clon -OutputDir $script:out -Environment 'e'
+        $info.detached | Should -BeFalse
+        $info.branch | Should -Be 'main'
+        $info.containedIn | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Resolve-PublishRef (-Branch o -Commit)' {
+    It 'acepta uno de los dos y valida que -Commit sea un SHA' {
+        InModuleScope PublishToIIS {
+            Resolve-PublishRef -Branch 'main_deploy-20261015' | Should -Be 'main_deploy-20261015'
+            Resolve-PublishRef -Commit 'a7282e491' | Should -Be 'a7282e491'
+            { Resolve-PublishRef -Branch 'main' -Commit 'a7282e491' } | Should -Throw '*no los dos*'
+            { Resolve-PublishRef -Commit 'main' } | Should -Throw '*no es un SHA*'
+            { Resolve-PublishRef } | Should -Throw '*Indica -Branch*'
+        }
+    }
+
+    It 'Request-RemotePublish -Commit manda el SHA como referencia de la orden' {
+        Mock -ModuleName PublishToIIS Invoke-RestMethod { [pscustomobject]@{ runId = 'r1'; position = 1 } }
+        Request-RemotePublish -Url 'http://ep.test' -Token 't' -Environment 'devecoesp1' -Commit 'a7282e491' -NoWait | Out-Null
+        Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+            $Method -eq 'Post' -and ([Text.Encoding]::UTF8.GetString($Body) -like '*"branch":"a7282e491"*')
+        }
+    }
+}
+
+Describe 'La build en el servidor: errores en el resultado y builds anteriores' {
+    It 'guarda las primeras líneas de error sin el sufijo del proyecto' {
+        InModuleScope PublishToIIS {
+            $err = New-Object System.Collections.Generic.List[string]
+            @(
+                'Compilando...',
+                'C:\x\Foo.cs(12,5): warning CS0168: variable sin usar [C:\x\P.csproj]',
+                'e:\git\V\Index.cshtml(43): error CS1061: no contiene CheckBoxList [E:\git\P.csproj]',
+                'e:\git\V\Index.cshtml(43): error CS1061: no contiene CheckBoxList [E:\git\P.csproj]',
+                'C:\VS\Microsoft.Web.Publishing.targets(3074,5): error : Copying file bin\AWSSDK.dll failed. [C:\x\P.csproj]'
+            ) | Write-BuildOutput -Errors $err 6>$null
+            $err.Count | Should -Be 2
+            $err[0] | Should -Be 'e:\git\V\Index.cshtml(43): error CS1061: no contiene CheckBoxList'
+            Format-BuildErrors $err | Should -Be (' Errores: e:\git\V\Index.cshtml(43): error CS1061: no contiene CheckBoxList | ' +
+                'C:\VS\Microsoft.Web.Publishing.targets(3074,5): error : Copying file bin\AWSSDK.dll failed.')
+            Format-BuildErrors (New-Object System.Collections.Generic.List[string]) | Should -Be ''
+        }
+    }
+
+    It 'Clear-PriorBuildWrites olvida la lista de la build anterior y deja lo compilado' {
+        $proyecto = Join-Path $TestDrive 'P'
+        $rel = Join-Path $proyecto 'obj\Release'
+        New-Item -ItemType Directory -Path $rel -Force | Out-Null
+        Set-Content -Path (Join-Path $rel 'P.csproj.FileListAbsolute.txt') -Value 'C:\P\bin\MvcCheckBoxList.dll'
+        Set-Content -Path (Join-Path $rel 'P.dll') -Value 'x'
+        InModuleScope PublishToIIS -Parameters @{ proj = (Join-Path $proyecto 'P.csproj') } {
+            Clear-PriorBuildWrites -ProjectFile $proj
+        }
+        Test-Path (Join-Path $rel 'P.csproj.FileListAbsolute.txt') | Should -BeFalse
+        Test-Path (Join-Path $rel 'P.dll') | Should -BeTrue
+    }
+}

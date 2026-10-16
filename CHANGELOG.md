@@ -6,6 +6,26 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.13.0] - 2026-10-16
+
+### Added
+- **Publicar un commit sin rama**: `Request-RemotePublish`/`Request-Publish -Commit <sha>`
+  (o el SHA, de 7 a 40 caracteres hexadecimales, en `-Branch` o en el dashboard) hace
+  checkout con HEAD desacoplado; basta con que el commit esté en alguna rama de origin. El
+  `deploy-info.json` lleva `detached`; si el commit no es la punta de ninguna rama de
+  origin, `branch` va vacía y `containedIn` dice la rama más cercana y la distancia
+  (`main~312`).
+- **El resultado de una build fallida trae sus errores**: hasta cinco líneas `error` de
+  MSBuild o dotnet en el mensaje, en vez de «MSBuild failed with exit code 1» a secas, y
+  la salida de la build queda en el transcript (`GET /api/log`).
+
+### Fixed
+- **Publicar un commit viejo después de main en el clon compartido del servidor**: el
+  IncrementalClean de MSBuild borraba de `bin\` las DLL que ese commit lleva versionadas
+  (MvcCheckBoxList.dll) porque las había escrito la build anterior, y las vistas no
+  compilaban. Antes de compilar se borra la lista de esa build
+  (`obj\*\*.FileListAbsolute.txt`), y el checkout repone los ficheros versionados que falten.
+
 ## [0.12.6] - 2026-10-14
 
 ### Added
