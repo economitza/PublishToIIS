@@ -1085,6 +1085,11 @@ function Invoke-RefCheckout {
         tal cual, con HEAD desacoplado: publicar un commit no obliga a crear una rama.
         Tiene que estar en alguna rama de origin, que es lo que trae el fetch.
 
+        Si la rama local lleva commits que su punta de origin no tiene (un worktree de
+        trabajo con commits sin pushear), checkout -B los dejaría solo en el reflog: antes
+        se guardan en refs/publish-backup/<rama>/<fecha> y se avisa. No se bloquea, porque
+        en la copia de despliegue eso mismo es lo que deja una rama reescrita en origin.
+
         Después repone los ficheros versionados que falten en el árbol: un checkout a la
         misma punta no los recupera, y una build anterior pudo borrarlos de bin\.
 
@@ -1095,6 +1100,17 @@ function Invoke-RefCheckout {
         [Parameter(Mandatory)][string]$Repo,
         [Parameter(Mandatory)][string]$Ref
     )
+    $local = "$(& git -C $Repo rev-parse --verify --quiet "refs/heads/$Ref")".Trim()
+    if ($local) {
+        $sinPushear = @(& git -C $Repo rev-list "origin/$Ref..$local" 2>$null | Where-Object { $_ })
+        if ($sinPushear.Count) {
+            $copia = "refs/publish-backup/$Ref/$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+            & git -C $Repo update-ref $copia $local
+            Write-Warning ("La rama local '$Ref' de $Repo lleva $($sinPushear.Count) commit(s) que origin no tiene; " +
+                "se publica la punta de origin y quedan en $copia (git -C `"$Repo`" reset --hard $copia para recuperarlos). " +
+                "Para publicarlos, pushéalos antes.")
+        }
+    }
     $esRama = [bool]("$(& git -C $Repo rev-parse --verify --quiet "refs/remotes/origin/$Ref")".Trim())
     if (-not $esRama -and (Test-CommitRef $Ref)) {
         $sha = "$(& git -C $Repo rev-parse --verify --quiet "${Ref}^{commit}")".Trim()

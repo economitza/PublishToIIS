@@ -2806,6 +2806,25 @@ Describe 'Publicar un commit sin rama (Invoke-RefCheckout y el sello)' {
             } } | Should -Throw '*no está en*'
     }
 
+    It 'los commits locales sin pushear se guardan en refs/publish-backup antes de reponer la rama' {
+        Set-Content -Path (Join-Path $script:clon 'a.txt') -Value 'tres'
+        git -C $script:clon -c user.email=t@t -c user.name=t commit -am 'tres, sin pushear' --quiet
+        $shaLocal = "$(git -C $script:clon rev-parse HEAD)".Trim()
+        InModuleScope PublishToIIS -Parameters @{ clon = $script:clon } {
+            Invoke-RefCheckout -Repo $clon -Ref 'main' 6>$null 3>$null | Should -Be 'branch'
+        }
+        "$(git -C $script:clon rev-parse HEAD)".Trim() | Should -Be $script:shaPunta
+        $copias = @(git -C $script:clon for-each-ref --format='%(objectname)' 'refs/publish-backup/main/')
+        $copias | Should -Be @($shaLocal)
+    }
+
+    It 'sin commits locales de más no deja copia' {
+        InModuleScope PublishToIIS -Parameters @{ clon = $script:clon } {
+            Invoke-RefCheckout -Repo $clon -Ref 'main' 6>$null 3>$null | Out-Null
+        }
+        @(git -C $script:clon for-each-ref 'refs/publish-backup/').Count | Should -Be 0
+    }
+
     It 'repone los ficheros versionados que una build anterior borró del árbol' {
         Remove-Item (Join-Path $script:clon 'a.txt')
         InModuleScope PublishToIIS -Parameters @{ clon = $script:clon } {
