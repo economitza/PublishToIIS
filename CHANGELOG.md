@@ -6,6 +6,14 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.13.1] - 2026-10-16
+
+### Fixed
+- **El refresco de BD remoto completa la fase de IDENTITY**: la copia fija de las
+  herramientas lleva también `CentralCompres/Models` (el `.dbml` y las entidades que
+  `Repair-IdentityColumns.ps1` lee para saber qué claves genera la BD). Sin él el refresco
+  terminaba con código 1 al final, tras cargar y sanear (visto en devecoesp1 el 16/10).
+
 ## [0.13.0] - 2026-10-16
 
 ### Added
