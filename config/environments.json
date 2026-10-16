@@ -51,6 +51,15 @@
       "templateSite": "devecoesp2",
       "responsable": "Joaquim"
     },
+    "deveco-experimental-and": {
+      "server": "deployments-76",
+      "origin": "E:\\git\\central-de-compres\\CentralCompres",
+      "destination": "E:\\wwwrootDevecoExperimentalAnd",
+      "siteUrl": "https://deveco-experimental-and.economitza.com",
+      "templateSite": "devecoand1",
+      "sourceDatabase": "CCAndorra",
+      "responsable": "Joaquim"
+    },
     "devecoesp-audit": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
