@@ -316,7 +316,9 @@ Integración en solución .NET Framework:
 - **Refrescar la BD de un deveco* (PublishToIIS 0.8.0, 28/09/2026)**:
   `Request-RemoteDbRefresh -Server deployments-76 -Environment <env> -TestEmail it@economitza.com`
   es el dry-run (valida réplica y destino, `-ShowLog` trae el plan de tablas); `-Execute` lo aplica.
-  El destino sale del `Web.config` del site y la lógica es la de `tools\db-refresh` del repo:
+  Lo mismo desde el dashboard (0.13.5): botón **Refrescar BD** de cada entorno con endpoint que no
+  sea una API; enseña el plan (BD, servidor y sites que la comparten) y pide confirmación antes del
+  refresco de verdad. El destino sale del `Web.config` del site y la lógica es la de `tools\db-refresh` del repo:
   el publicador solo la orquesta. **Desde la 0.9.0 el refresco tiene carril propio** (cola
   `dbqueue\`, tareas «Publish DbRefresh» y su drenador, registradas por `Install.ps1`): no
   bloquea deploys; el dry-run no pasa por ninguna cola; un candado por BD deja parado el pool
