@@ -2684,6 +2684,42 @@ Describe 'Entornos aspnetcore (la API)' {
         }
     }
 
+    It 'del web.config, lo que el build retira de IIS (WebDAV) se añade al del site una sola vez' {
+        $site = Join-Path $script:tmp 'site'; $rel = Join-Path $script:tmp 'rel'
+        @'
+<configuration><location path="." inheritInChildApplications="false"><system.webServer>
+  <handlers><add name="aspNetCore" path="*" verb="*" modules="AspNetCoreModuleV2" resourceType="Unspecified" /></handlers>
+  <aspNetCore processPath="dotnet" arguments=".\api.dll" hostingModel="inprocess">
+    <environmentVariables><environmentVariable name="ASPNETCORE_ENVIRONMENT" value="Development" /></environmentVariables>
+  </aspNetCore>
+</system.webServer></location></configuration>
+'@ | Set-Content (Join-Path $site 'web.config')
+        $build = @'
+<configuration><location path="." inheritInChildApplications="false"><system.webServer>
+  <modules><remove name="WebDAVModule" /></modules>
+  <handlers><remove name="WebDAV" /><add name="aspNetCore" path="*" verb="*" modules="AspNetCoreModuleV2" resourceType="Unspecified" /></handlers>
+  <aspNetCore processPath="dotnet" arguments=".\api.dll" hostingModel="inprocess" />
+</system.webServer></location></configuration>
+'@
+        $build | Set-Content (Join-Path $rel 'web.config')
+        InModuleScope PublishToIIS -Parameters @{ site = $site; rel = $rel; build = $build } {
+            Protect-SiteSettings -Destination $site -ReleasingDir $rel | Should -Be @('web.config')
+            [xml]$x = Get-Content (Join-Path $rel 'web.config') -Raw
+            $x.SelectNodes("//system.webServer/modules/remove[@name='WebDAVModule']").Count | Should -Be 1
+            $x.SelectNodes("//system.webServer/handlers/remove[@name='WebDAV']").Count | Should -Be 1
+            $x.SelectSingleNode("//system.webServer/handlers/add[@name='aspNetCore']") | Should -Not -BeNullOrEmpty
+            $x.SelectSingleNode("//environmentVariable[@name='ASPNETCORE_ENVIRONMENT']").value | Should -Be 'Development'
+
+            # La publicación siguiente parte del site que ya lo tiene: no se repite.
+            Copy-Item (Join-Path $rel 'web.config') (Join-Path $site 'web.config') -Force
+            $build | Set-Content (Join-Path $rel 'web.config')
+            Protect-SiteSettings -Destination $site -ReleasingDir $rel | Out-Null
+            [xml]$y = Get-Content (Join-Path $rel 'web.config') -Raw
+            $y.SelectNodes("//system.webServer/modules/remove[@name='WebDAVModule']").Count | Should -Be 1
+            $y.SelectNodes("//system.webServer/handlers/remove[@name='WebDAV']").Count | Should -Be 1
+        }
+    }
+
     It 'Merge-JsonSettings mezcla en profundidad, sin distinguir mayúsculas, y crea el fichero si falta' {
         $f = Join-Path $script:tmp 'site\appsettings.Production.json'
         '{"Queues":{"Environment":"devecoesp1"},"BackgroundServices":{"PriceImportEnabled":true,"Otro":1},"Swagger":{"ShowAllEndpoints":true}}' |

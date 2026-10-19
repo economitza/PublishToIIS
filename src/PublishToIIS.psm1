@@ -103,6 +103,9 @@ function Get-AspNetCoreWebConfigMerge {
         Del elemento <aspNetCore> son del build processPath, arguments y hostingModel
         (el ejecutable y cómo se aloja cambian con la versión de .NET o el nombre del
         ensamblado); el resto, incluidas las variables de entorno, es del servidor.
+        También es del build lo que retira de IIS (<remove> en modules y handlers): sin
+        quitar WebDAV, IIS responde 405 a PUT y DELETE antes de llegar a la aplicación.
+        Se añade al del servidor si no lo tiene.
         Devuelve $null si alguno de los dos no tiene <aspNetCore>: entonces se copia
         el del servidor tal cual.
     #>
@@ -132,6 +135,20 @@ function Get-AspNetCoreWebConfigMerge {
         if ($serverNode.GetAttribute($attr) -ne $valor) {
             $serverNode.SetAttribute($attr, $valor)
             $changes += $attr
+        }
+    }
+
+    $webServer = $serverNode.ParentNode
+    foreach ($section in 'modules', 'handlers') {
+        foreach ($remove in $build.SelectNodes("//system.webServer/$section/remove")) {
+            $name = $remove.GetAttribute('name')
+            if ($webServer.SelectSingleNode("$section/remove[@name='$name']")) { continue }
+            $parent = $webServer.SelectSingleNode($section)
+            if (-not $parent) { $parent = $webServer.PrependChild($server.CreateElement($section)) }
+            $node = $server.CreateElement('remove')
+            $node.SetAttribute('name', $name)
+            [void]$parent.PrependChild($node)
+            $changes += "$section/remove $name"
         }
     }
     [pscustomobject]@{ Document = $server; Changes = $changes }
