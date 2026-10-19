@@ -44,6 +44,7 @@ def load_environments():
         endpoint_url = env.get("endpointUrl", "") or servers.get(server, {}).get("endpointUrl", "")
         local_origin = Path(env.get("origin", "")).exists()
         is_local = endpoint_url.startswith("http://127.0.0.1") or endpoint_url.startswith("http://localhost")
+        kind = env.get("kind", "mvc")
         envs.append({
             "name": name,
             "origin": env.get("origin", ""),
@@ -60,6 +61,11 @@ def load_environments():
             "local": is_local,
             "remote": bool(endpoint_url) and not is_local,
             "publishable": bool(endpoint_url),
+            "kind": kind,
+            "testEmail": env.get("testEmail", ""),
+            # La BD se refresca desde el e-market (su Web.config dice cuál es); una API
+            # comparte la de su web y no tiene refresco propio.
+            "dbRefreshable": bool(endpoint_url) and kind != "aspnetcore" and name not in ("prod", "staging"),
         })
     return envs
 
@@ -220,8 +226,20 @@ def publish_via_endpoint(env, branch):
     run_id = trig.get("runId", "")
     lines = [f"Orden encolada (runId {run_id}, posición {trig.get('position')}) por {order['requestedBy']}. "
              "La publicación corre en el servidor."]
+    status = wait_result(url, token, run_id, PUBLISH_TIMEOUT, lines)
+    out = "\n".join(lines)[-4000:]
+    if status == "ok":
+        return 200, {"ok": True, "output": out}
+    if status == "error":
+        return 500, {"error": f"Publish de '{env['name']}' (servidor '{server}') falló", "detail": out}
+    return 504, {"error": f"Timeout de {PUBLISH_TIMEOUT} s esperando el resultado (runId {run_id})", "detail": out}
+
+
+def wait_result(url, token, run_id, timeout, lines):
+    """Sondea /api/result hasta ok o error y deja en `lines` cada cambio de estado.
+    Devuelve el estado final, o '' si se agota el tiempo."""
     last = ""
-    deadline = time.monotonic() + PUBLISH_TIMEOUT
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(PUBLISH_POLL)
         try:
@@ -231,16 +249,85 @@ def publish_via_endpoint(env, branch):
         status = res.get("status", "")
         if status in ("ok", "error"):
             lines.append(f"RESULT: {status} {res.get('message', '')}")
-            out = "\n".join(lines)[-4000:]
-            if status == "ok":
-                return 200, {"ok": True, "output": out}
-            return 500, {"error": f"Publish de '{env['name']}' (servidor '{server}') falló", "detail": out}
+            return status
         if status != last:  # eco del cambio de estado sin repetir cada poll
             last = status
             pos = f" (posición {res.get('position')})" if status == "queued" else ""
             lines.append(f"  ...{status}{pos}")
-    return 504, {"error": f"Timeout de {PUBLISH_TIMEOUT} s esperando el resultado (runId {run_id})",
-                 "detail": "\n".join(lines)[-4000:]}
+    return ""
+
+
+DEFAULT_TEST_EMAIL = "it@economitza.com"  # buzón que recibe todo el correo de una copia de test
+DBREFRESH_TIMEOUT = 3600  # el refresco de CCEspana en un servidor de test tarda decenas de minutos
+_PLAN_FIELDS = {
+    "database": re.compile(r"^BD:\s+(\S+) en (\S+)", re.M),
+    "testEmail": re.compile(r"^Correo:\s+todo el de la copia irá a (\S+)", re.M),
+    "sites": re.compile(r"^Sites que comparten la BD \(se paran con -Execute\): (.+)$", re.M),
+}
+
+
+def endpoint_text(url, token, timeout=60):
+    req = urllib.request.Request(url, headers={"X-Api-Token": token, "User-Agent": "publish-dashboard"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as r:
+        return r.read().decode("utf-8-sig", "replace")
+
+
+def plan_summary(log_text):
+    """BD de destino, servidor, buzón y sites que comparten la BD, del transcript
+    del refresco (Invoke-DbRefreshOrder los escribe al empezar)."""
+    summary = {}
+    for key, rx in _PLAN_FIELDS.items():
+        m = rx.search(log_text or "")
+        if not m:
+            continue
+        if key == "database":
+            summary["database"], summary["dataSource"] = m.group(1), m.group(2)
+        else:
+            summary[key] = m.group(1).strip()
+    return summary
+
+
+def db_refresh(env_name, execute):
+    """Refresco de la BD del entorno desde la réplica (esquema, datos y saneado), por
+    el endpoint de su servidor: POST /api/dbrefresh, como Request-RemoteDbRefresh. Sin
+    `execute` es el plan, que no toca nada y dice qué BD es y qué sites la comparten."""
+    env = {e["name"]: e for e in load_environments()}.get(env_name)
+    if not env:
+        return 404, {"error": f"entorno desconocido: {env_name}"}
+    if not env["dbRefreshable"]:
+        return 400, {"error": f"El entorno '{env_name}' no tiene refresco de BD: sin endpoint, o es una API "
+                              "(comparte la BD de su web)."}
+    server = env["server"]
+    token = resolve_api_token(server)
+    if not token:
+        return 400, {"error": f"Sin token para el servidor '{server}'. Regístralo con: Set-DeployToken -Server {server}"}
+    url = env["endpointUrl"].rstrip("/")
+    order = {"environment": env["name"], "testEmail": env["testEmail"] or DEFAULT_TEST_EMAIL, "tables": [],
+             "execute": bool(execute), "requestedBy": requester_identity()}
+    try:
+        trig = endpoint_json("POST", url + "/api/dbrefresh", token, order)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[-4000:]
+        return 500, {"error": f"El endpoint de '{server}' rechazó el refresco (HTTP {e.code})", "detail": detail}
+    except Exception as e:
+        return 500, {"error": f"No se pudo contactar el endpoint de '{server}' ({url})", "detail": str(e)}
+
+    run_id = trig.get("runId", "")
+    mode = "refresco" if execute else "plan (no toca nada)"
+    lines = [f"{mode.capitalize()} de la BD de {env['name']} encolado (runId {run_id}) por {order['requestedBy']}."]
+    status = wait_result(url, token, run_id, DBREFRESH_TIMEOUT if execute else PUBLISH_TIMEOUT, lines)
+    query = f"runId={run_id}" if trig.get("lane") == "dryrun" else f"lane={trig.get('lane') or 'dbrefresh'}"
+    try:
+        log_text = endpoint_text(f"{url}/api/log?{query}", token)
+    except Exception as e:
+        log_text = f"(no se pudo leer el transcript: {e})"
+    out = "\n".join(lines) + "\n\n" + log_text[-8000:]
+    payload = dict(plan_summary(log_text), output=out)
+    if status == "ok":
+        return 200, dict(payload, ok=True)
+    if status == "error":
+        return 500, dict(payload, error=f"El {mode} de la BD de '{env['name']}' falló", detail=out)
+    return 504, dict(payload, error=f"Timeout esperando el {mode} (runId {run_id})", detail=out)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -282,13 +369,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if urlparse(self.path).path == "/api/publish":
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length) or b"{}")
-            code, payload = publish(data.get("env", ""), data.get("branch", ""))
-            self._send(code, payload)
-        else:
+        path = urlparse(self.path).path
+        if path not in ("/api/publish", "/api/dbrefresh"):
             self._send(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        data = json.loads(self.rfile.read(length) or b"{}")
+        if path == "/api/publish":
+            code, payload = publish(data.get("env", ""), data.get("branch", ""))
+        else:
+            # Solo un booleano JSON de verdad ejecuta, como en el endpoint.
+            code, payload = db_refresh(data.get("env", ""), data.get("execute") is True)
+        self._send(code, payload)
 
     def log_message(self, fmt, *args):  # silenciar el ruido por request
         pass

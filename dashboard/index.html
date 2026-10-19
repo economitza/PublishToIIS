@@ -19,6 +19,8 @@
   button.pub { padding: .35rem .9rem; border: 0; border-radius: 4px; background: #2980b9; color: #fff; cursor: pointer; }
   button.pub:disabled { background: #b6bdc4; cursor: not-allowed; }
   button.pub.busy { background: #f39c12; }
+  button.pub.db { background: #c0392b; }
+  button.pub.db.busy { background: #f39c12; }
   #refresh { margin-left: 1rem; font-size: .8rem; }
   code { background: #eef; padding: 0 .3rem; border-radius: 3px; }
   #log { white-space: pre-wrap; background: #1e1e1e; color: #d7d7d7; padding: .8rem; margin-top: 1rem;
@@ -33,7 +35,7 @@
 <table id="tbl">
   <thead><tr>
     <th>Entorno</th><th>Responsable</th><th>Servidor</th><th>Rama a publicar</th><th></th>
-    <th>Online</th><th>Desplegado</th>
+    <th>BD</th><th>Online</th><th>Desplegado</th>
   </tr></thead>
   <tbody></tbody>
 </table>
@@ -43,6 +45,10 @@
   remoto por el endpoint del servidor). El Publish <b>local</b> necesita el dashboard
   <b>elevado</b> (<code>dashboard-admin.cmd</code>); el <b>remoto</b> no, pero pide el token del
   endpoint (<code>PUBLISHTOIIS_API_TOKEN</code> o <code>dashboard\remote-api-token.txt</code>).
+  <b>Refrescar BD</b> copia en la BD del entorno los datos de la réplica de producción, los sanea
+  (correos al buzón de test, contraseñas de test) y alinea el esquema con la rama publicada. Primero
+  enseña el plan, que no toca nada y dice qué BD es y qué entornos la comparten; después pide
+  confirmación.
 </div>
 
 <h1 style="margin-top:2rem">Entornos de test según Jira
@@ -140,6 +146,38 @@ async function doPublish(env, row, btn) {
   refreshStatus(env, row);
 }
 
+// Refrescar la BD: primero el plan (no toca nada; dice qué BD es y qué sites la
+// comparten, que se paran mientras dura) y, si se confirma, el refresco.
+async function doDbRefresh(env, row, btn) {
+  const reset = () => { btn.disabled = false; btn.classList.remove('busy'); btn.textContent = 'Refrescar BD'; };
+  const call = execute => fetchJson('/api/dbrefresh', { method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ env: env.name, execute }) });
+  btn.disabled = true; btn.classList.add('busy'); btn.textContent = 'Revisando…';
+  log.style.display = 'block'; log.textContent = `[${env.name}] Plan del refresco de BD (no toca nada)…`;
+  let plan;
+  try {
+    plan = await call(false);
+    log.textContent = `[${env.name}] PLAN\n` + (plan.output || '');
+  } catch (e) { log.textContent = `[${env.name}] ERROR en el plan\n` + e.message; reset(); return; }
+
+  const bd = plan.database ? `${plan.database} en ${plan.dataSource}` : '(no se ha podido leer del plan)';
+  const pregunta = `Refrescar la BD del entorno ${env.name}?\n\n` +
+    `BD: ${bd}\nEntornos que la comparten y se paran mientras dura: ${plan.sites || env.name}\n` +
+    `Correo de la copia: ${plan.testEmail || '—'}\n\n` +
+    'Se sustituyen TODOS sus datos por los de producción (saneados) y se alinea el esquema con la rama ' +
+    'publicada. Tarda varios minutos.';
+  if (!confirm(pregunta)) { reset(); return; }
+
+  btn.textContent = 'Refrescando…';
+  log.textContent = `[${env.name}] Refresco de BD lanzado (${bd})…`;
+  try {
+    const r = await call(true);
+    log.textContent = `[${env.name}] OK\n` + (r.output || '');
+  } catch (e) { log.textContent = `[${env.name}] ERROR\n` + e.message; }
+  reset();
+  refreshStatus(env, row);
+}
+
 function envRowHtml(env) {
   return `
     <td><b>${esc(env.name)}</b><div class="muted">${esc(env.destination)}</div></td>
@@ -149,6 +187,7 @@ function envRowHtml(env) {
       : (esc(env.serverName) || '<span class="muted">—</span>')}</td>
     <td><input class="branch" list="branches" placeholder="buscar rama…"></td>
     <td><button class="pub" ${env.publishable ? '' : 'disabled title="ni origin local ni endpointUrl configurado"'}>Publish</button>${env.remote ? '<div class="muted">remoto</div>' : '<div class="muted">local</div>'}</td>
+    <td>${env.dbRefreshable ? '<button class="pub db">Refrescar BD</button>' : '<span class="muted">—</span>'}</td>
     <td class="online">…</td>
     <td class="info">…</td>`;
 }
@@ -167,6 +206,8 @@ async function buildTable() {
     tbody.appendChild(row);
     row._env = env;
     row.querySelector('button.pub').onclick = ev => doPublish(env, row, ev.target);
+    const dbButton = row.querySelector('button.db');
+    if (dbButton) dbButton.onclick = ev => doDbRefresh(env, row, ev.target);
     refreshStatus(env, row);
   }
 }
