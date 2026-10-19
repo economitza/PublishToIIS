@@ -88,6 +88,24 @@
       },
       "responsable": "Marc"
     },
+    "devecoesp1api": {
+      "server": "deployments-76",
+      "kind": "aspnetcore",
+      "origin": "E:\\git\\central-compres-api\\central-de-compres-integracio",
+      "destination": "E:\\wwwrootDevecoEsp1\\api_devecoesp1",
+      "siteUrl": "https://devecoesp1api.economitza.com",
+      "templateSite": "devecoesp1api.economitza.com",
+      "responsable": "Joaquim"
+    },
+    "devecoandapi1": {
+      "server": "deployments-76",
+      "kind": "aspnetcore",
+      "origin": "E:\\git\\central-compres-api\\central-de-compres-integracio",
+      "destination": "E:\\wwwrootDevecoAndApi1",
+      "siteUrl": "https://devecoandapi1.economitza.com",
+      "templateSite": "devecoandapi1.economitza.com",
+      "responsable": "Joaquim"
+    },
     "deveco": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
