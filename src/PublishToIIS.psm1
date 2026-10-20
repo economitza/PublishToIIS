@@ -217,6 +217,32 @@ function Add-DeployInfoStaticRoute {
     $true
 }
 
+function Set-WebConfigSiteHost {
+    <#
+    .SYNOPSIS
+        mvc: el appSetting urlWeb del web.config publicado pasa a ser el host del site.
+    .DESCRIPTION
+        El e-market arma con urlWeb los enlaces absolutos de sus correos («Ver pedido», «Gestionar
+        entregas» del pedido al proveedor) y el logo de respaldo. En producción vale el host público;
+        en los sites de prueba, sembrados desde una plantilla, se quedaba en localhost:56006 y los
+        correos llevaban enlaces que solo abrían en el equipo que los mandaba, así que el flujo entero
+        no se podía probar en un deveco. Solo toca una clave que ya exista; devuelve $true si la cambia.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WebConfigPath,
+        [Parameter(Mandatory)][string]$HostName
+    )
+    if (-not (Test-Path $WebConfigPath)) { return $false }
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.Load($WebConfigPath)
+    $nodo = $xml.SelectSingleNode("/configuration/appSettings/add[@key='urlWeb']")
+    if (-not $nodo -or $nodo.GetAttribute('value') -eq $HostName) { return $false }
+    $nodo.SetAttribute('value', $HostName)
+    $xml.Save($WebConfigPath)
+    $true
+}
+
 function Merge-JsonSettings {
     <#
     .SYNOPSIS
@@ -1357,6 +1383,11 @@ function Publish {
             switch ($connResult) {
                 'preserved'  { Write-Host "Site connections.config preserved" -ForegroundColor Green }
                 'overridden' { Write-Host "BUILD connections.config PUBLISHED (-OverrideWebconfig); site copy saved as connections.config.previous" -ForegroundColor Yellow }
+            }
+            # urlWeb = el host del site: los enlaces de los correos de un entorno de prueba
+            # apuntan a ese entorno, como en producción, y no al localhost de la plantilla.
+            if ($HostName -and (Set-WebConfigSiteHost -WebConfigPath $releasingWebConfig -HostName $HostName)) {
+                Write-Host "urlWeb del web.config: $HostName" -ForegroundColor Green
             }
         }
 

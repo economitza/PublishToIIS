@@ -925,6 +925,37 @@ Describe 'Register-Dashboard' {
     }
 }
 
+Describe 'Set-WebConfigSiteHost' {
+    # Los enlaces de los correos del e-market salen de urlWeb: en un site de prueba tienen que
+    # apuntar a ese site y no al localhost:56006 de la plantilla.
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:tmp | Out-Null
+        $script:cfg = Join-Path $script:tmp 'web.config'
+    }
+
+    AfterEach {
+        Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'pone el host del site en urlWeb y deja el resto como estaba' {
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings><add key="urlWeb" value="localhost:56006" /><add key="otra" value="x" /></appSettings></configuration>'
+        $cambiado = InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigSiteHost -WebConfigPath $cfg -HostName 'devecoesp1.economitza.com' }
+        $cambiado | Should -BeTrue
+        $xml = [xml](Get-Content $script:cfg -Raw)
+        $xml.SelectSingleNode("//add[@key='urlWeb']").value | Should -Be 'devecoesp1.economitza.com'
+        $xml.SelectSingleNode("//add[@key='otra']").value | Should -Be 'x'
+    }
+
+    It 'no toca nada si ya es ese host o si el web.config no tiene urlWeb' {
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings><add key="urlWeb" value="esp.emkt.test" /></appSettings></configuration>'
+        InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigSiteHost -WebConfigPath $cfg -HostName 'esp.emkt.test' } | Should -BeFalse
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings /></configuration>'
+        InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigSiteHost -WebConfigPath $cfg -HostName 'esp.emkt.test' } | Should -BeFalse
+        (Get-Content $script:cfg -Raw) | Should -Not -Match 'urlWeb'
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())
