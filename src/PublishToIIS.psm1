@@ -1725,8 +1725,16 @@ function Resolve-DbRefreshPlan {
     if (-not $Config.origin -or -not $Config.destination) { throw "El entorno '$Environment' no declara origin y destination." }
 
     if (-not $TestEmail -and $Config.testEmail) { $TestEmail = [string]$Config.testEmail }
+    # Sin buzón en la orden ni en el entorno, el del repo: testEmail de tools/db-refresh/config.json
+    # (testing@economitza.com, el común de pruebas).
     if (-not $TestEmail) {
-        throw "Falta -TestEmail: es el buzón que recibirá TODO el correo que genere la copia (o declara 'testEmail' en el entorno)."
+        $repoDbRefreshConfig = Join-Path (Split-Path (([string]$Config.origin).TrimEnd('\', '/')) -Parent) 'tools\db-refresh\config.json'
+        if (Test-Path $repoDbRefreshConfig) {
+            try { $TestEmail = [string](Get-Content $repoDbRefreshConfig -Raw -Encoding UTF8 | ConvertFrom-Json).testEmail } catch { $TestEmail = $null }
+        }
+    }
+    if (-not $TestEmail) {
+        throw "Falta -TestEmail: es el buzón que recibirá TODO el correo que genere la copia (o 'testEmail' en el entorno o en tools/db-refresh/config.json del repo)."
     }
     if ($TestEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "TestEmail con formato inválido: '$TestEmail'" }
     $Tables = @($Tables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -2265,10 +2273,10 @@ function Request-DbRefresh {
         Con -Direct se salta la cola (lo usa el drenador, que ya ES la cola).
 
     .EXAMPLE
-        Request-DbRefresh -Environment devecoesp1 -TestEmail it@economitza.com
+        Request-DbRefresh -Environment devecoesp1
 
     .EXAMPLE
-        Request-DbRefresh -Environment devecoesp1 -TestEmail it@economitza.com -Execute
+        Request-DbRefresh -Environment devecoesp1 -Execute
     #>
     [CmdletBinding()]
     param(
@@ -4041,10 +4049,10 @@ function Request-RemoteDbRefresh {
         que es donde está el plan de tablas y el detalle de cada fase.
 
     .EXAMPLE
-        Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -TestEmail it@economitza.com -ShowLog
+        Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -ShowLog
 
     .EXAMPLE
-        Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -TestEmail it@economitza.com -Execute
+        Request-RemoteDbRefresh -Server deployments-76 -Environment devecoesp1 -Execute
     #>
     [CmdletBinding()]
     param(
