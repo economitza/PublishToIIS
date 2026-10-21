@@ -81,6 +81,181 @@ function Get-RuntimeFolders {
     @('Upload', 'Upload\tmp')
 }
 
+# ─── Subaplicaciones ────────────────────────────────────────────────────────
+# Un site mvc puede llevar dentro aplicaciones IIS de .NET moderno (la /cocina de .NET 10 dentro
+# del e-market). Las declara el repo que se publica en tools/deploy/iis-subapps.json, y viajan en la
+# misma publicación: se compilan dentro de la carpeta del site, entran en su sello y en su manifiesto
+# y se activan con el mismo swap. Cada una tiene su grupo de aplicaciones, sin código administrado:
+# un proceso de IIS no puede cargar .NET Framework y .NET moderno a la vez.
+
+function Get-SubApplications {
+    <#
+    .SYNOPSIS
+        Las subaplicaciones que declara el repo (tools/deploy/iis-subapps.json); ninguna si no hay fichero.
+    .DESCRIPTION
+        Cada una: Path (la carpeta y la ruta en IIS, «cocina»), Project (el .csproj, resuelto desde la raíz
+        del repo) y EnvironmentVariables (las del web.config de la subaplicación, con los marcadores de
+        Resolve-SubAppValue sin resolver).
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    $file = Join-Path $RepoRoot 'tools\deploy\iis-subapps.json'
+    if (-not (Test-Path $file)) { return @() }
+    try { $doc = [IO.File]::ReadAllText($file) | ConvertFrom-Json }
+    catch { throw "No se puede leer $file como JSON: $($_.Exception.Message)" }
+    @(foreach ($app in @($doc.subApplications)) {
+        $path = ([string]$app.path).Trim('/', '\')
+        if ($path -notmatch '^[A-Za-z0-9_-]+$') {
+            throw "iis-subapps.json: la ruta '$($app.path)' tiene que ser una sola carpeta (letras, cifras, - y _)."
+        }
+        $project = Join-Path $RepoRoot ([string]$app.project)
+        if (-not $app.project -or -not (Test-Path $project -PathType Leaf)) {
+            throw "iis-subapps.json: /$path apunta a un proyecto que no existe en el repo: '$($app.project)'."
+        }
+        $vars = [ordered]@{}
+        if ($app.environmentVariables) {
+            foreach ($p in $app.environmentVariables.PSObject.Properties) { $vars[$p.Name] = [string]$p.Value }
+        }
+        [pscustomobject]@{ Path = $path; Project = $project; EnvironmentVariables = $vars }
+    })
+}
+
+function Get-SubAppDataDir {
+    # Carpeta de datos de una subaplicación (sus claves de Data Protection), al lado del site y fuera
+    # del swap: si viviera dentro, cada publicación la estrenaría y las sesiones abiertas se perderían.
+    param([Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string]$Path)
+    # [IO.Path] y no Join-Path: en PowerShell 5.1 Join-Path exige que la unidad exista.
+    $site = $Destination.TrimEnd('\')
+    [IO.Path]::Combine([IO.Path]::GetDirectoryName($site), ("{0}_data" -f [IO.Path]::GetFileName($site)), $Path)
+}
+
+function Get-WebConfigAppSetting {
+    param([Parameter(Mandatory)][string]$WebConfigPath, [Parameter(Mandatory)][string]$Key)
+    if (-not (Test-Path $WebConfigPath)) { return $null }
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.Load($WebConfigPath)
+    $nodo = $xml.SelectSingleNode("/configuration/appSettings/add[@key='$Key']")
+    if ($nodo) { $nodo.GetAttribute('value') } else { $null }
+}
+
+function Resolve-SubAppValue {
+    <#
+    .SYNOPSIS
+        El valor de una variable de una subaplicación, con sus marcadores resueltos.
+    .DESCRIPTION
+        {appSetting:Clave} es el appSetting del web.config del site que se publica (la API que llama el
+        e-market, UrlApiEconomitza: la subaplicación sigue al site sin configuración propia en el
+        servidor) y {dataDir} su carpeta de datos (Get-SubAppDataDir). Un appSetting que el site no
+        tiene es un error: una subaplicación sin su API no arranca, y mejor que falle la publicación.
+    #>
+    param([Parameter(Mandatory)][string]$Value, [Parameter(Mandatory)][string]$SiteWebConfig, [Parameter(Mandatory)][string]$DataDir)
+    $resolved = $Value.Replace('{dataDir}', $DataDir)
+    foreach ($m in [regex]::Matches($resolved, '\{appSetting:([^}]+)\}')) {
+        $setting = Get-WebConfigAppSetting -WebConfigPath $SiteWebConfig -Key $m.Groups[1].Value
+        if ([string]::IsNullOrEmpty($setting)) {
+            throw "La subaplicación necesita el appSetting '$($m.Groups[1].Value)' del web.config del site, y no lo tiene."
+        }
+        $resolved = $resolved.Replace($m.Value, $setting)
+    }
+    $resolved
+}
+
+function Set-AspNetCoreEnvironmentVariables {
+    # Las variables de entorno de <aspNetCore> del web.config de una aplicación ASP.NET Core publicada:
+    # las que ya tenga con ese nombre se sustituyen y el resto se conserva.
+    param([Parameter(Mandatory)][string]$WebConfigPath, [Parameter(Mandatory)][System.Collections.IDictionary]$Variables)
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.Load($WebConfigPath)
+    $core = $xml.SelectSingleNode('//system.webServer/aspNetCore')
+    if (-not $core) { throw "$WebConfigPath no tiene <aspNetCore>: no es el web.config de una aplicación ASP.NET Core publicada." }
+    $vars = $core.SelectSingleNode('environmentVariables')
+    if (-not $vars) { $vars = $core.AppendChild($xml.CreateElement('environmentVariables')) }
+    foreach ($name in $Variables.Keys) {
+        $node = @($vars.SelectNodes('environmentVariable') | Where-Object { $_.GetAttribute('name') -eq $name })[0]
+        if (-not $node) {
+            $node = $vars.AppendChild($xml.CreateElement('environmentVariable'))
+            $node.SetAttribute('name', $name)
+        }
+        $node.SetAttribute('value', [string]$Variables[$name])
+    }
+    $xml.Save($WebConfigPath)
+}
+
+function Get-SubAppPoolName {
+    # El grupo de una subaplicación: el del site con su ruta («devecoesp1-cocina»).
+    param([Parameter(Mandatory)][string]$SitePoolName, [Parameter(Mandatory)][string]$Path)
+    "$SitePoolName-$Path"
+}
+
+function Assert-AspNetCoreModule {
+    # IIS sirve .NET moderno con el AspNetCoreModuleV2 del Hosting Bundle. Sin él, la aplicación
+    # existiría en IIS y respondería 500.19 a todo: se para antes de tocar nada.
+    $dll = Join-Path $env:ProgramFiles 'IIS\Asp.Net Core Module\V2\aspnetcorev2.dll'
+    if (-not (Test-Path $dll)) {
+        throw "Este servidor no tiene el módulo AspNetCoreModuleV2 de IIS: instala el Hosting Bundle de .NET antes de publicar un site con subaplicaciones."
+    }
+}
+
+function Get-IisSiteNameByPath {
+    # El nombre del site de IIS que sirve $Destination (por su ruta física, como Get-SiteAppPool).
+    param([Parameter(Mandatory)][string]$Destination)
+    Import-Module WebAdministration -ErrorAction Stop -WarningAction SilentlyContinue
+    $ruta = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    $site = Get-ChildItem IIS:\Sites | Where-Object {
+        $_.physicalPath -and ([IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$_.physicalPath)).TrimEnd('\') -ieq $ruta)
+    } | Select-Object -First 1
+    if (-not $site) { throw "Ningún site de IIS tiene la ruta física ${Destination}: una subaplicación necesita su site." }
+    $site.Name
+}
+
+function Initialize-IisSubApplication {
+    <#
+    .SYNOPSIS
+        Crea, si faltan, el grupo y la aplicación IIS de una subaplicación, y los deja como deben estar.
+    .DESCRIPTION
+        El grupo, sin código administrado y con el perfil de usuario cargado. La aplicación, en
+        /<Path> del site, con la ruta física de su carpeta dentro de la del site (la misma en cada
+        swap) y ese grupo. Devuelve lo que ha tenido que crear o corregir.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SiteName,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$PhysicalPath,
+        [Parameter(Mandatory)][string]$AppPoolName
+    )
+    Import-Module WebAdministration -ErrorAction Stop -WarningAction SilentlyContinue
+    $actions = @()
+    $poolPath = "IIS:\AppPools\$AppPoolName"
+    if (-not (Test-Path $poolPath)) {
+        New-WebAppPool -Name $AppPoolName | Out-Null
+        $actions += "grupo $AppPoolName"
+    }
+    if ((Get-ItemProperty $poolPath -Name managedRuntimeVersion).Value -ne '') {
+        Set-ItemProperty $poolPath -Name managedRuntimeVersion -Value ''
+        $actions += "$AppPoolName sin código administrado"
+    }
+    if (-not (Get-ItemProperty $poolPath -Name processModel.loadUserProfile).Value) {
+        Set-ItemProperty $poolPath -Name processModel.loadUserProfile -Value $true
+        $actions += "$AppPoolName con perfil de usuario"
+    }
+    $app = Get-WebApplication -Site $SiteName -Name $Path
+    if (-not $app) {
+        New-WebApplication -Site $SiteName -Name $Path -PhysicalPath $PhysicalPath -ApplicationPool $AppPoolName | Out-Null
+        $actions += "aplicación /$Path"
+    }
+    else {
+        if ($app.applicationPool -ne $AppPoolName) {
+            Set-ItemProperty "IIS:\Sites\$SiteName\$Path" -Name applicationPool -Value $AppPoolName
+            $actions += "/$Path en $AppPoolName"
+        }
+        if ([IO.Path]::GetFullPath([string]$app.PhysicalPath).TrimEnd('\') -ine [IO.Path]::GetFullPath($PhysicalPath).TrimEnd('\')) {
+            Set-ItemProperty "IIS:\Sites\$SiteName\$Path" -Name physicalPath -Value $PhysicalPath
+            $actions += "/$Path en $PhysicalPath"
+        }
+    }
+    $actions
+}
+
 function Get-DotNet {
     <#
     .SYNOPSIS
@@ -1343,6 +1518,11 @@ function Publish {
 
     $poolStopped = $false
     $swapCompleted = $false
+    # Subaplicaciones del repo (mvc): se compilan dentro de releasing y sus grupos se paran y
+    # arrancan con el del site, porque su proceso bloquea los ficheros de su carpeta.
+    $subApps = @()
+    $subPoolsStopped = New-Object System.Collections.Generic.List[string]
+    $subPoolsStarted = $false
 
     try {
         Write-Host "Destination:  $Destination" -ForegroundColor Gray
@@ -1445,6 +1625,35 @@ function Publish {
             if ($ApiUrl -and (Set-WebConfigApiUrl -WebConfigPath $releasingWebConfig -ApiUrl $ApiUrl)) {
                 Write-Host "UrlApiEconomitza del web.config: $ApiUrl" -ForegroundColor Green
             }
+
+            # Subaplicaciones: con el web.config final del site, para que sus variables sigan a lo
+            # que sirve (la misma API), y antes del sello y del manifiesto, que las incluyen.
+            # En PowerShell 5.1, con Stop, lo que git escriba en stderr lanza: fuera de un repo, sin subaplicaciones.
+            $repoRoot = $null
+            try { $repoRoot = (& git -C (Split-Path $projectToBuild -Parent) rev-parse --show-toplevel 2>$null) } catch { $repoRoot = $null }
+            if ($repoRoot) { $subApps = @(Get-SubApplications -RepoRoot (([string]$repoRoot).Trim() -replace '/', '\')) }
+            if ($subApps.Count) {
+                Assert-AspNetCoreModule
+                $dotnet = Get-DotNet
+                foreach ($sub in $subApps) {
+                    $subOut = Join-Path $releasingDir $sub.Path
+                    Write-Host "Subaplicación /$($sub.Path): dotnet publish $($sub.Project)" -ForegroundColor Yellow
+                    $erroresSub = New-Object System.Collections.Generic.List[string]
+                    & $dotnet publish $sub.Project -c $Configuration -o $subOut --nologo -v minimal | Write-BuildOutput -Errors $erroresSub
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "dotnet publish de la subaplicación /$($sub.Path) falló con código $LASTEXITCODE.$(Format-BuildErrors $erroresSub)"
+                    }
+                    if ($sub.EnvironmentVariables.Count) {
+                        $dataDir = Get-SubAppDataDir -Destination $Destination -Path $sub.Path
+                        $vars = [ordered]@{}
+                        foreach ($name in $sub.EnvironmentVariables.Keys) {
+                            $vars[$name] = Resolve-SubAppValue -Value $sub.EnvironmentVariables[$name] -SiteWebConfig $releasingWebConfig -DataDir $dataDir
+                        }
+                        Set-AspNetCoreEnvironmentVariables -WebConfigPath (Join-Path $subOut 'web.config') -Variables $vars
+                        Write-Host "Subaplicación /$($sub.Path): $(@($vars.Keys) -join ', ')" -ForegroundColor Green
+                    }
+                }
+            }
         }
 
         # Sello de versión del despliegue: viaja dentro de releasing/ y por tanto con el swap
@@ -1461,6 +1670,15 @@ function Publish {
         if (Test-Path $previousDir) {
             Write-Host "Removing old previous directory..." -ForegroundColor Yellow
             Remove-Item $previousDir -Recurse -Force
+        }
+
+        foreach ($sub in $subApps) {
+            $subPool = Get-SubAppPoolName -SitePoolName $AppPoolName -Path $sub.Path
+            if (Test-IISAppPoolExists $subPool) {
+                Write-Host "Stopping app pool '$subPool' (/$($sub.Path)) for final swap..." -ForegroundColor Yellow
+                Stop-IISAppPool -Name $subPool
+                $subPoolsStopped.Add($subPool)
+            }
         }
 
         Write-Host "Stopping app pool '$AppPoolName' for final swap..." -ForegroundColor Yellow
@@ -1495,6 +1713,24 @@ function Publish {
         # escribir en ella y las importaciones mueren con «Access to the path ... is denied».
         # La API escribe ademas su log en Logs\ (Serilog no avisa si no puede).
         Grant-RuntimeFolderWrite -SitePath $Destination -Folders (Get-RuntimeFolders -Kind $Kind)
+
+        # Subaplicaciones: su grupo y su aplicación en IIS (la primera vez se crean), su carpeta de
+        # datos fuera del swap con escritura para su grupo, y en marcha.
+        if ($subApps.Count) {
+            $iisSite = Get-IisSiteNameByPath -Destination $Destination
+            foreach ($sub in $subApps) {
+                $subPool = Get-SubAppPoolName -SitePoolName $AppPoolName -Path $sub.Path
+                $acciones = @(Initialize-IisSubApplication -SiteName $iisSite -Path $sub.Path -PhysicalPath (Join-Path $Destination $sub.Path) -AppPoolName $subPool)
+                if ($acciones.Count) { Write-Host "Subaplicación /$($sub.Path): $($acciones -join '; ')" -ForegroundColor Green }
+                $dataDir = Get-SubAppDataDir -Destination $Destination -Path $sub.Path
+                if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir -Force | Out-Null }
+                & icacls $dataDir /grant "IIS AppPool\${subPool}:(OI)(CI)M" | Out-Null
+                if ($LASTEXITCODE -ne 0) { Write-Warning "No se pudo dar escritura a IIS AppPool\$subPool en $dataDir (icacls $LASTEXITCODE): /$($sub.Path) perderá las sesiones al reciclar." }
+                Start-IISAppPool -Name $subPool
+                Write-Host "Subaplicación /$($sub.Path) publicada en '$iisSite' con el grupo '$subPool'" -ForegroundColor Green
+            }
+            $subPoolsStarted = $true
+        }
     }
     catch {
         Write-Host "Publish failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -1518,6 +1754,13 @@ function Publish {
         if ($poolStopped) {
             Write-Host "Starting app pool '$AppPoolName'..." -ForegroundColor Yellow
             [void](Start-SitePoolUnlessRefreshing -Destination $Destination -AppPoolName $AppPoolName)
+        }
+        # Una publicación que falla a medias no deja paradas las subaplicaciones que ya estaban.
+        if ($subPoolsStopped.Count -and -not $subPoolsStarted) {
+            foreach ($subPool in $subPoolsStopped) {
+                try { Start-IISAppPool -Name $subPool }
+                catch { Write-Warning "No se pudo arrancar el grupo '$subPool': $($_.Exception.Message)" }
+            }
         }
 
         if ($swapCompleted -and -not $KeepPrevious) {

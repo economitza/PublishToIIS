@@ -3011,3 +3011,99 @@ Describe 'La build en el servidor: errores en el resultado y builds anteriores' 
         Test-Path (Join-Path $rel 'P.dll') | Should -BeTrue
     }
 }
+
+Describe 'Subaplicaciones (tools/deploy/iis-subapps.json)' {
+    BeforeEach {
+        $repo = Join-Path $TestDrive ('repo_' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path (Join-Path $repo 'tools\deploy') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $repo 'Kitchen\Kitchen.Web') -Force | Out-Null
+        '<Project Sdk="Microsoft.NET.Sdk.Web" />' | Set-Content (Join-Path $repo 'Kitchen\Kitchen.Web\Kitchen.Web.csproj')
+    }
+
+    It 'un repo sin iis-subapps.json no tiene subaplicaciones' {
+        InModuleScope PublishToIIS -Parameters @{ repo = $repo } {
+            @(Get-SubApplications -RepoRoot $repo).Count | Should -Be 0
+        }
+    }
+
+    It 'lee la ruta, el proyecto desde la raíz del repo y las variables en su orden' {
+        @'
+{ "subApplications": [ { "path": "/cocina/", "project": "Kitchen/Kitchen.Web/Kitchen.Web.csproj",
+    "environmentVariables": { "Kitchen__ApiBaseUrl": "{appSetting:UrlApiEconomitza}", "Kitchen__DataProtectionKeysPath": "{dataDir}\\keys" } } ] }
+'@ | Set-Content (Join-Path $repo 'tools\deploy\iis-subapps.json') -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ repo = $repo } {
+            $apps = @(Get-SubApplications -RepoRoot $repo)
+            $apps.Count | Should -Be 1
+            $apps[0].Path | Should -Be 'cocina'
+            $apps[0].Project | Should -Be (Join-Path $repo 'Kitchen/Kitchen.Web/Kitchen.Web.csproj')
+            @($apps[0].EnvironmentVariables.Keys) | Should -Be @('Kitchen__ApiBaseUrl', 'Kitchen__DataProtectionKeysPath')
+        }
+    }
+
+    It 'rechaza una ruta que no es una sola carpeta y un proyecto que no existe' {
+        '{ "subApplications": [ { "path": "cocina/../x", "project": "Kitchen/Kitchen.Web/Kitchen.Web.csproj" } ] }' |
+            Set-Content (Join-Path $repo 'tools\deploy\iis-subapps.json') -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ repo = $repo } {
+            { Get-SubApplications -RepoRoot $repo } | Should -Throw '*una sola carpeta*'
+        }
+        '{ "subApplications": [ { "path": "cocina", "project": "Kitchen/NoEsta.csproj" } ] }' |
+            Set-Content (Join-Path $repo 'tools\deploy\iis-subapps.json') -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ repo = $repo } {
+            { Get-SubApplications -RepoRoot $repo } | Should -Throw '*no existe*'
+        }
+    }
+
+    It 'la carpeta de datos queda al lado del site, fuera del swap, también con la barra final' {
+        InModuleScope PublishToIIS {
+            Get-SubAppDataDir -Destination 'E:\wwwrootDevecoEsp1\CentralCompresTest' -Path 'cocina' | Should -Be 'E:\wwwrootDevecoEsp1\CentralCompresTest_data\cocina'
+            Get-SubAppDataDir -Destination 'E:\wwwrootDevecoand1\' -Path 'cocina' | Should -Be 'E:\wwwrootDevecoand1_data\cocina'
+            Get-SubAppPoolName -SitePoolName 'devecoesp1' -Path 'cocina' | Should -Be 'devecoesp1-cocina'
+        }
+    }
+
+    It 'los marcadores salen del web.config del site y de la carpeta de datos; sin el appSetting, falla' {
+        $site = Join-Path $TestDrive 'site-web.config'
+        '<configuration><appSettings><add key="UrlApiEconomitza" value="https://devecoesp1api.economitza.com/" /></appSettings></configuration>' | Set-Content $site -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ site = $site } {
+            Resolve-SubAppValue -Value '{appSetting:UrlApiEconomitza}' -SiteWebConfig $site -DataDir 'D:\x' | Should -Be 'https://devecoesp1api.economitza.com/'
+            Resolve-SubAppValue -Value '{dataDir}\keys' -SiteWebConfig $site -DataDir 'E:\s_data\cocina' | Should -Be 'E:\s_data\cocina\keys'
+            Resolve-SubAppValue -Value 'fijo' -SiteWebConfig $site -DataDir 'D:\x' | Should -Be 'fijo'
+            { Resolve-SubAppValue -Value '{appSetting:NoEsta}' -SiteWebConfig $site -DataDir 'D:\x' } | Should -Throw "*'NoEsta'*"
+        }
+    }
+
+    It 'escribe las variables en el aspNetCore del web.config publicado, sustituyendo las que ya tenga' {
+        $wc = Join-Path $TestDrive 'sub-web.config'
+        '<configuration><location path="." inheritInChildApplications="false"><system.webServer><aspNetCore processPath="dotnet" arguments=".\Kitchen.Web.dll" hostingModel="inprocess"><environmentVariables><environmentVariable name="Kitchen__ApiBaseUrl" value="viejo" /><environmentVariable name="OTRA" value="se queda" /></environmentVariables></aspNetCore></system.webServer></location></configuration>' |
+            Set-Content $wc -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ wc = $wc } {
+            $vars = [ordered]@{ Kitchen__ApiBaseUrl = 'https://api/'; Kitchen__DataProtectionKeysPath = 'E:\k' }
+            Set-AspNetCoreEnvironmentVariables -WebConfigPath $wc -Variables $vars
+            [xml]$x = Get-Content $wc -Raw
+            $nodos = $x.SelectNodes('//aspNetCore/environmentVariables/environmentVariable')
+            @($nodos).Count | Should -Be 3
+            ($nodos | Where-Object name -eq 'Kitchen__ApiBaseUrl').value | Should -Be 'https://api/'
+            ($nodos | Where-Object name -eq 'Kitchen__DataProtectionKeysPath').value | Should -Be 'E:\k'
+            ($nodos | Where-Object name -eq 'OTRA').value | Should -Be 'se queda'
+            $x.SelectSingleNode('//aspNetCore').processPath | Should -Be 'dotnet'
+        }
+    }
+
+    It 'sin aspNetCore no es una aplicación ASP.NET Core publicada: falla' {
+        $wc = Join-Path $TestDrive 'nocore.config'
+        '<configuration><system.webServer /></configuration>' | Set-Content $wc -Encoding UTF8
+        InModuleScope PublishToIIS -Parameters @{ wc = $wc } {
+            { Set-AspNetCoreEnvironmentVariables -WebConfigPath $wc -Variables @{ A = 'b' } } | Should -Throw '*aspNetCore*'
+        }
+    }
+
+    It 'Publish compila las subaplicaciones antes del sello y del manifiesto, y para sus grupos antes del swap' {
+        # Sin IIS ni privilegios no se puede ejecutar Publish: se comprueba el orden en su código.
+        $src = (Get-Command Publish -Module PublishToIIS).Definition
+        $build = $src.IndexOf('Get-SubApplications -RepoRoot')
+        $build | Should -BeGreaterThan 0
+        $build | Should -BeLessThan $src.IndexOf('New-DeployInfo -ProjectPath')
+        $src.IndexOf('Stop-IISAppPool -Name $subPool') | Should -BeLessThan $src.IndexOf('Stop-IISAppPool -Name $AppPoolName')
+        $src.IndexOf('Initialize-IisSubApplication') | Should -BeGreaterThan $src.IndexOf('$swapCompleted = $true')
+    }
+}

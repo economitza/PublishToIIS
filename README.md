@@ -351,6 +351,16 @@ Integración en solución .NET Framework:
   si falla el restore de EconomitzaDB, falta `E:\git\NuGet.Config` o su token ha caducado
   (`tools\Install-AspNetCorePrereqs.ps1`). Un aspnetcore no se hotfixea: se republica.
 - **`nuget restore` y checkout del servidor**: Desde la v0.5.3 del publicador (14/09/2026, `Restore-NuGetPackages`), `Publish` hace `nuget restore` del proyecto antes de MSBuild (nuget.exe del PATH, de `%ProgramData%\PublishToIIS` o descargado de dist.nuget.org), así que el 76 ya compila ramas que estrenan paquetes (MailKit de SI-2498). Y desde la v0.5.4 (mismo día) el checkout del servidor se REPONE a `origin/<rama>` con `git checkout -B`: antes un `pull --ff-only` fallaba con código 128 tras un rebase + push forzado de la rama (pasó con `main_SI-2504` el 14/09) y la publicación no arrancaba.
+- **Subaplicaciones (0.15.0)**: un site mvc publica también las aplicaciones IIS que su repo declara en
+  `tools/deploy/iis-subapps.json` (la `/cocina` .NET 10 del e-market), en la misma orden: `dotnet publish`
+  en `<releasing>\<ruta>` antes del sello y del manifiesto, sus variables escritas en el `<aspNetCore>` de
+  su `web.config` (`{appSetting:Clave}` sale del `web.config` final del site; `{dataDir}` es
+  `<site>_data\<ruta>`, fuera del swap, con escritura para su grupo), su grupo `<pool del site>-<ruta>`
+  parado antes del swap y arrancado después y, si faltan, el grupo (sin código administrado, perfil
+  cargado) y la aplicación. Una rama sin el fichero se publica como siempre. Exige el AspNetCoreModuleV2
+  del Hosting Bundle (si no, la publicación para antes de construir). El `web.config` del e-market se
+  hereda en la subaplicación: lo que estorbe se quita en el de ella, no en el del site. `Invoke-Hotfix`
+  no la lleva: un cambio de la subaplicación se republica.
 - **`urlWeb` del e-market = host del site (mvc)**: al publicar, el `appSettings/urlWeb` del web.config
   conservado pasa a ser el host de `siteUrl`/`hostName` del entorno (`Set-WebConfigSiteHost`). Con él
   arma el e-market los enlaces de sus correos («Ver pedido», «Gestionar entregas»); los sites de prueba

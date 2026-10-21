@@ -6,6 +6,17 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.15.0] - 2026-10-21
+
+### Added
+- **Subaplicaciones de .NET moderno dentro de un site mvc**: el repo que se publica las declara en
+  `tools/deploy/iis-subapps.json` (ruta, proyecto y variables de entorno) y viajan en la misma publicación
+  que el site: `dotnet publish` dentro de su carpeta (`<site>\cocina`), sello y manifiesto comunes, sus
+  grupos parados y arrancados con el swap y, la primera vez, su grupo sin código administrado y su
+  aplicación IIS. Las variables admiten `{appSetting:Clave}` (del `web.config` final del site, p. ej. la
+  API que llama) y `{dataDir}` (`<site>_data\<ruta>`, fuera del swap). Exige el AspNetCoreModuleV2 del
+  Hosting Bundle en el servidor. La estrena la `/cocina` .NET 10 del e-market (SI-2729).
+
 ## [0.14.2] - 2026-10-21
 
 ### Fixed
