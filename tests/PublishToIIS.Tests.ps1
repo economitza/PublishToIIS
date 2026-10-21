@@ -956,6 +956,41 @@ Describe 'Set-WebConfigSiteHost' {
     }
 }
 
+Describe 'Set-WebConfigApiUrl' {
+    # La API que llama un site sale de su entrada de environments.json, no de la plantilla de la que se sembró.
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:tmp | Out-Null
+        $script:cfg = Join-Path $script:tmp 'web.config'
+    }
+
+    AfterEach {
+        Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'pone la API del entorno en UrlApiEconomitza y deja el resto como estaba' {
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://testapidevecoesp.economitza.com" /><add key="urlWeb" value="x" /></appSettings></configuration>'
+        $cambiado = InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigApiUrl -WebConfigPath $cfg -ApiUrl 'https://devecoesp1api.economitza.com' }
+        $cambiado | Should -BeTrue
+        $xml = [xml](Get-Content $script:cfg -Raw)
+        $xml.SelectSingleNode("//add[@key='UrlApiEconomitza']").value | Should -Be 'https://devecoesp1api.economitza.com'
+        $xml.SelectSingleNode("//add[@key='urlWeb']").value | Should -Be 'x'
+    }
+
+    It 'no toca nada si ya es esa API o si el web.config no tiene UrlApiEconomitza' {
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://devecoesp1api.economitza.com" /></appSettings></configuration>'
+        InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigApiUrl -WebConfigPath $cfg -ApiUrl 'https://devecoesp1api.economitza.com' } | Should -BeFalse
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings /></configuration>'
+        InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigApiUrl -WebConfigPath $cfg -ApiUrl 'https://devecoesp1api.economitza.com' } | Should -BeFalse
+        (Get-Content $script:cfg -Raw) | Should -Not -Match 'UrlApiEconomitza'
+    }
+
+    It 'rechaza una API que no sea una URL http(s)' {
+        Set-Content $script:cfg -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://a" /></appSettings></configuration>'
+        { InModuleScope PublishToIIS -Parameters @{ cfg = $script:cfg } { Set-WebConfigApiUrl -WebConfigPath $cfg -ApiUrl 'devecoesp1api' } } | Should -Throw
+    }
+}
+
 Describe 'Protect-ProductionWebConfig' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())

@@ -6,6 +6,13 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.13.9] - 2026-10-21
+
+### Added
+- **`apiUrl` por entorno**: un e-market declara en `config\environments.json` la API que llama y cada
+  publicación la fija en `UrlApiEconomitza` del web.config conservado. `devecoesp-audit` pasa a
+  `devecoesp1api`; hasta ahora heredaba de su plantilla una API anterior a la 2.1.0.
+
 ## [0.13.2] - 2026-10-16
 
 ### Added

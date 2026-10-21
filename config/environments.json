@@ -65,6 +65,7 @@
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoEspAudit",
       "siteUrl": "https://devecoesp-audit.economitza.com",
+      "apiUrl": "https://devecoesp1api.economitza.com",
       "templateSite": "devecoesp1",
       "responsable": "Joaquim"
     },

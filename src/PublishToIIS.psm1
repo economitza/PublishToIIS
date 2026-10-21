@@ -243,6 +243,32 @@ function Set-WebConfigSiteHost {
     $true
 }
 
+function Set-WebConfigApiUrl {
+    <#
+    .SYNOPSIS
+        mvc: el appSetting UrlApiEconomitza del web.config publicado pasa a ser la API del entorno.
+    .DESCRIPTION
+        Qué API llama un site queda declarado en su entrada de environments.json (`apiUrl`) en vez de
+        vivir solo en el web.config del servidor, que se conserva de publicación en publicación. Un
+        site sembrado desde una plantilla heredaba su API para siempre: devecoesp-audit, clonado de
+        devecoesp1 antes de que existiera devecoesp1api, seguía llamando a una API anterior a la 2.1.0
+        mientras se auditaba la release. Solo toca una clave que ya exista; devuelve $true si la cambia.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WebConfigPath,
+        [Parameter(Mandatory)][ValidatePattern('^https?://')][string]$ApiUrl
+    )
+    if (-not (Test-Path $WebConfigPath)) { return $false }
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.Load($WebConfigPath)
+    $nodo = $xml.SelectSingleNode("/configuration/appSettings/add[@key='UrlApiEconomitza']")
+    if (-not $nodo -or $nodo.GetAttribute('value') -eq $ApiUrl) { return $false }
+    $nodo.SetAttribute('value', $ApiUrl)
+    $xml.Save($WebConfigPath)
+    $true
+}
+
 function Merge-JsonSettings {
     <#
     .SYNOPSIS
@@ -1198,6 +1224,8 @@ function Publish {
         # databaseMap) cuando no se pasan explícitos.
         [string]$TemplateSite,
         [string]$HostName,
+        # mvc: la API que llama el site (UrlApiEconomitza). Sale del campo `apiUrl` del entorno.
+        [string]$ApiUrl,
         $DatabaseMap,
         # Tipo de proyecto (ver Resolve-PublishKind): 'mvc' por defecto, 'aspnetcore'
         # para la API. Sale del campo `kind` del entorno si no se pasa.
@@ -1242,6 +1270,7 @@ function Publish {
         if (-not $TemplateSite -and $cfg.templateSite) { $TemplateSite = [string]$cfg.templateSite }
         if (-not $HostName -and $cfg.hostName) { $HostName = [string]$cfg.hostName }
         if (-not $HostName -and $cfg.siteUrl) { $HostName = ([Uri][string]$cfg.siteUrl).Host }
+        if (-not $ApiUrl -and $cfg.apiUrl) { $ApiUrl = [string]$cfg.apiUrl }
         if (-not $DatabaseMap -and $cfg.databaseMap) { $DatabaseMap = $cfg.databaseMap }
         if (-not $Kind -and $cfg.kind) { $Kind = [string]$cfg.kind }
         if (-not $SeedAppSettings -and $cfg.seedAppSettings) { $SeedAppSettings = $cfg.seedAppSettings }
@@ -1388,6 +1417,9 @@ function Publish {
             # apuntan a ese entorno, como en producción, y no al localhost de la plantilla.
             if ($HostName -and (Set-WebConfigSiteHost -WebConfigPath $releasingWebConfig -HostName $HostName)) {
                 Write-Host "urlWeb del web.config: $HostName" -ForegroundColor Green
+            }
+            if ($ApiUrl -and (Set-WebConfigApiUrl -WebConfigPath $releasingWebConfig -ApiUrl $ApiUrl)) {
+                Write-Host "UrlApiEconomitza del web.config: $ApiUrl" -ForegroundColor Green
             }
         }
 
