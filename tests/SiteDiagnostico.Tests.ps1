@@ -33,6 +33,29 @@ Describe 'Diagnóstico del site: configuración con los secretos tapados' {
         $t | Should -Match 'publicKeyToken="31bf3856ad364e35"'
     }
 
+    It 'tapa también lo comentado y los <setting> de applicationSettings' {
+        # Una cadena de conexión comentada en el Web.config de devecoesp-audit salió con su contraseña.
+        $cfg = Join-Path $script:tmp 'Web.config'
+        Set-Content $cfg -Encoding UTF8 -Value @'
+<configuration>
+  <connectionStrings>
+    <!--<add name="Viejo" connectionString="Data Source=172.31.0.209;Initial Catalog=X; User ID=CCEspana ;Password=fuga-uno" />-->
+    <!-- <add key="AWSSecretKey" value="fuga-dos" /> -->
+    <!-- no es XML: password="fuga-tres" y Server=x;Pwd=fuga-cuatro; -->
+  </connectionStrings>
+  <applicationSettings><X.Properties.Settings>
+    <setting name="SmtpPassword" serializeAs="String"><value>fuga-cinco</value></setting>
+    <setting name="UrlApi" serializeAs="String"><value>https://api</value></setting>
+  </X.Properties.Settings></applicationSettings>
+</configuration>
+'@
+        $t = InModuleScope PublishToIIS -Parameters @{ p = $cfg } { Get-ConfigTextoProtegido -Path $p }
+        $t | Should -Not -Match 'fuga'
+        $t | Should -Match 'User ID=CCEspana ;Password=\*\*\*'
+        $t | Should -Match '<value>https://api</value>'
+        { [xml]$t } | Should -Not -Throw
+    }
+
     It 'tapa propiedades secretas y contraseñas en cadenas de un appsettings.json' {
         $cfg = Join-Path $script:tmp 'appsettings.json'
         Set-Content $cfg -Encoding UTF8 -Value '{ "ConnectionStrings": { "Default": "Server=x;Database=CCEspana;Password=clave-bd;" }, "AWS": { "AccessKey": "AK", "SecretKey": "SK", "Region": "eu-west-3" }, "Jwt": { "Key": "firma" } }'
@@ -103,6 +126,17 @@ Describe 'Diagnóstico del site: rutas, ficheros y manifiesto' {
             $r.body.appSettings['UrlApiEconomitza'] | Should -Be 'https://api'
             $r.body.appSettings['AWSSecretKey'] | Should -Be '***'
             $r.body.deployInfo.commit | Should -Be 'abc1234'
+        }
+
+        It '/api/config resume el Web.config efectivo (configSource incluido), no un Web_local.config de al lado' {
+            Set-Content (Join-Path $script:site 'Web.config') -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://devecoesp1api" /></appSettings><connectionStrings configSource="connections.config" /></configuration>'
+            Set-Content (Join-Path $script:site 'connections.config') -Encoding UTF8 -Value '<connectionStrings><add name="Default" connectionString="Server=172.31.0.244;Database=CCEspana;Password=fuga;" /></connectionStrings>'
+            Set-Content (Join-Path $script:site 'Web_local.config') -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://otra" /></appSettings><connectionStrings><add name="Default" connectionString="Server=DESKTOP;Database=Vieja" /></connectionStrings></configuration>'
+            $r = & $script:llamar '/api/config' @{ environment = 'devecoesp-audit' }
+            $r.body.appSettings['UrlApiEconomitza'] | Should -Be 'https://devecoesp1api'
+            $r.body.connectionStrings['Default'] | Should -Be 'Server=172.31.0.244;Database=CCEspana;Password=***;'
+            $r.body.files.path | Should -Contain 'Web_local.config'
+            ($r.body.files | ForEach-Object { $_.text }) -join '' | Should -Not -Match 'fuga'
         }
 
         It '/api/files lista y /api/file sirve un binario en base64 y la configuración tapada' {

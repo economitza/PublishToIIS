@@ -3565,8 +3565,48 @@ $script:PatronConfig = '(?i)\.config$|^appsettings.*\.json$'
 function Test-NombreSecreto([string]$Nombre) { $Nombre -match $script:PatronSecreto }
 
 function Hide-SecretosEnCadena([string]$Texto) {
-    # La contraseña de una cadena de conexión, también la anidada de Entity Framework.
-    [regex]::Replace($Texto, '(?i)\b(password|pwd)(\s*=\s*)[^;"]*', '$1$2***')
+    # La contraseña de una cadena de conexión (también la anidada de Entity Framework), esté donde esté.
+    # No toca un atributo password="…" (lo que sigue al = es una comilla): ese lo tapa el recorrido del XML.
+    [regex]::Replace($Texto, '(?i)\b(password|pwd)(\s*=\s*)(?![\s"''])[^;"''<]*', '$1$2***')
+}
+
+function Hide-SecretosEnXml($Nodo) {
+    foreach ($el in @($Nodo.SelectNodes('.//*'))) {
+        $clave = $el.GetAttribute('key')
+        foreach ($at in @($el.Attributes)) {
+            if ($at.Name -eq 'value' -and $clave -and (Test-NombreSecreto $clave)) { $at.Value = '***' }
+            elseif ($at.Name -ne 'key' -and (Test-NombreSecreto $at.Name)) { $at.Value = '***' }
+            elseif ($at.Name -match '(?i)connectionString') { $at.Value = Hide-SecretosEnCadena $at.Value }
+        }
+        # applicationSettings: <setting name="…Password…"><value>…</value></setting>
+        if ($el.LocalName -eq 'value' -and $el.ParentNode.LocalName -eq 'setting' -and (Test-NombreSecreto $el.ParentNode.GetAttribute('name'))) {
+            $el.InnerText = '***'
+        }
+    }
+}
+
+function Hide-SecretosEnComentario([string]$Texto) {
+    # Una configuración comentada lleva sus secretos igual que la activa. Si el comentario es XML se tapa
+    # como el resto, y después siempre por texto (un comentario de prosa también es XML válido dentro de
+    # <r>): nombre="valor" con nombre de secreto, key="secreto" value="…" y las cadenas de conexión.
+    $t = $Texto
+    $frag = New-Object System.Xml.XmlDocument
+    $frag.PreserveWhitespace = $true
+    try {
+        $frag.LoadXml("<r>$Texto</r>")
+        Hide-SecretosEnXml $frag.DocumentElement
+        $t = $frag.DocumentElement.InnerXml
+    }
+    catch { }   # no es XML: queda para las reglas de texto de abajo
+    $t = [regex]::Replace($t, '(?i)\bkey(\s*=\s*")([^"]*)("\s+value\s*=\s*")[^"]*(")', {
+        param($m)
+        if (Test-NombreSecreto $m.Groups[2].Value) { 'key' + $m.Groups[1].Value + $m.Groups[2].Value + $m.Groups[3].Value + '***' + $m.Groups[4].Value } else { $m.Value }
+    })
+    $t = [regex]::Replace($t, '\b([\w.:-]+)(\s*=\s*")[^"]*(")', {
+        param($m)
+        if ($m.Groups[1].Value -ne 'key' -and (Test-NombreSecreto $m.Groups[1].Value)) { $m.Groups[1].Value + $m.Groups[2].Value + '***' + $m.Groups[3].Value } else { $m.Value }
+    })
+    Hide-SecretosEnCadena $t
 }
 
 function Get-ConfigTextoProtegido {
@@ -3580,24 +3620,39 @@ function Get-ConfigTextoProtegido {
     param([Parameter(Mandatory)][string]$Path)
     $texto = [IO.File]::ReadAllText($Path)
     if ($Path -match '\.json$') {
-        return [regex]::Replace($texto, '"([^"]+)"(\s*:\s*)"((?:[^"\\]|\\.)*)"', {
+        $json = [regex]::Replace($texto, '"([^"]+)"(\s*:\s*)"((?:[^"\\]|\\.)*)"', {
             param($m)
-            $valor = if (Test-NombreSecreto $m.Groups[1].Value) { '***' } else { Hide-SecretosEnCadena $m.Groups[3].Value }
+            $valor = if (Test-NombreSecreto $m.Groups[1].Value) { '***' } else { $m.Groups[3].Value }
             '"' + $m.Groups[1].Value + '"' + $m.Groups[2].Value + '"' + $valor + '"'
         })
+        return Hide-SecretosEnCadena $json
     }
     $xml = New-Object System.Xml.XmlDocument
     $xml.PreserveWhitespace = $true
     $xml.LoadXml($texto)
-    foreach ($el in $xml.SelectNodes('//*')) {
-        $clave = $el.GetAttribute('key')
-        foreach ($at in @($el.Attributes)) {
-            if ($at.Name -eq 'value' -and $clave -and (Test-NombreSecreto $clave)) { $at.Value = '***' }
-            elseif ($at.Name -ne 'key' -and (Test-NombreSecreto $at.Name)) { $at.Value = '***' }
-            elseif ($at.Name -match '(?i)connectionString') { $at.Value = Hide-SecretosEnCadena $at.Value }
-        }
+    Hide-SecretosEnXml $xml
+    foreach ($c in @($xml.SelectNodes('//comment()'))) { $c.Value = Hide-SecretosEnComentario $c.Value }
+    # Red final: cualquier contraseña de cadena de conexión que quede en el texto (CDATA, texto de nodos…).
+    Hide-SecretosEnCadena $xml.OuterXml
+}
+
+function Read-ConfigSection($Root, $Doc, [string]$Seccion) {
+    # Los <add> efectivos de una sección del Web.config: configSource la sustituye por la de otro fichero
+    # y file (appSettings) la completa con los suyos, que mandan.
+    $nodo = $Doc.SelectSingleNode("/configuration/$Seccion")
+    if (-not $nodo) { return @() }
+    $nodos = @()
+    if (-not $nodo.GetAttribute('configSource')) { $nodos += @($nodo.SelectNodes('add')) }
+    foreach ($atributo in 'configSource', 'file') {
+        $ruta = $nodo.GetAttribute($atributo)
+        if (-not $ruta) { continue }
+        $full = Resolve-SiteFile -Root $Root -Relative $ruta
+        if (-not (Test-Path -LiteralPath $full)) { continue }
+        $d = New-Object System.Xml.XmlDocument
+        $d.LoadXml((Get-ConfigTextoProtegido -Path $full))
+        $nodos += @($d.DocumentElement.SelectNodes('add'))
     }
-    $xml.OuterXml
+    $nodos
 }
 
 function Resolve-SiteRoot {
@@ -3688,25 +3743,29 @@ function New-DeployManifest {
 }
 
 function Get-SiteConfigInfo {
-    # /api/config: los ficheros de configuración de la raíz del site con los secretos tapados, sus
-    # appSettings y cadenas de conexión ya leídos, y el deploy-info.json.
+    # /api/config: los ficheros de configuración de la raíz del site con los secretos tapados, los
+    # appSettings y las cadenas de conexión EFECTIVOS (los del Web.config, siguiendo configSource y file;
+    # no los de un Web_local.config que esté al lado) y el deploy-info.json.
     param([Parameter(Mandatory)][string]$Root, [string]$Environment)
-    $appSettings = [ordered]@{}; $conexiones = [ordered]@{}
+    $appSettings = [ordered]@{}; $conexiones = [ordered]@{}; $errores = @()
     $ficheros = foreach ($f in @(Get-ChildItem -LiteralPath $Root -File -Force | Where-Object { $_.Name -match $script:PatronConfig } | Sort-Object Name)) {
-        $t = Get-ConfigTextoProtegido -Path $f.FullName
-        if ($f.Extension -eq '.config') {
-            try {
-                $x = New-Object System.Xml.XmlDocument; $x.LoadXml($t)
-                foreach ($a in $x.SelectNodes('/configuration/appSettings/add')) { $appSettings[$a.GetAttribute('key')] = $a.GetAttribute('value') }
-                foreach ($c in $x.SelectNodes('//connectionStrings/add')) { $conexiones[$c.GetAttribute('name')] = $c.GetAttribute('connectionString') }
-            } catch { }
+        $t = try { Get-ConfigTextoProtegido -Path $f.FullName } catch { $errores += "$($f.Name): $($_.Exception.Message)"; $null }
+        if ($null -ne $t) { [ordered]@{ path = $f.Name; text = $t } }
+    }
+    $web = Join-Path $Root 'Web.config'
+    if (Test-Path -LiteralPath $web) {
+        try {
+            $doc = New-Object System.Xml.XmlDocument
+            $doc.LoadXml((Get-ConfigTextoProtegido -Path $web))
+            foreach ($a in Read-ConfigSection $Root $doc 'appSettings') { $appSettings[$a.GetAttribute('key')] = $a.GetAttribute('value') }
+            foreach ($c in Read-ConfigSection $Root $doc 'connectionStrings') { $conexiones[$c.GetAttribute('name')] = $c.GetAttribute('connectionString') }
         }
-        [ordered]@{ path = $f.Name; text = $t }
+        catch { $errores += "Web.config: $($_.Exception.Message)" }
     }
     $info = $null
     $di = Join-Path $Root 'deploy-info.json'
     if (Test-Path -LiteralPath $di) { try { $info = [IO.File]::ReadAllText($di).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { } }
-    [ordered]@{ environment = $Environment; root = $Root; deployInfo = $info; appSettings = $appSettings; connectionStrings = $conexiones; files = @($ficheros) }
+    [ordered]@{ environment = $Environment; root = $Root; deployInfo = $info; appSettings = $appSettings; connectionStrings = $conexiones; files = @($ficheros); errors = @($errores) }
 }
 
 function Get-SiteFileContent {
