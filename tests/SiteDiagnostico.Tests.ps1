@@ -66,6 +66,37 @@ Describe 'Diagnóstico del site: configuración con los secretos tapados' {
     }
 }
 
+Describe 'Protect-ProductionWebConfig: los tipos MIME del build llegan al web.config conservado' {
+    # SI-2695: la app acepta fotos .webp y el Web.config del repo declara su tipo, pero el del servidor
+    # se conserva al publicar y sin ese tipo IIS respondía 404 al pedirlas.
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:tmp | Out-Null
+        $script:servidor = Join-Path $script:tmp 'target_web.config'
+        $script:build = Join-Path $script:tmp 'releasing_web.config'
+        Set-Content $script:build -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://repo" /></appSettings><system.webServer><staticContent><remove fileExtension=".webp" /><mimeMap fileExtension=".webp" mimeType="image/webp" /><mimeMap fileExtension=".json" mimeType="application/json" /></staticContent></system.webServer></configuration>'
+    }
+    AfterEach { Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'añade los que le faltan al servidor y conserva lo suyo' {
+        Set-Content $script:servidor -Encoding UTF8 -Value '<configuration><appSettings><add key="UrlApiEconomitza" value="https://servidor" /></appSettings><system.webServer><staticContent><clientCache cacheControlMode="UseMaxAge" /><mimeMap fileExtension=".json" mimeType="text/json" /></staticContent></system.webServer></configuration>'
+        Protect-ProductionWebConfig -TargetWebConfig $script:servidor -ReleasingWebConfig $script:build | Should -Be 'preserved'
+        $x = [xml](Get-Content $script:build -Raw)
+        $x.SelectSingleNode("//appSettings/add[@key='UrlApiEconomitza']").value | Should -Be 'https://servidor'
+        $x.SelectSingleNode("//staticContent/mimeMap[@fileExtension='.webp']").mimeType | Should -Be 'image/webp'
+        $x.SelectSingleNode("//staticContent/remove[@fileExtension='.webp']") | Should -Not -BeNullOrEmpty
+        @($x.SelectNodes("//staticContent/mimeMap[@fileExtension='.json']")).Count | Should -Be 1
+        $x.SelectSingleNode("//staticContent/mimeMap[@fileExtension='.json']").mimeType | Should -Be 'text/json'
+        $x.SelectSingleNode('//staticContent/clientCache') | Should -Not -BeNullOrEmpty
+    }
+
+    It 'crea system.webServer y staticContent si el servidor no los tiene' {
+        Set-Content $script:servidor -Encoding UTF8 -Value '<configuration><appSettings /></configuration>'
+        Protect-ProductionWebConfig -TargetWebConfig $script:servidor -ReleasingWebConfig $script:build | Should -Be 'preserved'
+        ([xml](Get-Content $script:build -Raw)).SelectSingleNode("/configuration/system.webServer/staticContent/mimeMap[@fileExtension='.webp']") | Should -Not -BeNullOrEmpty
+    }
+}
+
 Describe 'Diagnóstico del site: rutas, ficheros y manifiesto' {
     BeforeEach {
         $script:site = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_site_" + [Guid]::NewGuid())

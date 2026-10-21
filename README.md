@@ -26,8 +26,9 @@ Uso rápido:
   `web.config.previous` para poder comparar o restaurar.
 
   Al preservar, lo que depende de los binarios del build viaja con el build: el
-  `<runtime>` (redirecciones de ensamblados) y los `system.web/compilation/assemblies`
-  que le falten al del servidor. El resto (appSettings, conexiones, customErrors...)
+  `<runtime>` (redirecciones de ensamblados), los `system.web/compilation/assemblies`
+  y los `mimeMap` de `system.webServer/staticContent` que le falten al del servidor
+  (sin el del `.webp`, IIS daba 404 a las fotos que la app aceptaba). El resto (appSettings, conexiones, customErrors...)
   es del servidor. Sin esto, un build que cambia de version una DLL rompia el site
   hasta editar su web.config a mano (System.Memory de NPOI 2.7.6, 05 y 07/10/2026).
 

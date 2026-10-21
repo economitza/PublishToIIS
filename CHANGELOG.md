@@ -6,6 +6,15 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.14.2] - 2026-10-21
+
+### Fixed
+- **Los tipos MIME del build llegan al web.config conservado**: los `mimeMap` de
+  `system.webServer/staticContent` que declara el build y le faltan al servidor se añaden al publicar,
+  con un `<remove>` delante. Sin el del `.webp` (SI-2695), IIS respondía 404 a las fotos de las fichas
+  que la app ya aceptaba. Los del servidor se respetan.
+- `/api/config` tapa también los secretos de los comentarios y resume solo el `Web.config` efectivo (0.14.1).
+
 ## [0.14.0] - 2026-10-21
 
 ### Added

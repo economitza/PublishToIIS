@@ -489,6 +489,30 @@ function Get-BuildBoundWebConfigMerge {
         }
     }
 
+    # Los tipos MIME que declara el build (system.webServer/staticContent/mimeMap) van con lo que la app
+    # guarda y sirve, no con el entorno: sin el del .webp, IIS respondía 404 a las fotos que la app ya
+    # aceptaba (SI-2695). Se añaden los que le falten al servidor, con un <remove> delante para no chocar
+    # con los que ya traiga el IIS; los del servidor se respetan.
+    $buildMimes = $build.SelectNodes('/configuration/system.webServer/staticContent/mimeMap')
+    if ($buildMimes.Count) {
+        $webServer = $server.SelectSingleNode('/configuration/system.webServer')
+        if (-not $webServer) { $webServer = $server.DocumentElement.AppendChild($server.CreateElement('system.webServer')) }
+        $static = $webServer.SelectSingleNode('staticContent')
+        if (-not $static) { $static = $webServer.AppendChild($server.CreateElement('staticContent')) }
+        $present = @{}
+        foreach ($m in $static.SelectNodes('mimeMap')) { $present[$m.GetAttribute('fileExtension').ToLowerInvariant()] = $true }
+        foreach ($m in $buildMimes) {
+            $ext = $m.GetAttribute('fileExtension')
+            if (-not $ext -or $present.ContainsKey($ext.ToLowerInvariant())) { continue }
+            $remove = $server.CreateElement('remove')
+            $remove.SetAttribute('fileExtension', $ext)
+            $null = $static.AppendChild($remove)
+            $null = $static.AppendChild($server.ImportNode($m, $true))
+            $present[$ext.ToLowerInvariant()] = $true
+            $changes += "mimeMap $ext"
+        }
+    }
+
     [pscustomobject]@{ Document = $server; Changes = $changes }
 }
 
