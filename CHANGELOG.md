@@ -6,6 +6,16 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.14.0] - 2026-10-21
+
+### Added
+- **Diagnóstico de un site remoto sin RDP**: `GET /api/config` (configuración con los secretos tapados),
+  `GET /api/files` (ficheros con tamaño y sha256 calculado en el servidor) y `GET /api/file` (un fichero; la
+  configuración, tapada), con sus clientes `Get-RemoteSiteConfig`, `Get-RemoteSiteFiles` y `Get-RemoteSiteFile`.
+  Solo entornos de la lista blanca y dentro de su carpeta.
+- **`deploy-manifest.json`**: cada publicación sella, junto al `deploy-info.json`, la lista de ficheros publicados
+  con su sha256; `Test-RemoteSiteManifest` dice qué ha cambiado, falta o sobra en el site respecto a ese build.
+
 ## [0.13.9] - 2026-10-21
 
 ### Added

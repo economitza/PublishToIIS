@@ -1429,6 +1429,9 @@ function Publish {
         if ($deployInfo.commit) {
             Write-Host "deploy-info.json stamped: $($deployInfo.branch)@$($deployInfo.commit) -> $deployInfoEnv" -ForegroundColor Green
         }
+        # Lo publicado, fichero a fichero: Test-RemoteSiteManifest lo compara después con el site vivo.
+        try { Write-Host "deploy-manifest.json stamped: $(New-DeployManifest -Dir $releasingDir) ficheros" -ForegroundColor Green }
+        catch { Write-Warning "deploy-manifest.json no se ha podido sellar: $($_.Exception.Message)" }
 
         # Si había un previous viejo, eliminarlo antes del swap
         if (Test-Path $previousDir) {
@@ -3545,6 +3548,185 @@ function Invoke-DeployQueueDrain {
     $processed
 }
 
+# --- Diagnóstico de un site publicado: configuración, ficheros y manifiesto -------------------------
+# Quien tiene el token del endpoint ya puede sobrescribir el site, así que leerlo no le da nada nuevo.
+# Lo que sí se cuida: los secretos de la configuración salen tapados (para que no viajen al equipo que
+# pregunta ni acaben en logs o en el contexto de un agente), solo se lee dentro de la carpeta del
+# entorno, sin seguir enlaces, y con tope de tamaño.
+
+# Nombre de clave, propiedad o atributo que guarda un secreto: su valor no sale del servidor.
+# El atributo `key` de un <add key=…> es el nombre, no un secreto: Get-ConfigTextoProtegido lo deja.
+$script:PatronSecreto = '(?i)^(?!publicKeyToken$)(.*(pass(word)?|pwd|secret|token|apikey|api_key|accesskey|privatekey|credential).*|.*key)$'
+# Lo que cambia solo en el site vivo (logs, subidas, temporales) y los sellos: fuera del manifiesto.
+$script:ManifiestoExcluir = '(?i)^(Logs|Upload|App_Data|tmp|Temp)(\\|$)|\.log$|^deploy-(manifest|info)\.json$'
+# Ficheros de configuración: se sirven como texto con los secretos tapados, nunca tal cual.
+$script:PatronConfig = '(?i)\.config$|^appsettings.*\.json$'
+
+function Test-NombreSecreto([string]$Nombre) { $Nombre -match $script:PatronSecreto }
+
+function Hide-SecretosEnCadena([string]$Texto) {
+    # La contraseña de una cadena de conexión, también la anidada de Entity Framework.
+    [regex]::Replace($Texto, '(?i)\b(password|pwd)(\s*=\s*)[^;"]*', '$1$2***')
+}
+
+function Get-ConfigTextoProtegido {
+    <#
+    .SYNOPSIS
+        Texto de un fichero de configuración del site (*.config o appsettings*.json) con los secretos tapados.
+    .DESCRIPTION
+        Se tapa el valor de toda clave, propiedad o atributo con nombre de secreto (password, secret, token,
+        *Key…; no publicKeyToken) y la contraseña de toda cadena de conexión. El resto, tal cual.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $texto = [IO.File]::ReadAllText($Path)
+    if ($Path -match '\.json$') {
+        return [regex]::Replace($texto, '"([^"]+)"(\s*:\s*)"((?:[^"\\]|\\.)*)"', {
+            param($m)
+            $valor = if (Test-NombreSecreto $m.Groups[1].Value) { '***' } else { Hide-SecretosEnCadena $m.Groups[3].Value }
+            '"' + $m.Groups[1].Value + '"' + $m.Groups[2].Value + '"' + $valor + '"'
+        })
+    }
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.LoadXml($texto)
+    foreach ($el in $xml.SelectNodes('//*')) {
+        $clave = $el.GetAttribute('key')
+        foreach ($at in @($el.Attributes)) {
+            if ($at.Name -eq 'value' -and $clave -and (Test-NombreSecreto $clave)) { $at.Value = '***' }
+            elseif ($at.Name -ne 'key' -and (Test-NombreSecreto $at.Name)) { $at.Value = '***' }
+            elseif ($at.Name -match '(?i)connectionString') { $at.Value = Hide-SecretosEnCadena $at.Value }
+        }
+    }
+    $xml.OuterXml
+}
+
+function Resolve-SiteRoot {
+    # La carpeta que sirve un entorno de la lista blanca: su `destination` (el swap la sustituye entera).
+    param([Parameter(Mandatory)][string]$Environment)
+    if ($Environment -notin @(Get-AllowedEnvironments)) { throw "Entorno no permitido: '$Environment'." }
+    $cfg = Get-PublishConfig -Environment $Environment
+    if (-not $cfg.destination) { throw "El entorno '$Environment' no declara destination." }
+    $root = [IO.Path]::GetFullPath([string]$cfg.destination).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "No existe en este servidor la carpeta del site: $root" }
+    $root
+}
+
+function Resolve-SiteFile {
+    # Una ruta relativa dentro del site; nada de '..', unidades ni rutas absolutas.
+    param([Parameter(Mandatory)][string]$Root, [string]$Relative)
+    $rel = ([string]$Relative).Replace('/', '\').Trim('\')
+    if ($rel -match '(^|\\)\.\.(\\|$)|:') { throw "Ruta no permitida: '$Relative'." }
+    $full = if ($rel) { [IO.Path]::GetFullPath((Join-Path $Root $rel)) } else { $Root }
+    if ($full -ne $Root -and -not $full.StartsWith("$Root\", [StringComparison]::OrdinalIgnoreCase)) { throw "Ruta fuera del site: '$Relative'." }
+    $full
+}
+
+function Read-SiteFileBytes([string]$Path) {
+    # Con FileShare.ReadWrite: un log o una DLL en uso por el site se leen igual.
+    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try { $ms = New-Object IO.MemoryStream; $fs.CopyTo($ms); $ms.ToArray() } finally { $fs.Dispose() }
+}
+
+function Get-FileSha256([string]$Path) {
+    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose(); $fs.Dispose() }
+}
+
+function Get-SiteFileManifest {
+    <#
+    .SYNOPSIS
+        Los ficheros de una carpeta del site, con ruta relativa (con /), tamaño, fecha y sha256.
+    .DESCRIPTION
+        Sin -Todo deja fuera lo que solo cambia en el site vivo ($script:ManifiestoExcluir). No sigue
+        enlaces ni uniones. -Sub acota a una subcarpeta y -NoHash no calcula los sha256.
+    #>
+    param([Parameter(Mandatory)][string]$Root, [string]$Sub = '', [switch]$NoHash, [switch]$Todo, [int]$Max = 50000)
+    $Root = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $base = Resolve-SiteFile -Root $Root -Relative $Sub
+    if (-not (Test-Path -LiteralPath $base -PathType Container)) { throw "No existe en el site la carpeta '$Sub'." }
+    $salida = [System.Collections.Generic.List[object]]::new()
+    $pila = [System.Collections.Generic.Stack[string]]::new()
+    $pila.Push($base)
+    while ($pila.Count) {
+        $dir = $pila.Pop()
+        foreach ($d in [IO.Directory]::GetDirectories($dir)) {
+            if ([IO.File]::GetAttributes($d) -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if (-not $Todo -and $d.Substring($Root.Length + 1) -match $script:ManifiestoExcluir) { continue }
+            $pila.Push($d)
+        }
+        foreach ($p in [IO.Directory]::GetFiles($dir)) {
+            $rel = $p.Substring($Root.Length + 1)
+            if (-not $Todo -and $rel -match $script:ManifiestoExcluir) { continue }
+            $f = New-Object IO.FileInfo($p)
+            if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($salida.Count -ge $Max) { throw "Más de $Max ficheros: acota la carpeta." }
+            $salida.Add([pscustomobject][ordered]@{
+                path = $rel.Replace('\', '/'); size = $f.Length; modified = $f.LastWriteTimeUtc.ToString('o')
+                sha256 = $(if ($NoHash) { $null } else { Get-FileSha256 $p })
+            })
+        }
+    }
+    $salida | Sort-Object path
+}
+
+function New-DeployManifest {
+    <#
+    .SYNOPSIS
+        Sella deploy-manifest.json junto al deploy-info.json: lo que se publicó, fichero a fichero con su sha256.
+    .DESCRIPTION
+        Compararlo con lo que hay después en el site (Test-RemoteSiteManifest, /api/files) dice si sigue
+        siendo ese build o qué ha cambiado: un hotfix, una edición a mano, una DLL de menos. Devuelve cuántos
+        ficheros sella.
+    #>
+    param([Parameter(Mandatory)][string]$Dir)
+    $files = @(Get-SiteFileManifest -Root $Dir | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
+    $doc = [ordered]@{ generated = (Get-Date).ToString('o'); count = $files.Count; files = $files }
+    [IO.File]::WriteAllText((Join-Path $Dir 'deploy-manifest.json'), ($doc | ConvertTo-Json -Depth 4 -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    $files.Count
+}
+
+function Get-SiteConfigInfo {
+    # /api/config: los ficheros de configuración de la raíz del site con los secretos tapados, sus
+    # appSettings y cadenas de conexión ya leídos, y el deploy-info.json.
+    param([Parameter(Mandatory)][string]$Root, [string]$Environment)
+    $appSettings = [ordered]@{}; $conexiones = [ordered]@{}
+    $ficheros = foreach ($f in @(Get-ChildItem -LiteralPath $Root -File -Force | Where-Object { $_.Name -match $script:PatronConfig } | Sort-Object Name)) {
+        $t = Get-ConfigTextoProtegido -Path $f.FullName
+        if ($f.Extension -eq '.config') {
+            try {
+                $x = New-Object System.Xml.XmlDocument; $x.LoadXml($t)
+                foreach ($a in $x.SelectNodes('/configuration/appSettings/add')) { $appSettings[$a.GetAttribute('key')] = $a.GetAttribute('value') }
+                foreach ($c in $x.SelectNodes('//connectionStrings/add')) { $conexiones[$c.GetAttribute('name')] = $c.GetAttribute('connectionString') }
+            } catch { }
+        }
+        [ordered]@{ path = $f.Name; text = $t }
+    }
+    $info = $null
+    $di = Join-Path $Root 'deploy-info.json'
+    if (Test-Path -LiteralPath $di) { try { $info = [IO.File]::ReadAllText($di).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { } }
+    [ordered]@{ environment = $Environment; root = $Root; deployInfo = $info; appSettings = $appSettings; connectionStrings = $conexiones; files = @($ficheros) }
+}
+
+function Get-SiteFileContent {
+    # /api/file: un fichero del site. La configuración, como texto con los secretos tapados; el resto, en base64.
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Relative, [long]$MaxBytes = 25MB)
+    $full = Resolve-SiteFile -Root $Root -Relative $Relative
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "No existe en el site: '$Relative'." }
+    $f = Get-Item -LiteralPath $full -Force
+    if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Es un enlace: no se sirve '$Relative'." }
+    $rel = $f.FullName.Substring($Root.Length + 1).Replace('\', '/')
+    if ($f.Name -match $script:PatronConfig) {
+        return [ordered]@{ path = $rel; size = $f.Length; masked = $true; text = (Get-ConfigTextoProtegido -Path $f.FullName) }
+    }
+    if ($f.Length -gt $MaxBytes) { throw "Pasa de $([math]::Round($MaxBytes / 1MB)) MB: '$Relative' ($($f.Length) bytes)." }
+    $bytes = Read-SiteFileBytes $f.FullName
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    [ordered]@{ path = $rel; size = $f.Length; sha256 = $hash; base64 = [Convert]::ToBase64String($bytes) }
+}
+
 function Invoke-DeployEndpointRequest {
     <#
     .SYNOPSIS
@@ -3566,7 +3748,10 @@ function Invoke-DeployEndpointRequest {
         runId; encola el refresco de la BD del entorno desde la réplica, con
         sanitización (Invoke-DbRefreshOrder) · GET /api/version (versión, commit y rama del código que sirve el endpoint) ·
         GET /api/result?runId=... (queued / running / ok / error) · GET /api/queue
-        (cola pendiente) · GET /api/log (cola del transcript de la publicación en curso).
+        (cola pendiente) · GET /api/log (cola del transcript de la publicación en curso) ·
+        GET /api/config?environment= (configuración del site con los secretos tapados) ·
+        GET /api/files?environment=[&path=][&hash=0][&all=1] (ficheros con tamaño y sha256) ·
+        GET /api/file?environment=&path= (un fichero; la configuración, con los secretos tapados).
     #>
     [CmdletBinding()]
     param(
@@ -3602,6 +3787,27 @@ function Invoke-DeployEndpointRequest {
 
     if ($Method -eq 'GET' -and $Path -eq '/api/version') {
         return [pscustomobject]@{ status = 200; body = (Get-PublishToIISVersionInfo) }
+    }
+
+    if ($Method -eq 'GET' -and $Path -in '/api/config', '/api/files', '/api/file') {
+        try {
+            $root = Resolve-SiteRoot -Environment ([string]$Query['environment'])
+            # No `$body`: es el parámetro [string]$Body de esta función y convertiría la respuesta en texto.
+            $respuesta = switch ($Path) {
+                '/api/config' { Get-SiteConfigInfo -Root $root -Environment ([string]$Query['environment']) }
+                '/api/files' {
+                    $sub = [string]$Query['path']
+                    $files = @(Get-SiteFileManifest -Root $root -Sub $sub -NoHash:([string]$Query['hash'] -eq '0') -Todo:([string]$Query['all'] -eq '1'))
+                    [ordered]@{ environment = [string]$Query['environment']; root = $root; path = $sub; count = $files.Count; files = $files }
+                }
+                '/api/file' { Get-SiteFileContent -Root $root -Relative ([string]$Query['path']) }
+            }
+            return [pscustomobject]@{ status = 200; body = $respuesta }
+        }
+        catch {
+            $status = if ($_.Exception.Message -match '^No existe') { 404 } else { 400 }
+            return [pscustomobject]@{ status = $status; body = @{ error = $_.Exception.Message } }
+        }
     }
 
     if ($Method -eq 'POST' -and $Path -eq '/api/update') {
@@ -4164,6 +4370,103 @@ function Get-RemoteDeployVersion {
     $ErrorActionPreference = 'Stop'
     $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
     Invoke-RestMethod -Method Get -Uri "$($ep.url)/api/version" -Headers $ep.headers -TimeoutSec $TimeoutSec
+}
+
+function Invoke-RemoteSiteQuery($Ep, [string]$Ruta, [hashtable]$Query, [int]$TimeoutSec) {
+    $qs = ($Query.GetEnumerator() | Where-Object { $null -ne $_.Value -and "$($_.Value)" -ne '' } |
+        ForEach-Object { "$($_.Key)=$([uri]::EscapeDataString([string]$_.Value))" }) -join '&'
+    Invoke-RestMethod -Method Get -Uri ($Ep.url + $Ruta + '?' + $qs) -Headers $Ep.headers -TimeoutSec $TimeoutSec
+}
+
+function Get-RemoteSiteConfig {
+    <#
+    .SYNOPSIS
+        Configuración del site de un entorno remoto, con los secretos tapados (GET /api/config).
+    .DESCRIPTION
+        appSettings y cadenas de conexión ya leídos, el texto de cada *.config / appsettings*.json de la raíz
+        y el deploy-info.json. Contraseñas, claves y tokens llegan como ***.
+    .EXAMPLE
+        (Get-RemoteSiteConfig -Server deployments-76 -Environment devecoesp-audit).appSettings.UrlApiEconomitza
+    #>
+    [CmdletBinding()]
+    param([string]$Server, [string]$Url, [string]$Token, [Parameter(Mandatory)][string]$Environment, [int]$TimeoutSec = 30)
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    Invoke-RemoteSiteQuery $ep '/api/config' @{ environment = $Environment } $TimeoutSec
+}
+
+function Get-RemoteSiteFiles {
+    <#
+    .SYNOPSIS
+        Ficheros del site de un entorno remoto con tamaño, fecha y sha256 calculado en el servidor (GET /api/files).
+    .DESCRIPTION
+        Sin -All deja fuera lo que solo cambia en el site vivo (Logs, Upload, App_Data, tmp, *.log) y los
+        sellos. -Path acota a una subcarpeta (bin, Views…); -NoHash no calcula los sha256.
+    .EXAMPLE
+        Get-RemoteSiteFiles -Server deployments-76 -Environment devecoesp-audit -Path bin | Where-Object path -like '*CentralCompres*'
+    #>
+    [CmdletBinding()]
+    param([string]$Server, [string]$Url, [string]$Token, [Parameter(Mandatory)][string]$Environment,
+        [string]$Path, [switch]$NoHash, [switch]$All, [int]$TimeoutSec = 300)
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    $q = @{ environment = $Environment; path = $Path }
+    if ($NoHash) { $q.hash = '0' }
+    if ($All) { $q.all = '1' }
+    (Invoke-RemoteSiteQuery $ep '/api/files' $q $TimeoutSec).files
+}
+
+function Get-RemoteSiteFile {
+    <#
+    .SYNOPSIS
+        Un fichero del site de un entorno remoto (GET /api/file).
+    .DESCRIPTION
+        La configuración (*.config, appsettings*.json) llega como texto con los secretos tapados; el resto,
+        en binario: con -OutFile se guarda, sin él se devuelven los bytes. Tope de 25 MB por fichero.
+    .EXAMPLE
+        Get-RemoteSiteFile -Server deployments-76 -Environment devecoesp-audit -Path bin/CentralCompres.dll -OutFile $env:TEMP\cc.dll
+    #>
+    [CmdletBinding()]
+    param([string]$Server, [string]$Url, [string]$Token, [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Path, [string]$OutFile, [int]$TimeoutSec = 300)
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    $r = Invoke-RemoteSiteQuery $ep '/api/file' @{ environment = $Environment; path = $Path } $TimeoutSec
+    if ($r.masked) {
+        if ($OutFile) { [IO.File]::WriteAllText($OutFile, $r.text, (New-Object System.Text.UTF8Encoding($false))); return Get-Item $OutFile }
+        return $r.text
+    }
+    $bytes = [Convert]::FromBase64String($r.base64)
+    if ($OutFile) { [IO.File]::WriteAllBytes($OutFile, $bytes); return Get-Item $OutFile }
+    , $bytes
+}
+
+function Test-RemoteSiteManifest {
+    <#
+    .SYNOPSIS
+        ¿Sigue el site siendo el build que se publicó? Compara su deploy-manifest.json con los ficheros de ahora.
+    .DESCRIPTION
+        Devuelve una fila por diferencia (cambiado, falta, nuevo) con su ruta; ninguna fila = idéntico. Deja
+        fuera lo que solo cambia en el site vivo, igual que el manifiesto. Un site publicado antes de la
+        0.14.0 no tiene manifiesto.
+    .EXAMPLE
+        Test-RemoteSiteManifest -Server deployments-76 -Environment devecoesp-audit | Format-Table
+    #>
+    [CmdletBinding()]
+    param([string]$Server, [string]$Url, [string]$Token, [Parameter(Mandatory)][string]$Environment, [int]$TimeoutSec = 300)
+    $ErrorActionPreference = 'Stop'
+    $comun = @{ Server = $Server; Url = $Url; Token = $Token; Environment = $Environment; TimeoutSec = $TimeoutSec }
+    try { $bytes = Get-RemoteSiteFile @comun -Path 'deploy-manifest.json' }
+    catch { throw "El site de '$Environment' no tiene deploy-manifest.json (publicado con un publicador anterior a la 0.14.0): $($_.Exception.Message)" }
+    $manifiesto = [Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    $esperado = @{}; foreach ($f in $manifiesto.files) { $esperado[$f.path] = $f }
+    $actual = @{}; foreach ($f in @(Get-RemoteSiteFiles @comun)) { $actual[$f.path] = $f }
+    $filas = foreach ($p in $esperado.Keys) {
+        if (-not $actual.ContainsKey($p)) { [pscustomobject]@{ estado = 'falta'; path = $p; esperado = $esperado[$p].sha256; actual = $null } }
+        elseif ($actual[$p].sha256 -ne $esperado[$p].sha256) { [pscustomobject]@{ estado = 'cambiado'; path = $p; esperado = $esperado[$p].sha256; actual = $actual[$p].sha256 } }
+    }
+    $nuevos = foreach ($p in $actual.Keys) { if (-not $esperado.ContainsKey($p)) { [pscustomobject]@{ estado = 'nuevo'; path = $p; esperado = $null; actual = $actual[$p].sha256 } } }
+    @($filas) + @($nuevos) | Where-Object { $_ } | Sort-Object estado, path
 }
 
 function Request-RemoteUpdate {
@@ -5384,4 +5687,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath -Alias Publish-Update

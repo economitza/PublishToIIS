@@ -354,6 +354,18 @@ Integración en solución .NET Framework:
   conservado pasa a ser el host de `siteUrl`/`hostName` del entorno (`Set-WebConfigSiteHost`). Con él
   arma el e-market los enlaces de sus correos («Ver pedido», «Gestionar entregas»); los sites de prueba
   sembrados desde la plantilla se quedaban en `localhost:56006`. Solo cambia una clave que ya exista.
+- **Diagnóstico de un site remoto sin RDP (0.14.0)**: `Get-RemoteSiteConfig -Server deployments-76 -Environment <env>`
+  (`GET /api/config`: `appSettings`, cadenas de conexión y el texto de cada `*.config`/`appsettings*.json` de la
+  raíz, con contraseñas, claves y tokens como `***`, más el `deploy-info.json`); `Get-RemoteSiteFiles [-Path bin]
+  [-NoHash] [-All]` (`GET /api/files`: cada fichero con tamaño, fecha y sha256 calculado en el servidor);
+  `Get-RemoteSiteFile -Path <ruta> [-OutFile]` (`GET /api/file`: un fichero de hasta 25 MB; la configuración llega
+  como texto tapado, nunca tal cual), y `Test-RemoteSiteManifest`, que compara el `deploy-manifest.json` sellado al
+  publicar con el site de ahora y lista lo `cambiado`, lo que `falta` y lo `nuevo` (hotfix, edición a mano, una DLL
+  de menos). Leer no da nada que el token no diera ya (puede sobrescribir el site); los secretos se tapan para que no
+  viajen al equipo que pregunta ni acaben en logs o en el contexto de un agente. Solo entornos de la lista blanca,
+  solo dentro de su `destination`, sin `..` ni enlaces. Fuera del manifiesto y de la comparación queda lo que solo
+  cambia en el site vivo: `Logs`, `Upload`, `App_Data`, `tmp`, `*.log` y los dos sellos. Un site publicado antes de
+  la 0.14.0 no tiene manifiesto hasta que se republica.
 - **`apiUrl`: la API que llama un e-market se declara en su entorno**: con `"apiUrl": "https://…"` en la
   entrada de `environments.json`, cada publicación fija `appSettings/UrlApiEconomitza` del web.config
   conservado (`Set-WebConfigApiUrl`). Sin el campo, el site sigue con la API que ya tuviera, que en un
