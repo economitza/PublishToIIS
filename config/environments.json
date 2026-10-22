@@ -56,8 +56,22 @@
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
       "destination": "E:\\wwwrootDevecoExperimentalAnd",
       "siteUrl": "https://deveco-experimental-and.economitza.com",
+      "apiUrl": "https://deveco-experimental-and-api.economitza.com",
       "templateSite": "devecoand1",
       "sourceDatabase": "CCAndorra",
+      "responsable": "Joaquim"
+    },
+    "deveco-experimental-and-api": {
+      "server": "deployments-76",
+      "kind": "aspnetcore",
+      "origin": "E:\\git\\central-compres-api\\CentralCompres.Api",
+      "destination": "E:\\wwwrootDevecoExperimentalAndApi",
+      "siteUrl": "https://deveco-experimental-and-api.economitza.com",
+      "templateSite": "devecoandapi1.economitza.com",
+      "seedAppSettings": {
+        "Queues": { "Environment": "deveco-experimental-and-api" },
+        "BackgroundServices": { "PriceImportEnabled": false }
+      },
       "responsable": "Joaquim"
     },
     "devecoesp-audit": {
