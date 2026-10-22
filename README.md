@@ -350,6 +350,11 @@ Integración en solución .NET Framework:
   publish falla al empezar con «no tiene ningún SDK» (el Hosting Bundle solo trae el runtime);
   si falla el restore de EconomitzaDB, falta `E:\git\NuGet.Config` o su token ha caducado
   (`tools\Install-AspNetCorePrereqs.ps1`). Un aspnetcore no se hotfixea: se republica.
+  **El renombrado de la API (SI-2663, MR !126)** movió el proyecto a `CentralCompres.Api\`: el `origin` de
+  cada API apunta a la carpeta de su rama, así que una API que pasa a ramas de después del renombrado cambia
+  su `origin` (devecoandapi1 desde el 22/10/2026) y una rama de antes publicada ahí falla con «No .csproj
+  found». El nombre nuevo de la DLL llega solo: `processPath` y `arguments` del `<aspNetCore>` salen del
+  build (`Get-AspNetCoreWebConfigMerge`).
 - **`nuget restore` y checkout del servidor**: Desde la v0.5.3 del publicador (14/09/2026, `Restore-NuGetPackages`), `Publish` hace `nuget restore` del proyecto antes de MSBuild (nuget.exe del PATH, de `%ProgramData%\PublishToIIS` o descargado de dist.nuget.org), así que el 76 ya compila ramas que estrenan paquetes (MailKit de SI-2498). Y desde la v0.5.4 (mismo día) el checkout del servidor se REPONE a `origin/<rama>` con `git checkout -B`: antes un `pull --ff-only` fallaba con código 128 tras un rebase + push forzado de la rama (pasó con `main_SI-2504` el 14/09) y la publicación no arrancaba.
 - **Subaplicaciones (0.15.0)**: un site mvc publica también las aplicaciones IIS que su repo declara en
   `tools/deploy/iis-subapps.json` (la `/cocina` .NET 10 del e-market), en la misma orden: `dotnet publish`

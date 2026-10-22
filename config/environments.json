@@ -101,7 +101,7 @@
     "devecoandapi1": {
       "server": "deployments-76",
       "kind": "aspnetcore",
-      "origin": "E:\\git\\central-compres-api\\central-de-compres-integracio",
+      "origin": "E:\\git\\central-compres-api\\CentralCompres.Api",
       "destination": "E:\\wwwrootDevecoAndApi1",
       "siteUrl": "https://devecoandapi1.economitza.com",
       "templateSite": "devecoandapi1.economitza.com",
