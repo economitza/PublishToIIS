@@ -444,6 +444,195 @@ function Set-WebConfigApiUrl {
     $true
 }
 
+# ---------------------------------------------------------------------------------------------------------
+# Parches del web.config por entorno (XDT) y secretos del servidor
+# El web.config de un site se conserva de publicación en publicación; lo que un entorno necesita en él y el
+# publicador no conoce (claves nuevas de una funcionalidad, por ejemplo) va en un parche XDT versionado en el
+# repo que se publica: tools/deploy/webconfig/<entorno>.xdt. Los valores secretos no van en el parche: se
+# escriben como {secreto:Nombre} y salen del almacén del servidor (ProgramData\PublishToIIS\secretos\<entorno>.json,
+# cifrado con DPAPI de máquina), donde se guardan con Set-PublishSecret o, desde fuera, Set-RemotePublishSecret.
+# ---------------------------------------------------------------------------------------------------------
+
+function Get-XdtAssemblyPath {
+    <#
+    .SYNOPSIS
+        Ruta de Microsoft.Web.XmlTransform.dll, el motor de las transformaciones XDT de Visual Studio.
+    .DESCRIPTION
+        Viene con las herramientas de compilación web del MSBuild de Visual Studio, las mismas con las que se
+        publican los sites (<VS>\MSBuild\Microsoft\VisualStudio\v<NN>\Web\): se busca junto al MSBuild de Publish y,
+        si no, en cualquier instalación de Visual Studio.
+    #>
+    $raices = New-Object System.Collections.Generic.List[string]
+    try { $raices.Add((Split-Path (Split-Path (Split-Path (Get-MSBuild) -Parent) -Parent) -Parent)) } catch { }
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }) {
+        foreach ($version in @(Get-ChildItem (Join-Path $pf 'Microsoft Visual Studio') -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($edicion in @(Get-ChildItem $version.FullName -Directory -ErrorAction SilentlyContinue)) {
+                $raices.Add((Join-Path $edicion.FullName 'MSBuild'))
+            }
+        }
+    }
+    foreach ($raiz in $raices) {
+        $dll = Get-ChildItem (Join-Path $raiz 'Microsoft\VisualStudio') -Filter 'Microsoft.Web.XmlTransform.dll' -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if ($dll) { return $dll.FullName }
+    }
+    throw 'No encuentro Microsoft.Web.XmlTransform.dll: hacen falta las herramientas de compilación web de Visual Studio.'
+}
+
+function Get-PublishSecretsFile {
+    param([Parameter(Mandatory)][string]$Environment, [string]$DataDir)
+    if ($Environment -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$') { throw "Nombre de entorno no válido: '$Environment'" }
+    Join-Path (Join-Path (Get-PublishDataDir -DataDir $DataDir) 'secretos') "$Environment.json"
+}
+
+function Read-PublishSecretsRaw {
+    # nombre -> valor cifrado (base64 de DPAPI), tal como está en el fichero
+    param([Parameter(Mandatory)][string]$File)
+    $secretos = @{}
+    if (Test-Path $File) {
+        $json = (Get-Content $File -Raw -Encoding UTF8) | ConvertFrom-Json
+        foreach ($p in $json.PSObject.Properties) { $secretos[$p.Name] = [string]$p.Value }
+    }
+    $secretos
+}
+
+function Initialize-DpapiType {
+    if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) { Add-Type -AssemblyName System.Security }
+}
+
+function Set-PublishSecret {
+    <#
+    .SYNOPSIS
+        Guarda un secreto de un entorno en el almacén del servidor, cifrado con DPAPI de máquina.
+    .DESCRIPTION
+        Para los valores que el parche del web.config de un entorno pide como {secreto:Nombre}: no van en git ni en
+        environments.json, y solo se descifran en este servidor. Solo entornos de la lista blanca (nunca prod ni
+        staging). El valor no se devuelve ni se escribe en ningún log.
+    .EXAMPLE
+        $secreto | Set-PublishSecret -Environment devecoand1 -Name RowsTraspasoSecreto
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9_.-]{0,99}$')][string]$Name,
+        [Parameter(Mandatory, ValueFromPipeline)][AllowEmptyString()][string]$Value,
+        [string[]]$AllowedEnvironments,
+        [string]$DataDir
+    )
+    process {
+        if ($Environment -notin @(Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments)) {
+            throw "Entorno no permitido para secretos: '$Environment'"
+        }
+        $Value = $Value.Trim()
+        if (-not $Value) { throw "El secreto '$Name' de '$Environment' llega vacío" }
+        Initialize-DpapiType
+        $fichero = Get-PublishSecretsFile -Environment $Environment -DataDir $DataDir
+        $carpeta = Split-Path $fichero -Parent
+        if (-not (Test-Path $carpeta)) {
+            New-Item -ItemType Directory -Path $carpeta -Force | Out-Null
+            # En el almacén del servidor (bajo ProgramData), la carpeta solo para SYSTEM, Administradores y la cuenta
+            # que la crea (la del endpoint), sin heredar la lectura de Usuarios de ProgramData.
+            if ($env:ProgramData -and $carpeta.StartsWith($env:ProgramData, [StringComparison]::OrdinalIgnoreCase)) {
+                $yo = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+                & icacls $carpeta /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${yo}:(OI)(CI)F" | Out-Null
+            }
+        }
+        $secretos = Read-PublishSecretsRaw -File $fichero
+        $cifrado = [System.Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes($Value), $null,
+            [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+        $secretos[$Name] = [Convert]::ToBase64String($cifrado)
+        ConvertTo-Json $secretos | Set-Content -Path $fichero -Encoding UTF8
+        [pscustomobject]@{ environment = $Environment; name = $Name; stored = $true }
+    }
+}
+
+function Get-PublishSecretNames {
+    # Los nombres de los secretos guardados de un entorno (nunca los valores).
+    param([Parameter(Mandatory)][string]$Environment, [string]$DataDir)
+    @((Read-PublishSecretsRaw -File (Get-PublishSecretsFile -Environment $Environment -DataDir $DataDir)).Keys | Sort-Object)
+}
+
+function Resolve-PublishSecrets {
+    <#
+    .SYNOPSIS
+        Sustituye cada {secreto:Nombre} del texto por el secreto guardado del entorno, escapado para XML.
+    .DESCRIPTION
+        Si falta alguno, para con el nombre y el comando para darlo de alta: un web.config con el marcador literal
+        dejaría la funcionalidad rota sin avisar.
+    #>
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Environment, [string]$DataDir)
+    $patron = '\{secreto:([A-Za-z][A-Za-z0-9_.-]{0,99})\}'
+    if ($Text -notmatch $patron) { return $Text }
+    Initialize-DpapiType
+    $cifrados = Read-PublishSecretsRaw -File (Get-PublishSecretsFile -Environment $Environment -DataDir $DataDir)
+    $faltan = New-Object System.Collections.Generic.List[string]
+    $resuelto = [regex]::Replace($Text, $patron, {
+        param($m)
+        $nombre = $m.Groups[1].Value
+        if (-not $cifrados.ContainsKey($nombre)) { $faltan.Add($nombre); return $m.Value }
+        $claro = [Text.Encoding]::UTF8.GetString([System.Security.Cryptography.ProtectedData]::Unprotect(
+            [Convert]::FromBase64String($cifrados[$nombre]), $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine))
+        [System.Security.SecurityElement]::Escape($claro)
+    })
+    if ($faltan.Count) {
+        throw ("Faltan secretos de '$Environment' para su parche del web.config: $(($faltan | Sort-Object -Unique) -join ', '). " +
+            "Se dan de alta con Set-RemotePublishSecret -Server <servidor> -Environment $Environment -Name <nombre> (el valor por la tubería).")
+    }
+    $resuelto
+}
+
+function Get-WebConfigPatch {
+    <#
+    .SYNOPSIS
+        Los parches XDT que tocan al web.config de un entorno, en el orden en que se aplican.
+    .DESCRIPTION
+        Primero el del propio entorno (config\webconfig\<entorno>.xdt de este repo): lo que el entorno lleva sea cual sea
+        la rama que se publique, como el emisor del traspaso a rows. Después el de la rama (tools\deploy\webconfig\
+        <entorno>.xdt del repo publicado), para lo que necesite una funcionalidad concreta.
+    #>
+    param([string]$RepoRoot, [string]$Environment, [string]$ConfigDir = (Join-Path $PSScriptRoot '..\config\webconfig'))
+    if (-not $Environment) { return @() }
+    $candidatos = @((Join-Path $ConfigDir "$Environment.xdt"))
+    if ($RepoRoot) { $candidatos += Join-Path $RepoRoot "tools\deploy\webconfig\$Environment.xdt" }
+    @($candidatos | Where-Object { Test-Path $_ } | ForEach-Object { (Resolve-Path $_).Path })
+}
+
+function Invoke-WebConfigPatch {
+    <#
+    .SYNOPSIS
+        Aplica al web.config final del site el parche XDT del entorno, con sus secretos, y devuelve lo que cambia.
+    .DESCRIPTION
+        Las líneas que entran (+) y salen (-), con el valor tapado en las claves que parecen secretas, para el log
+        de la publicación. Si el parche no se puede aplicar, para: la publicación no llega al swap.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WebConfigPath,
+        [Parameter(Mandatory)][string]$PatchPath,
+        [Parameter(Mandatory)][string]$Environment,
+        [string]$DataDir
+    )
+    Add-Type -Path (Get-XdtAssemblyPath)
+    $xdt = Resolve-PublishSecrets -Text ([IO.File]::ReadAllText($PatchPath)) -Environment $Environment -DataDir $DataDir
+    $antes = [IO.File]::ReadAllLines($WebConfigPath)
+    $doc = New-Object Microsoft.Web.XmlTransform.XmlTransformableDocument
+    $doc.PreserveWhitespace = $true
+    $doc.Load($WebConfigPath)
+    $transformacion = New-Object Microsoft.Web.XmlTransform.XmlTransformation($xdt, $false, $null)
+    try {
+        if (-not $transformacion.Apply($doc)) { throw "El parche $(Split-Path $PatchPath -Leaf) no se ha podido aplicar al web.config" }
+        $doc.Save($WebConfigPath)
+    }
+    finally {
+        $transformacion.Dispose()
+        if ($doc -is [IDisposable]) { $doc.Dispose() }
+    }
+    $despues = [IO.File]::ReadAllLines($WebConfigPath)
+    @(Compare-Object $antes $despues | ForEach-Object {
+        $linea = $_.InputObject.Trim() -replace '(?i)(key="[^"]*(secret|pass|pwd|token|clave)[^"]*"\s+value=")[^"]*"', '$1***"'
+        '{0} {1}' -f $(if ($_.SideIndicator -eq '=>') { '+' } else { '-' }), $linea
+    })
+}
+
 function Merge-JsonSettings {
     <#
     .SYNOPSIS
@@ -1626,12 +1815,22 @@ function Publish {
                 Write-Host "UrlApiEconomitza del web.config: $ApiUrl" -ForegroundColor Green
             }
 
-            # Subaplicaciones: con el web.config final del site, para que sus variables sigan a lo
-            # que sirve (la misma API), y antes del sello y del manifiesto, que las incluyen.
-            # En PowerShell 5.1, con Stop, lo que git escriba en stderr lanza: fuera de un repo, sin subaplicaciones.
+            # En PowerShell 5.1, con Stop, lo que git escriba en stderr lanza: fuera de un repo, sin parche ni subaplicaciones.
             $repoRoot = $null
             try { $repoRoot = (& git -C (Split-Path $projectToBuild -Parent) rev-parse --show-toplevel 2>$null) } catch { $repoRoot = $null }
-            if ($repoRoot) { $subApps = @(Get-SubApplications -RepoRoot (([string]$repoRoot).Trim() -replace '/', '\')) }
+            if ($repoRoot) { $repoRoot = ([string]$repoRoot).Trim() -replace '/', '\' }
+
+            # Parches XDT del entorno (config\webconfig\ de este repo y tools\deploy\webconfig\ del publicado), con los
+            # secretos del almacén del servidor: lo que su web.config tiene que llevar y el publicador no conoce.
+            foreach ($parche in @(Get-WebConfigPatch -RepoRoot $repoRoot -Environment $Environment)) {
+                $cambios = @(Invoke-WebConfigPatch -WebConfigPath $releasingWebConfig -PatchPath $parche -Environment $Environment)
+                Write-Host "web.config: parche $parche, $($cambios.Count) líneas cambiadas" -ForegroundColor Green
+                foreach ($c in $cambios) { Write-Host "    $c" }
+            }
+
+            # Subaplicaciones: con el web.config final del site, para que sus variables sigan a lo
+            # que sirve (la misma API), y antes del sello y del manifiesto, que las incluyen.
+            if ($repoRoot) { $subApps = @(Get-SubApplications -RepoRoot $repoRoot) }
             if ($subApps.Count) {
                 Assert-AspNetCoreModule
                 $dotnet = Get-DotNet
@@ -4136,6 +4335,30 @@ function Invoke-DeployEndpointRequest {
         }
     }
 
+    # Secretos de los parches del web.config: el valor va en el cuerpo (el log de auditoría guarda la URL) y no
+    # vuelve nunca; GET /api/secrets solo dice los nombres que tiene un entorno.
+    if ($Method -eq 'POST' -and $Path -eq '/api/secret') {
+        try { $req = $Body | ConvertFrom-Json }
+        catch { return [pscustomobject]@{ status = 400; body = @{ error = 'Cuerpo JSON inválido.' } } }
+        if (-not $req -or -not $req.environment -or -not $req.name -or -not $req.value) {
+            return [pscustomobject]@{ status = 400; body = @{ error = "Faltan 'environment', 'name' y/o 'value'." } }
+        }
+        try {
+            $guardado = Set-PublishSecret -Environment ([string]$req.environment) -Name ([string]$req.name) -Value ([string]$req.value) -DataDir $dir
+        }
+        catch { return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } } }
+        return [pscustomobject]@{ status = 200; body = @{ environment = $guardado.environment; name = $guardado.name; stored = $true } }
+    }
+
+    if ($Method -eq 'GET' -and $Path -eq '/api/secrets') {
+        try {
+            $entorno = [string]$Query['environment']
+            if ($entorno -notin @(Get-AllowedEnvironments)) { throw "Entorno no permitido para secretos: '$entorno'" }
+            return [pscustomobject]@{ status = 200; body = @{ environment = $entorno; names = @(Get-PublishSecretNames -Environment $entorno -DataDir $dir) } }
+        }
+        catch { return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } } }
+    }
+
     if ($Method -eq 'POST' -and $Path -eq '/api/update') {
         $req = $null
         if ($Body) {
@@ -4719,6 +4942,48 @@ function Get-RemoteSiteConfig {
     $ErrorActionPreference = 'Stop'
     $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
     Invoke-RemoteSiteQuery $ep '/api/config' @{ environment = $Environment } $TimeoutSec
+}
+
+function Set-RemotePublishSecret {
+    <#
+    .SYNOPSIS
+        Guarda un secreto de un entorno en el almacén del servidor remoto (POST /api/secret), para su parche del web.config.
+    .DESCRIPTION
+        El valor llega por la tubería (o -Value), viaja en el cuerpo de la petición por HTTPS y ni se imprime ni vuelve:
+        se puede encadenar desde donde vive el secreto sin que pase por la consola. Lo usa la siguiente publicación
+        del entorno, al resolver los {secreto:Nombre} de tools/deploy/webconfig/<entorno>.xdt.
+    .EXAMPLE
+        ssh rows 'grep -oE "test=[^;]+" ~/mensajeria-datos/traspaso.env | cut -d= -f2' |
+            Set-RemotePublishSecret -Server deployments-76 -Environment devecoand1 -Name RowsTraspasoSecreto
+    #>
+    [CmdletBinding()]
+    param([string]$Server, [string]$Url, [string]$Token, [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory, ValueFromPipeline)][AllowEmptyString()][string]$Value,
+        [int]$TimeoutSec = 30)
+    begin { $partes = New-Object System.Collections.Generic.List[string] }
+    process { $partes.Add($Value) }
+    end {
+        $ErrorActionPreference = 'Stop'
+        $valor = (($partes | Where-Object { $_.Trim() }) -join "`n").Trim()
+        if (-not $valor) { throw "El secreto '$Name' llega vacío: no se envía nada." }
+        if ($valor.Contains("`n")) { throw "El secreto '$Name' trae varias líneas: se espera un solo valor." }
+        $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+        $cuerpo = @{ environment = $Environment; name = $Name; value = $valor } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Method Post -Uri ($ep.url + '/api/secret') -Headers $ep.headers `
+            -Body ([Text.Encoding]::UTF8.GetBytes($cuerpo)) -ContentType 'application/json; charset=utf-8' -TimeoutSec $TimeoutSec
+    }
+}
+
+function Get-RemotePublishSecretNames {
+    <#
+    .SYNOPSIS
+        Los nombres de los secretos que el servidor remoto tiene guardados para un entorno (GET /api/secrets). Nunca los valores.
+    #>
+    [CmdletBinding()]
+    param([string]$Server, [string]$Url, [string]$Token, [Parameter(Mandatory)][string]$Environment, [int]$TimeoutSec = 30)
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    (Invoke-RemoteSiteQuery $ep '/api/secrets' @{ environment = $Environment } $TimeoutSec).names
 }
 
 function Get-RemoteSiteFiles {
@@ -6013,4 +6278,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath, Get-XdtAssemblyPath, Get-WebConfigPatch, Invoke-WebConfigPatch, Set-PublishSecret, Get-PublishSecretNames, Set-RemotePublishSecret, Get-RemotePublishSecretNames -Alias Publish-Update

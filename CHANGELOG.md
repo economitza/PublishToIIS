@@ -6,6 +6,22 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.16.0] - 2026-10-23
+
+### Added
+- **Parches XDT del web.config por entorno**: al publicar, el web.config conservado del site recibe
+  `config\webconfig\<entorno>.xdt` de este repo (lo que el entorno lleva sea cual sea la rama) y, después,
+  `tools\deploy\webconfig\<entorno>.xdt` del repo publicado (lo que pida una rama). El log de la publicación
+  enseña las líneas que cambian, con los valores secretos tapados; un parche que no se aplica para la
+  publicación antes del swap. Motor: `Microsoft.Web.XmlTransform.dll` de las herramientas web de Visual Studio.
+- **Secretos del servidor para esos parches**: `{secreto:Nombre}` en un parche sale del almacén del servidor
+  (`ProgramData\PublishToIIS\secretos\<entorno>.json`, DPAPI de máquina, solo SYSTEM, Administradores y la
+  cuenta que lo crea), nunca de git. Se guardan con `Set-PublishSecret` en el servidor o con
+  `Set-RemotePublishSecret` (`POST /api/secret`, el valor por la tubería y en el cuerpo, sin volver nunca);
+  `Get-RemotePublishSecretNames` (`GET /api/secrets`) dice qué nombres hay. Un secreto que falta para la
+  publicación con su nombre. Solo entornos de la lista blanca. Primer uso: el traspaso de sesión a rows de
+  SI-2763 en devecoand1 y devecoesp1.
+
 ## [0.15.0] - 2026-10-21
 
 ### Added

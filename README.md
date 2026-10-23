@@ -387,4 +387,13 @@ Integración en solución .NET Framework:
   conservado (`Set-WebConfigApiUrl`). Sin el campo, el site sigue con la API que ya tuviera, que en un
   site sembrado es la de su plantilla el día que se sembró: devecoesp-audit llamaba así a una API
   anterior a la 2.1.0 mientras se auditaba una release. Solo cambia una clave que ya exista.
+- **Parches del web.config por entorno (0.16.0)**: lo que un entorno necesita en su web.config y el publicador no
+  conoce va en un parche XDT: `config\webconfig\<entorno>.xdt` de este repo (se aplica sea cual sea la rama; para
+  añadir una clave, el par `Remove` + `Insert` con `Match(key)`, que deja una sola aunque se repita) y, si la rama lo
+  trae, `tools\deploy\webconfig\<entorno>.xdt` del repo publicado. Los valores secretos van como `{secreto:Nombre}` y
+  salen del almacén del servidor: `ssh … 'cat secreto' | Set-RemotePublishSecret -Server deployments-76 -Environment
+  <entorno> -Name <Nombre>` (el valor no pasa por la consola ni vuelve en la respuesta) y
+  `Get-RemotePublishSecretNames` para ver los nombres. **Antes de subir un parche que pide un secreto, el secreto**:
+  si falta, todas las publicaciones de ese entorno se paran con «Faltan secretos». El log de la publicación enseña las
+  líneas que cambian, con los valores de claves secretas tapados.
 - **Publicar por rama desde un worktree de trabajo lo deja en la punta de origin**: el `checkout -B` también corre cuando el origen es un worktree local (entorno ad hoc o `environmentDef` de la orden), y los commits sin pushear salían del árbol a mitad de trabajo. Desde la v0.13.2 se guardan antes en `refs/publish-backup/<rama>/<fecha>` y el transcript lo avisa con el comando para recuperarlos; aun así, **se pushea antes de publicar**.
