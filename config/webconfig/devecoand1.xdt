@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Parche del web.config de devecoand1: se aplica en cada publicación, sea cual sea la rama.
+     {secreto:Nombre} sale del almacén del servidor (Set-RemotePublishSecret), nunca de git. -->
+<configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+  <appSettings>
+    <!-- SI-2763: el menú «Impactos de tarifa» abre la calculadora de rows ya identificado, con el emisor de pruebas -->
+    <add key="RowsTraspasoEmisor" xdt:Transform="Remove" xdt:Locator="Match(key)" />
+    <add key="RowsTraspasoEmisor" value="test" xdt:Transform="Insert" />
+    <add key="RowsTraspasoSecreto" xdt:Transform="Remove" xdt:Locator="Match(key)" />
+    <add key="RowsTraspasoSecreto" value="{secreto:RowsTraspasoSecreto}" xdt:Transform="Insert" />
+  </appSettings>
+</configuration>
