@@ -11,6 +11,7 @@ Describe 'Parches del web.config por entorno y secretos del servidor' {
         $script:parche = Join-Path $script:repo 'tools\deploy\webconfig\devecoand1.xdt'
         Set-Content -Path $script:parche -Encoding UTF8 -Value @'
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Un comentario que explica la sintaxis, {secreto:Nombre}, no pide ningún secreto. -->
 <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
   <appSettings>
     <add key="RowsTraspasoEmisor" xdt:Transform="Remove" xdt:Locator="Match(key)" />

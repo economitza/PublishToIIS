@@ -561,14 +561,16 @@ function Resolve-PublishSecrets {
         dejaría la funcionalidad rota sin avisar.
     #>
     param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Environment, [string]$DataDir)
-    $patron = '\{secreto:([A-Za-z][A-Za-z0-9_.-]{0,99})\}'
-    if ($Text -notmatch $patron) { return $Text }
+    # Los comentarios XML se dejan tal cual: el de cabecera de un parche explica la sintaxis con un {secreto:Nombre}.
+    $patron = '(<!--[\s\S]*?-->)|\{secreto:([A-Za-z][A-Za-z0-9_.-]{0,99})\}'
+    if ($Text -notmatch '\{secreto:') { return $Text }
     Initialize-DpapiType
     $cifrados = Read-PublishSecretsRaw -File (Get-PublishSecretsFile -Environment $Environment -DataDir $DataDir)
     $faltan = New-Object System.Collections.Generic.List[string]
     $resuelto = [regex]::Replace($Text, $patron, {
         param($m)
-        $nombre = $m.Groups[1].Value
+        if ($m.Groups[1].Success) { return $m.Value }
+        $nombre = $m.Groups[2].Value
         if (-not $cifrados.ContainsKey($nombre)) { $faltan.Add($nombre); return $m.Value }
         $claro = [Text.Encoding]::UTF8.GetString([System.Security.Cryptography.ProtectedData]::Unprotect(
             [Convert]::FromBase64String($cifrados[$nombre]), $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine))
