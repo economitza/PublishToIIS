@@ -396,4 +396,20 @@ Integración en solución .NET Framework:
   `Get-RemotePublishSecretNames` para ver los nombres. **Antes de subir un parche que pide un secreto, el secreto**:
   si falta, todas las publicaciones de ese entorno se paran con «Faltan secretos». El log de la publicación enseña las
   líneas que cambian, con los valores de claves secretas tapados.
+- **Una carpeta de site con un fichero abierto por otro proceso no se puede renombrar (0.16.3)**: Windows lo
+  impide aunque el fichero se haya abierto compartido, incluso para borrar, y el `Rename-Item` del swap falla con «Access to the path
+  '<site>' is denied». Desde el 26/10/2026 el agente de CloudWatch del 76 lee
+  `Logs\central-de-compres-integracio*.log` DENTRO de la carpeta de las API de test, así que en ellas el rename
+  falla siempre; a la web no le pasa (su log4net escribe fuera del site). `Invoke-SiteSwap` reintenta el rename
+  (5 × 2 s: cubre el w3wp que aún sale con el grupo ya `Stopped`) y, si no, hace el **cambiazo por espejo**: copia
+  de la versión actual en `<site>_previous` sin las carpetas de ejecución; `robocopy /MIR /IS /IT /IM` de `_releasing`
+  sin la configuración del site (`Get-SiteConfigFiles`) ni `Logs`/`Upload` (`Get-RuntimeFolders`), y la
+  configuración la última, desde `_releasing`, que es la del site con lo que viaja con el build (si se dejara la
+  del site, se quedarían el `processPath` y el `<runtime>` viejos). Queda lo mismo que con el rename y el rollback
+  funciona en los dos caminos; el transcript dice «Swap por rename» o «Cambiazo por ESPEJO» y por qué. Gotchas
+  de robocopy medidos: `/XD` y `/XF` con el nombre a secas excluyen a cualquier profundidad, y con solo la ruta del
+  origen `/MIR` purga la del destino (van con la ruta completa en los dos lados, `Get-RobocopyRootExclusions`);
+  y lo que robocopy da por igual no lo copia: con el mismo tamaño y la misma fecha de escritura hace falta `/IS`, y
+  si además la fecha de cambio difiere (lo que deja `dotnet publish`, que conserva la de escritura) es «modificado»
+  y hace falta `/IM`, que solo existe en los robocopy modernos (`Get-RobocopyIncludeAll` lo detecta).
 - **Publicar por rama desde un worktree de trabajo lo deja en la punta de origin**: el `checkout -B` también corre cuando el origen es un worktree local (entorno ad hoc o `environmentDef` de la orden), y los commits sin pushear salían del árbol a mitad de trabajo. Desde la v0.13.2 se guardan antes en `refs/publish-backup/<rama>/<fecha>` y el transcript lo avisa con el comando para recuperarlos; aun así, **se pushea antes de publicar**.
