@@ -1597,6 +1597,286 @@ function Invoke-RefCheckout {
     return $modo
 }
 
+# ─── Cambiazo de carpetas (swap) ────────────────────────────────────────────
+# El swap normal renombra: <site> -> <site>_previous y <site>_releasing -> <site>. Windows no deja
+# renombrar una carpeta mientras otro proceso tenga abierto un fichero de dentro, aunque lo comparta
+# para borrar: «Access to the path '<site>' is denied». Le pasa a las API de test, cuyo Logs\ lee el
+# agente de CloudWatch, y al w3wp que aún sale aunque su grupo ya diga Stopped. Para eso hay
+# reintentos y, si no bastan, el cambiazo por espejo (Invoke-SiteSwap).
+
+function Test-FileInUseError {
+    # Lo que da Windows al renombrar o escribir algo que otro proceso tiene abierto: IOException
+    # («Access to the path ... is denied», «being used by another process») o
+    # UnauthorizedAccessException. Una ruta que no existe no lo es.
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $e = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    while ($e) {
+        if ($e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) { return $false }
+        if ($e -is [System.IO.IOException] -or $e -is [System.UnauthorizedAccessException]) { return $true }
+        $e = $e.InnerException
+    }
+    $false
+}
+
+function Rename-ItemWithRetry {
+    <#
+    .SYNOPSIS
+        Rename-Item con reintentos mientras la ruta esté en uso. Devuelve Renamed, Attempts y Error.
+    .DESCRIPTION
+        Solo reintenta los errores de fichero en uso o acceso denegado (Test-FileInUseError); cualquier
+        otro se lanza al momento. Agotados los intentos no lanza: devuelve Renamed = $false con el último
+        error, y decide quien llama.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$NewName,
+        [int]$Attempts = 5,
+        [double]$DelaySeconds = 2
+    )
+    $Attempts = [Math]::Max(1, $Attempts)
+    $ultimo = $null
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            Rename-Item -LiteralPath $Path -NewName $NewName -ErrorAction Stop
+            return [pscustomobject]@{ Renamed = $true; Attempts = $i; Error = $null }
+        }
+        catch {
+            if (-not (Test-FileInUseError $_)) { throw }
+            $ultimo = $_.Exception.Message
+            Write-Host "No se puede renombrar '$Path' (intento $i de $Attempts): $ultimo" -ForegroundColor Yellow
+            if ($i -lt $Attempts -and $DelaySeconds -gt 0) { Start-Sleep -Milliseconds ([int]($DelaySeconds * 1000)) }
+        }
+    }
+    [pscustomobject]@{ Renamed = $false; Attempts = $Attempts; Error = $ultimo }
+}
+
+function Invoke-Robocopy {
+    <#
+    .SYNOPSIS
+        robocopy con su salida en el log. Códigos de salida: de 0 a 7 es éxito (copiado, extras, nada
+        que hacer); 8 o más es que algo no se ha podido copiar o borrar, y lanza.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$What,
+        [string[]]$Options = @()
+    )
+    $PSNativeCommandUseErrorActionPreference = $false
+    # Sin barra final: dentro de comillas, «E:\site\"» escapa la comilla.
+    $salida = & robocopy $Source.TrimEnd('\') $Destination.TrimEnd('\') @Options /NP /NJH /NFL /NDL
+    $code = $LASTEXITCODE
+    foreach ($linea in @($salida)) {
+        $t = "$linea".Trim()
+        if ($t) { Write-Host "    $t" -ForegroundColor DarkGray }
+    }
+    if ($code -ge 8) { throw "robocopy ($What) devolvió el código $code ($Source -> $Destination)." }
+    $code
+}
+
+function Get-RobocopyRootExclusions {
+    # /XF y /XD SOLO en la raíz: con el nombre a secas excluyen a cualquier profundidad («Web.config» se
+    # saltaría Views\Web.config). Van con la ruta completa en el origen Y en el destino: con solo la del
+    # origen, /MIR purga la del destino como «extra» (medido: se llevaba el Logs\ del site).
+    param([string[]]$Roots, [string[]]$Files = @(), [string[]]$Folders = @())
+    $o = @()
+    if (@($Files).Count) { $o += '/XF'; foreach ($r in $Roots) { foreach ($f in $Files) { $o += [IO.Path]::Combine($r.TrimEnd('\'), $f) } } }
+    if (@($Folders).Count) { $o += '/XD'; foreach ($r in $Roots) { foreach ($d in $Folders) { $o += [IO.Path]::Combine($r.TrimEnd('\'), $d) } } }
+    $o
+}
+
+function Get-RobocopyIncludeAll {
+    # Para un espejo exacto, que robocopy copie también lo que da por igual: /IS (mismo tamaño y misma
+    # fecha), /IT (además, mismos atributos) y /IM («modificado»: misma fecha de escritura y distinta
+    # fecha de cambio). Los «modificados» no se copian por defecto y son justo los que deja dotnet
+    # publish, que conserva la fecha de escritura: un fichero distinto con el mismo tamaño y la misma
+    # fecha se quedaría con la versión vieja. /IM solo existe en los robocopy que tienen esa clase
+    # (Windows 10 / Server 2016 en adelante): se pasa si su ayuda lo menciona.
+    if ($null -eq $script:RobocopyHasIM) {
+        $PSNativeCommandUseErrorActionPreference = $false
+        $script:RobocopyHasIM = ((& robocopy /?) -join "`n") -match '(?m)^\s*/IM\s+::'
+    }
+    if ($script:RobocopyHasIM) { @('/IS', '/IT', '/IM') } else { @('/IS', '/IT') }
+}
+
+function Get-SwapRuntimeFolders {
+    # Las carpetas de ejecución de primer nivel (Logs, Upload): las que el espejo no toca.
+    param([Parameter(Mandatory)][string]$Kind)
+    @(Get-RuntimeFolders -Kind $Kind | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique)
+}
+
+function Undo-SiteSwap {
+    <#
+    .SYNOPSIS
+        Deja el site como estaba antes de un swap que ha fallado. No lanza: devuelve $true si lo ha
+        dejado como estaba y, si no, dice en el log cómo hacerlo a mano.
+    .DESCRIPTION
+        rename: si el site no existe, <site>_previous vuelve a llamarse <site>.
+        espejo: robocopy /MIR de <site>_previous sobre el site, configuración incluida, sin tocar las
+        carpetas de ejecución (que no se copiaron a previous y el espejo tampoco tocó). Sin /IS /IT /IM,
+        a propósito: lo que el espejo no pudo escribir (una DLL retenida) sigue igual que en previous y
+        se salta, en vez de volver a fallar al intentar reescribirlo.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('rename', 'espejo')][string]$Mode,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$PreviousDir,
+        [Parameter(Mandatory)][string]$Kind,
+        [int]$RenameAttempts = 5,
+        [double]$RenameDelaySeconds = 2,
+        [int]$RobocopyRetries = 3,
+        [int]$RobocopyWaitSeconds = 2
+    )
+    Write-Host "Attempting rollback ($Mode)..." -ForegroundColor Yellow
+    $runtime = Get-SwapRuntimeFolders -Kind $Kind
+    try {
+        if ($Mode -eq 'rename') {
+            if (Test-Path -LiteralPath $Destination) { Write-Host "Rollback: '$Destination' sigue en su sitio; nada que deshacer." -ForegroundColor Gray; return $true }
+            if (-not (Test-Path -LiteralPath $PreviousDir)) { throw "no existe '$PreviousDir'" }
+            $r = Rename-ItemWithRetry -Path $PreviousDir -NewName (Split-Path $Destination -Leaf) -Attempts $RenameAttempts -DelaySeconds $RenameDelaySeconds
+            if (-not $r.Renamed) { throw $r.Error }
+        }
+        else {
+            [void](Invoke-Robocopy -Source $PreviousDir -Destination $Destination -What 'vuelta atrás del espejo' `
+                -Options (@('/MIR', "/R:$RobocopyRetries", "/W:$RobocopyWaitSeconds", '/MT:8') +
+                    (Get-RobocopyRootExclusions -Roots @($PreviousDir, $Destination) -Folders $runtime)))
+        }
+        Write-Host "Rollback completed: '$Destination' vuelve a tener la versión anterior" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        $manual = if ($Mode -eq 'rename') { "Rename-Item '$PreviousDir' '$(Split-Path $Destination -Leaf)'" }
+        else { "robocopy `"$PreviousDir`" `"$Destination`" /MIR " + ((Get-RobocopyRootExclusions -Roots @($PreviousDir, $Destination) -Folders $runtime | ForEach-Object { if ($_ -like '/*') { $_ } else { "`"$_`"" } }) -join ' ') }
+        Write-Host "ROLLBACK FALLIDO ($Mode): $($_.Exception.Message). A mano, con el grupo parado: $manual" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Invoke-SiteSwap {
+    <#
+    .SYNOPSIS
+        Activa <site>_releasing como el site: renombrando las carpetas o, si la del site no se deja,
+        por espejo. Va con el grupo de aplicaciones ya parado.
+    .DESCRIPTION
+        Lo normal es el cambiazo por nombre: <site> -> <site>_previous y <site>_releasing -> <site>.
+        Si la carpeta del site no se deja renombrar por un fichero en uso, se reintenta unas veces con
+        espera corta (el w3wp que todavía sale) y, si sigue sin dejarse (el agente de CloudWatch con
+        Logs\ abierto), se hace el cambiazo por espejo, como Deploy-CC-Share.ps1 del e-market:
+          1. copia de la versión actual en <site>_previous, sin las carpetas de ejecución. Si algo no se
+             puede leer, para aquí, con el site sin tocar: una copia incompleta no serviría para volver;
+          2. robocopy /MIR de _releasing sobre el site, sin la configuración del site (Get-SiteConfigFiles)
+             ni las carpetas de ejecución (Get-RuntimeFolders, Logs incluida);
+          3. lo que el build traiga dentro de las carpetas de ejecución, sin borrar lo que ya hubiera;
+          4. la configuración, la última, desde _releasing: es la del site con lo que viaja con el build
+             (el <runtime>, el processPath del <aspNetCore>, los parches XDT), la misma que dejaría el
+             rename. Un fichero de configuración que _releasing no trae se quita, como con el rename
+             (solo pasa con -OverrideWebconfig, que deja su copia como .previous);
+          5. se borra _releasing.
+        Queda lo mismo que con el rename: el site idéntico a lo publicado, con su configuración y sus
+        carpetas de ejecución (aquí, además, con su contenido). Si algo falla, el site vuelve a como
+        estaba (Undo-SiteSwap) y se lanza el error. El log dice qué camino se ha tomado y por qué.
+    .OUTPUTS
+        Mode ('rename' | 'espejo' | 'nuevo'), Attempts (intentos de renombrar el site) y Reason (por qué
+        no se ha podido renombrar, en el espejo).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ReleasingDir,
+        [Parameter(Mandatory)][string]$PreviousDir,
+        [Parameter(Mandatory)][string]$Kind,
+        [int]$RenameAttempts = 5,
+        [double]$RenameDelaySeconds = 2,
+        [int]$RobocopyRetries = 3,
+        [int]$RobocopyWaitSeconds = 2
+    )
+    $siteName = Split-Path $Destination -Leaf
+    $retry = @{ RenameAttempts = $RenameAttempts; RenameDelaySeconds = $RenameDelaySeconds; RobocopyRetries = $RobocopyRetries; RobocopyWaitSeconds = $RobocopyWaitSeconds }
+
+    # Primer publish: no hay site que apartar.
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        $r = Rename-ItemWithRetry -Path $ReleasingDir -NewName $siteName -Attempts $RenameAttempts -DelaySeconds $RenameDelaySeconds
+        if (-not $r.Renamed) { throw "No se puede activar '$ReleasingDir' como '$Destination': $($r.Error)" }
+        Write-Host "Swap: '$Destination' no existía; activada la carpeta nueva" -ForegroundColor Green
+        return [pscustomobject]@{ Mode = 'nuevo'; Attempts = $r.Attempts; Reason = $null }
+    }
+
+    $r = Rename-ItemWithRetry -Path $Destination -NewName (Split-Path $PreviousDir -Leaf) -Attempts $RenameAttempts -DelaySeconds $RenameDelaySeconds
+    if ($r.Renamed) {
+        try {
+            $activo = Rename-ItemWithRetry -Path $ReleasingDir -NewName $siteName -Attempts $RenameAttempts -DelaySeconds $RenameDelaySeconds
+            if (-not $activo.Renamed) { throw "No se puede activar '$ReleasingDir' como '$Destination': $($activo.Error)" }
+        }
+        catch {
+            Write-Host "Swap por rename fallido: $($_.Exception.Message)" -ForegroundColor Red
+            [void](Undo-SiteSwap -Mode rename -Destination $Destination -PreviousDir $PreviousDir -Kind $Kind @retry)
+            throw
+        }
+        Write-Host "Swap por rename (intento $($r.Attempts) de $RenameAttempts): la versión anterior queda en '$PreviousDir'" -ForegroundColor Green
+        return [pscustomobject]@{ Mode = 'rename'; Attempts = $r.Attempts; Reason = $null }
+    }
+
+    $motivo = $r.Error
+    Write-Host ("No se puede renombrar '$Destination' tras $($r.Attempts) intentos ($motivo). Cambiazo por ESPEJO " +
+        "desde '$ReleasingDir'. Lo habitual: un fichero del site abierto por otro proceso (el agente de CloudWatch " +
+        "lee Logs\ de las API de test) o el w3wp del grupo todavía saliendo.") -ForegroundColor Yellow
+
+    $runtime = Get-SwapRuntimeFolders -Kind $Kind
+    $config = @(@(Get-SiteConfigFiles -Kind $Kind -Path $Destination) + @(Get-SiteConfigFiles -Kind $Kind -Path $ReleasingDir) | Sort-Object -Unique)
+    $reintentos = @("/R:$RobocopyRetries", "/W:$RobocopyWaitSeconds", '/MT:8')
+
+    # 1. Copia de la versión actual, para poder volver. Si falla, el site no se ha tocado.
+    if (Test-Path -LiteralPath $PreviousDir) { Remove-Item -LiteralPath $PreviousDir -Recurse -Force }
+    Write-Host "Espejo 1/3: copia de la versión actual en '$PreviousDir' (sin $($runtime -join ', '))..." -ForegroundColor Yellow
+    try {
+        [void](Invoke-Robocopy -Source $Destination -Destination $PreviousDir -What 'copia de la versión actual' `
+            -Options (@('/E') + $reintentos + (Get-RobocopyRootExclusions -Roots @($Destination, $PreviousDir) -Folders $runtime)))
+    }
+    catch {
+        Remove-Item -LiteralPath $PreviousDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw "No se ha podido guardar la versión actual en '$PreviousDir'; el site no se ha tocado: $($_.Exception.Message)"
+    }
+
+    try {
+        # 2. Espejo exacto de lo publicado, sin la configuración ni las carpetas de ejecución. Reescribe
+        # también lo que robocopy daría por igual (Get-RobocopyIncludeAll).
+        $todo = Get-RobocopyIncludeAll
+        Write-Host ("Espejo 2/3: robocopy /MIR $($todo -join ' ') de '$ReleasingDir' sobre '$Destination' (sin " +
+            "$($config -join ', ') ni $($runtime -join ', '))...") -ForegroundColor Yellow
+        [void](Invoke-Robocopy -Source $ReleasingDir -Destination $Destination -What 'espejo de la versión nueva' `
+            -Options (@('/MIR') + $todo + $reintentos + (Get-RobocopyRootExclusions -Roots @($ReleasingDir, $Destination) -Files $config -Folders $runtime)))
+        # 3. Lo que traiga el build dentro de las carpetas de ejecución, sin purgar.
+        foreach ($d in $runtime) {
+            $src = Join-Path $ReleasingDir $d
+            if (Test-Path -LiteralPath $src) {
+                [void](Invoke-Robocopy -Source $src -Destination (Join-Path $Destination $d) -What "$d del build" -Options (@('/E') + $todo + $reintentos))
+            }
+        }
+        # 4. La configuración, la última: la de _releasing, la que dejaría el rename.
+        Write-Host "Espejo 3/3: configuración del site desde _releasing (la del site con lo que viaja con el build)" -ForegroundColor Yellow
+        foreach ($name in $config) {
+            $src = Join-Path $ReleasingDir $name
+            $dst = Join-Path $Destination $name
+            if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $dst -Force }
+            elseif (Test-Path -LiteralPath $dst) {
+                Remove-Item -LiteralPath $dst -Force
+                Write-Host "    ${name}: no viaja en la publicación; se quita, como con el rename" -ForegroundColor Yellow
+            }
+        }
+    }
+    catch {
+        Write-Host "Swap por espejo fallido: $($_.Exception.Message)" -ForegroundColor Red
+        [void](Undo-SiteSwap -Mode espejo -Destination $Destination -PreviousDir $PreviousDir -Kind $Kind @retry)
+        throw
+    }
+
+    # 5. La carpeta nueva ya está volcada en el site.
+    try { Remove-Item -LiteralPath $ReleasingDir -Recurse -Force }
+    catch { Write-Warning "No se ha podido borrar '$ReleasingDir' ($($_.Exception.Message)); lo hará la próxima publicación." }
+    Write-Host "Swap por espejo: '$Destination' tiene la versión nueva; la anterior queda en '$PreviousDir'" -ForegroundColor Green
+    [pscustomobject]@{ Mode = 'espejo'; Attempts = $r.Attempts; Reason = $motivo }
+}
+
 function Publish {
     param(
         [string]$ProjectPath,
@@ -1886,19 +2166,17 @@ function Publish {
         Stop-IISAppPool -Name $AppPoolName
         $poolStopped = $true
 
-        # Mover destino actual a previous
-        if (Test-Path $Destination) {
-            Rename-Item -Path $Destination -NewName "${siteName}_previous"
-        }
-
-        # Activar nueva release
-        Rename-Item -Path $releasingDir -NewName $siteName
+        # Destino actual a previous y la release nueva en su sitio. Si la carpeta del site no se deja
+        # renombrar (un fichero abierto dentro: el agente de CloudWatch en Logs\, el w3wp que sale),
+        # reintenta y, si no, cambiazo por espejo. Si falla, deja el site como estaba y lanza.
+        $swap = Invoke-SiteSwap -Destination $Destination -ReleasingDir $releasingDir -PreviousDir $previousDir -Kind $Kind
 
         $swapCompleted = $true
-        Write-Host "Directory swap completed" -ForegroundColor Green
+        Write-Host "Directory swap completed ($($swap.Mode))" -ForegroundColor Green
 
         # El log de la API vive en el site: el swap estrena carpeta y, sin moverlo, cada
-        # publicación borraría el de las anteriores con la carpeta previous.
+        # publicación borraría el de las anteriores con la carpeta previous. (En el espejo
+        # Logs\ no se ha movido ni copiado a previous: no hay nada que traer.)
         if ($Kind -eq 'aspnetcore') {
             $logsPrevios = Join-Path $previousDir 'Logs'
             if ((Test-Path $logsPrevios) -and -not (Test-Path (Join-Path $Destination 'Logs'))) {
@@ -1936,17 +2214,10 @@ function Publish {
     catch {
         Write-Host "Publish failed: $($_.Exception.Message)" -ForegroundColor Red
 
-        # Intento de rollback si el swap quedó a medias
-        if ($poolStopped -and -not $swapCompleted) {
-            Write-Host "Attempting rollback..." -ForegroundColor Yellow
-
-            $destinationExists = Test-Path $Destination
-            $previousExists = Test-Path $previousDir
-
-            if (-not $destinationExists -and $previousExists) {
-                Rename-Item -Path $previousDir -NewName $siteName
-                Write-Host "Rollback completed" -ForegroundColor Green
-            }
+        # Invoke-SiteSwap ya deshace lo suyo. Red de seguridad: si aun así el site no existe y la
+        # versión anterior sí, vuelve a su sitio.
+        if ($poolStopped -and -not $swapCompleted -and -not (Test-Path $Destination) -and (Test-Path $previousDir)) {
+            [void](Undo-SiteSwap -Mode rename -Destination $Destination -PreviousDir $previousDir -Kind $Kind)
         }
 
         throw

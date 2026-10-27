@@ -6,6 +6,17 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.16.3] - 2026-10-27
+
+### Fixed
+- **El swap ya no falla cuando otro proceso tiene abierto un fichero del site**: Windows no deja renombrar una
+  carpeta con un fichero abierto dentro, y desde que el agente de CloudWatch del servidor de test lee `Logs\` de
+  las API, la publicación de `devecoandapi1` fallaba en el swap con «Access to the path ... is denied» y volvía
+  atrás. Ahora el rename se reintenta unas veces y, si la carpeta sigue retenida, el cambiazo se hace por espejo
+  (`robocopy /MIR` de `_releasing` sobre el site, sin la configuración ni las carpetas de ejecución, y la
+  configuración la última), con el mismo resultado que el rename y vuelta atrás en los dos caminos. El log dice
+  qué camino se ha tomado y por qué.
+
 ## [0.16.0] - 2026-10-23
 
 ### Added
