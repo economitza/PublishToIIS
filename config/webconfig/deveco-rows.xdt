@@ -2,25 +2,32 @@
 <!-- Parche del web.config de deveco-rows (escandallos, kind node): se aplica en cada publicación, sea cual sea la rama.
      {secreto:Nombre} sale del almacén del servidor (Set-RemotePublishSecret), nunca de git.
      Un emisor por país, con el secreto del e-market de test que enlaza aquí (RowsUrl): test-and es deveco-experimental-and
-     (mismo valor que su RowsTraspasoSecreto). Para España, test-esp=<su secreto> cuando un e-market de España enlace. -->
+     (mismo valor que su RowsTraspasoSecreto) y test-esp, deveco-experimental-esp (su RowsTraspasoSecreto es el
+     RowsTraspasoSecretoEsp de aquí). -->
 <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
   <system.webServer>
     <aspNetCore>
       <environmentVariables>
         <environmentVariable name="ROWS_TRASPASO_SECRETOS" xdt:Transform="Remove" xdt:Locator="Match(name)" />
-        <environmentVariable name="ROWS_TRASPASO_SECRETOS" value="test-and={secreto:RowsTraspasoSecreto}" xdt:Transform="Insert" />
+        <environmentVariable name="ROWS_TRASPASO_SECRETOS" value="test-and={secreto:RowsTraspasoSecreto};test-esp={secreto:RowsTraspasoSecretoEsp}" xdt:Transform="Insert" />
         <environmentVariable name="PUERTA_ROWS_COOKIE_SECRETO" xdt:Transform="Remove" xdt:Locator="Match(name)" />
         <environmentVariable name="PUERTA_ROWS_COOKIE_SECRETO" value="{secreto:PuertaCookieSecreto}" xdt:Transform="Insert" />
         <environmentVariable name="ALLOWED_ORIGINS" xdt:Transform="Remove" xdt:Locator="Match(name)" />
         <environmentVariable name="ALLOWED_ORIGINS" value="https://deveco-rows.economitza.com" xdt:Transform="Insert" />
-        <!-- Datos de verdad: la API de Andorra de test (la de deveco-experimental-and) con la cuenta de servicio de
-             escandallos; sin ella, modo demostración con el catálogo de NEXTA para todos. -->
+        <!-- Datos de verdad: la API de test de cada país (la de su e-market de test) con la cuenta de test (dsantamaria),
+             nunca la de una persona; sin ninguna, modo demostración con el catálogo de NEXTA para todos. -->
         <environmentVariable name="API_BASE_URL_AND" xdt:Transform="Remove" xdt:Locator="Match(name)" />
         <environmentVariable name="API_BASE_URL_AND" value="https://deveco-experimental-and-api.economitza.com" xdt:Transform="Insert" />
         <environmentVariable name="API_CUENTA_AND_USUARIO" xdt:Transform="Remove" xdt:Locator="Match(name)" />
         <environmentVariable name="API_CUENTA_AND_USUARIO" value="{secreto:ApiCuentaAndUsuario}" xdt:Transform="Insert" />
         <environmentVariable name="API_CUENTA_AND_CLAVE" xdt:Transform="Remove" xdt:Locator="Match(name)" />
         <environmentVariable name="API_CUENTA_AND_CLAVE" value="{secreto:ApiCuentaAndClave}" xdt:Transform="Insert" />
+        <environmentVariable name="API_BASE_URL_ESP" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="API_BASE_URL_ESP" value="https://deveco-experimental-esp-api.economitza.com" xdt:Transform="Insert" />
+        <environmentVariable name="API_CUENTA_ESP_USUARIO" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="API_CUENTA_ESP_USUARIO" value="{secreto:ApiCuentaEspUsuario}" xdt:Transform="Insert" />
+        <environmentVariable name="API_CUENTA_ESP_CLAVE" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="API_CUENTA_ESP_CLAVE" value="{secreto:ApiCuentaEspClave}" xdt:Transform="Insert" />
       </environmentVariables>
     </aspNetCore>
   </system.webServer>

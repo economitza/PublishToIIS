@@ -74,6 +74,29 @@
       },
       "responsable": "Joaquim"
     },
+    "deveco-experimental-esp": {
+      "server": "deployments-76",
+      "origin": "E:\\git\\central-de-compres\\CentralCompres",
+      "destination": "E:\\wwwrootDevecoExperimentalEsp",
+      "siteUrl": "https://deveco-experimental-esp.economitza.com",
+      "apiUrl": "https://deveco-experimental-esp-api.economitza.com",
+      "templateSite": "devecoesp1",
+      "sourceDatabase": "CCEspana",
+      "responsable": "Joaquim"
+    },
+    "deveco-experimental-esp-api": {
+      "server": "deployments-76",
+      "kind": "aspnetcore",
+      "origin": "E:\\git\\central-compres-api\\CentralCompres.Api",
+      "destination": "E:\\wwwrootDevecoExperimentalEspApi",
+      "siteUrl": "https://deveco-experimental-esp-api.economitza.com",
+      "templateSite": "devecoesp1api.economitza.com",
+      "seedAppSettings": {
+        "Queues": { "Environment": "test-esp-experimental" },
+        "BackgroundServices": { "PriceImportEnabled": false }
+      },
+      "responsable": "Joaquim"
+    },
     "deveco-rows": {
       "server": "deployments-76",
       "kind": "node",
