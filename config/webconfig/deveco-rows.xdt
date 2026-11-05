@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Parche del web.config de deveco-rows (escandallos, kind node): se aplica en cada publicación, sea cual sea la rama.
+     {secreto:Nombre} sale del almacén del servidor (Set-RemotePublishSecret), nunca de git.
+     RowsTraspasoSecreto es el mismo valor que el de los e-market de test que enlazan aquí (RowsUrl). -->
+<configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+  <system.webServer>
+    <aspNetCore>
+      <environmentVariables>
+        <environmentVariable name="ROWS_TRASPASO_SECRETOS" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="ROWS_TRASPASO_SECRETOS" value="test={secreto:RowsTraspasoSecreto}" xdt:Transform="Insert" />
+        <environmentVariable name="PUERTA_ROWS_COOKIE_SECRETO" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="PUERTA_ROWS_COOKIE_SECRETO" value="{secreto:PuertaCookieSecreto}" xdt:Transform="Insert" />
+        <environmentVariable name="ALLOWED_ORIGINS" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="ALLOWED_ORIGINS" value="https://deveco-rows.economitza.com" xdt:Transform="Insert" />
+      </environmentVariables>
+    </aspNetCore>
+  </system.webServer>
+</configuration>

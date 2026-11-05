@@ -74,6 +74,15 @@
       },
       "responsable": "Joaquim"
     },
+    "deveco-rows": {
+      "server": "deployments-76",
+      "kind": "node",
+      "origin": "E:\\git\\escandallos-hotel",
+      "destination": "E:\\wwwrootDevecoRows",
+      "siteUrl": "https://deveco-rows.economitza.com",
+      "templateSite": "deveco-experimental-and-api.economitza.com",
+      "responsable": "Joaquim"
+    },
     "devecoesp-audit": {
       "server": "deployments-76",
       "origin": "E:\\git\\central-de-compres\\CentralCompres",
