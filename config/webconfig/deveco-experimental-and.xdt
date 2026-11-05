@@ -5,7 +5,8 @@
   <appSettings>
     <!-- SI-2763: los menús «Impactos de tarifa» y «Escandallos de hotel» (SI-2729) abren rows ya identificado, con el emisor de pruebas -->
     <add key="RowsTraspasoEmisor" xdt:Transform="Remove" xdt:Locator="Match(key)" />
-    <add key="RowsTraspasoEmisor" value="test" xdt:Transform="Insert" />
+    <!-- test-and: deveco-rows saca del emisor el país del usuario (con las dos API de test, a cuál ir) -->
+    <add key="RowsTraspasoEmisor" value="test-and" xdt:Transform="Insert" />
     <add key="RowsTraspasoSecreto" xdt:Transform="Remove" xdt:Locator="Match(key)" />
     <add key="RowsTraspasoSecreto" value="{secreto:RowsTraspasoSecreto}" xdt:Transform="Insert" />
     <!-- SI-2729: rows de producción no ve el servidor de test; este e-market enlaza con su copia de test, deveco-rows,
