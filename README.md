@@ -395,7 +395,10 @@ Integración en solución .NET Framework:
   <entorno> -Name <Nombre>` (el valor no pasa por la consola ni vuelve en la respuesta) y
   `Get-RemotePublishSecretNames` para ver los nombres. **Antes de subir un parche que pide un secreto, el secreto**:
   si falta, todas las publicaciones de ese entorno se paran con «Faltan secretos». El log de la publicación enseña las
-  líneas que cambian, con los valores de claves secretas tapados.
+  líneas que cambian, con los valores de claves secretas tapados. **En una API (`aspnetcore`) el parche se aplica
+  igual**, al `web.config` conservado: como sus `appsettings*.json` también se conservan, una clave nueva que pida la
+  rama (`Kitchen:ProductStructure` de SI-2729) va como `<environmentVariable>` del `<aspNetCore>`, dentro de
+  `<location path="." xdt:Locator="Match(path)">` (ejemplo: `config\webconfig\deveco-experimental-and-api.xdt`).
 - **Una carpeta de site con un fichero abierto por otro proceso no se puede renombrar (0.16.3)**: Windows lo
   impide aunque el fichero se haya abierto compartido, incluso para borrar, y el `Rename-Item` del swap falla con «Access to the path
   '<site>' is denied». Desde el 26/10/2026 el agente de CloudWatch del 76 lee
