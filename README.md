@@ -387,6 +387,17 @@ Integración en solución .NET Framework:
   conservado (`Set-WebConfigApiUrl`). Sin el campo, el site sigue con la API que ya tuviera, que en un
   site sembrado es la de su plantilla el día que se sembró: devecoesp-audit llamaba así a una API
   anterior a la 2.1.0 mientras se auditaba una release. Solo cambia una clave que ya exista.
+- **Entornos `kind: node` (0.17.0)**: una aplicación Node.js (escandallos en `deveco-rows`) detrás de IIS con el
+  `AspNetCoreModuleV2` fuera de proceso, que arranca `node.exe` y le pasa el puerto en `ASPNETCORE_PORT`. El
+  `origin` es la raíz del repo (no una carpeta de proyecto); se publica `git archive HEAD` de las rutas de
+  `deploy\iis\publicar.txt` y el `web.config` del repo (`deploy\iis\web.config`) solo la primera vez: después se
+  conserva el del site, con `processPath`, `arguments` y `hostingModel` del repo y la ruta de `node.exe`,
+  `DATA_DIR` y `stdoutLogFile` puestos por el publicador en `<site>_data` (fuera del swap). Con `templateSite` el
+  site se crea con su certificado, sin sembrar configuración de la plantilla. Lo propio del entorno (secretos)
+  va en su parche XDT, sin `<location>`. Prerrequisitos, una vez por servidor y por RDP:
+  `tools\Install-NodePrereqs.ps1` (Node.js LTS y el clon con un token fine-grained de GitHub de solo lectura). Un
+  node no se hotfixea: se republica. Gotcha: `Join-Path` falla si la unidad no existe en la máquina que calcula
+  la ruta (las pruebas con `E:\` en el 34); las rutas del servidor se arman con `[IO.Path]::Combine`.
 - **Parches del web.config por entorno (0.16.0)**: lo que un entorno necesita en su web.config y el publicador no
   conoce va en un parche XDT: `config\webconfig\<entorno>.xdt` de este repo (se aplica sea cual sea la rama; para
   añadir una clave, el par `Remove` + `Insert` con `Match(key)`, que deja una sola aunque se repita) y, si la rama lo

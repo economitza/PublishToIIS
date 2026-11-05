@@ -6,6 +6,18 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.17.0] - 2026-11-05
+
+### Added
+- **Entornos `kind: node`** (escandallos en `deveco-rows`): una aplicación Node.js detrás de IIS. El
+  `AspNetCoreModuleV2` del Hosting Bundle arranca `node.exe` fuera de proceso, le pasa el puerto en
+  `ASPNETCORE_PORT` y lo reinicia si cae: sin módulos nuevos en IIS ni servicios de Windows. Se publica lo
+  commiteado (`git archive` de lo que diga `deploy\iis\publicar.txt` del repo), con el `web.config` de
+  `deploy\iis\web.config` la primera vez y el del site conservado después; el publicador pone la ruta de
+  `node.exe`, `DATA_DIR` y el log de consola en `<site>_data`, fuera del swap, con escritura para su grupo. El
+  `origin` de un entorno node es la raíz del repo. `tools\Install-NodePrereqs.ps1` prepara el servidor una vez
+  (Node.js LTS con su SHA-256 comprobado y el clon con un token de GitHub de solo lectura).
+
 ## [0.16.3] - 2026-10-27
 
 ### Fixed
