@@ -87,6 +87,37 @@ Describe 'Parches del web.config por entorno y secretos del servidor' {
         Remove-Item $otro
     }
 
+    It 'en una API pone la variable de entorno del parche de deveco-experimental-and-api una sola vez y conserva las demás' {
+        if (-not $script:hayXdt) { Set-ItResult -Skipped -Because 'sin Microsoft.Web.XmlTransform.dll en este equipo'; return }
+        $web = Join-Path $script:dataDir ("api_" + [Guid]::NewGuid() + '.config')
+        Set-Content -Path $web -Encoding UTF8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <location path="." inheritInChildApplications="false">
+    <system.webServer>
+      <aspNetCore processPath="dotnet" arguments=".\CentralCompres.Api.dll" hostingModel="inprocess">
+        <environmentVariables>
+          <environmentVariable name="ASPNETCORE_ENVIRONMENT" value="Development" />
+          <environmentVariable name="ASPNETCORE_COUNTRY" value="AD" />
+        </environmentVariables>
+      </aspNetCore>
+    </system.webServer>
+  </location>
+  <location path="deploy-info.json"><system.webServer><handlers><clear /></handlers></system.webServer></location>
+</configuration>
+'@
+        $parche = @(Get-WebConfigPatch -Environment deveco-experimental-and-api)
+        $parche.Count | Should -Be 1
+        Invoke-EnvironmentWebConfigPatch -WebConfigPath $web -Environment deveco-experimental-and-api 6>$null
+        Invoke-EnvironmentWebConfigPatch -WebConfigPath $web -Environment deveco-experimental-and-api 6>$null
+        [xml]$x = Get-Content $web -Raw
+        $vars = @($x.configuration.location | Where-Object path -eq '.').'system.webServer'.aspNetCore.environmentVariables.environmentVariable
+        @($vars | Where-Object name -eq 'Kitchen__ProductStructure').Count | Should -Be 1
+        ($vars | Where-Object name -eq 'Kitchen__ProductStructure').value | Should -Be 'Avanzada'
+        ($vars | Where-Object name -eq 'ASPNETCORE_COUNTRY').value | Should -Be 'AD'
+        @($x.configuration.location | Where-Object path -eq 'deploy-info.json').Count | Should -Be 1
+    }
+
     It 'el endpoint guarda el secreto sin devolverlo, rechaza producción y lista solo los nombres' {
         $t = 'd' * 64
         $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/secret' -Token $t -ExpectedToken $t -DataDir $script:dataDir `

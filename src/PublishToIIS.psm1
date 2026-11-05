@@ -599,6 +599,23 @@ function Get-WebConfigPatch {
     @($candidatos | Where-Object { Test-Path $_ } | ForEach-Object { (Resolve-Path $_).Path })
 }
 
+function Invoke-EnvironmentWebConfigPatch {
+    <#
+    .SYNOPSIS
+        Aplica al web.config final del site, en orden, todos los parches XDT del entorno y lo dice en el log.
+    .DESCRIPTION
+        Los de config\webconfig\ de este repo y tools\deploy\webconfig\ del publicado, con los secretos del almacén del
+        servidor: lo que su web.config tiene que llevar y el publicador no conoce. Vale para el e-market (appSettings) y
+        para la API (variables de entorno del <aspNetCore>).
+    #>
+    param([Parameter(Mandatory)][string]$WebConfigPath, [string]$RepoRoot, [string]$Environment)
+    foreach ($parche in @(Get-WebConfigPatch -RepoRoot $RepoRoot -Environment $Environment)) {
+        $cambios = @(Invoke-WebConfigPatch -WebConfigPath $WebConfigPath -PatchPath $parche -Environment $Environment)
+        Write-Host "web.config: parche $parche, $($cambios.Count) líneas cambiadas" -ForegroundColor Green
+        foreach ($c in $cambios) { Write-Host "    $c" }
+    }
+}
+
 function Invoke-WebConfigPatch {
     <#
     .SYNOPSIS
@@ -2024,6 +2041,11 @@ function Publish {
             Write-Host "Extra MSBuild properties: $($extraProps -join ' ')" -ForegroundColor Gray
         }
 
+        # En PowerShell 5.1, con Stop, lo que git escriba en stderr lanza: fuera de un repo, sin parche ni subaplicaciones.
+        $repoRoot = $null
+        try { $repoRoot = (& git -C (Split-Path $projectToBuild -Parent) rev-parse --show-toplevel 2>$null) } catch { $repoRoot = $null }
+        if ($repoRoot) { $repoRoot = ([string]$repoRoot).Trim() -replace '/', '\' }
+
         if ($Kind -eq 'aspnetcore') {
             # dotnet publish restaura los paquetes (PackageReference) de las fuentes NuGet
             # de la máquina: una privada (EconomitzaDB en el registro de GitLab) tiene que
@@ -2047,6 +2069,9 @@ function Publish {
             if (Add-DeployInfoStaticRoute -WebConfigPath $releasingWebConfig) {
                 Write-Host "web.config: deploy-info.json served by IIS as a static file" -ForegroundColor Green
             }
+            # Los appsettings*.json del site se conservan: lo que una rama nueva pide en su configuración (una clave de
+            # appsettings.json que el site no tiene) llega como variable de entorno del <aspNetCore>, por el parche.
+            Invoke-EnvironmentWebConfigPatch -WebConfigPath $releasingWebConfig -RepoRoot $repoRoot -Environment $Environment
         }
         else {
             Write-Host "Running MSBuild publish into releasing directory..." -ForegroundColor Yellow
@@ -2097,18 +2122,7 @@ function Publish {
                 Write-Host "UrlApiEconomitza del web.config: $ApiUrl" -ForegroundColor Green
             }
 
-            # En PowerShell 5.1, con Stop, lo que git escriba en stderr lanza: fuera de un repo, sin parche ni subaplicaciones.
-            $repoRoot = $null
-            try { $repoRoot = (& git -C (Split-Path $projectToBuild -Parent) rev-parse --show-toplevel 2>$null) } catch { $repoRoot = $null }
-            if ($repoRoot) { $repoRoot = ([string]$repoRoot).Trim() -replace '/', '\' }
-
-            # Parches XDT del entorno (config\webconfig\ de este repo y tools\deploy\webconfig\ del publicado), con los
-            # secretos del almacén del servidor: lo que su web.config tiene que llevar y el publicador no conoce.
-            foreach ($parche in @(Get-WebConfigPatch -RepoRoot $repoRoot -Environment $Environment)) {
-                $cambios = @(Invoke-WebConfigPatch -WebConfigPath $releasingWebConfig -PatchPath $parche -Environment $Environment)
-                Write-Host "web.config: parche $parche, $($cambios.Count) líneas cambiadas" -ForegroundColor Green
-                foreach ($c in $cambios) { Write-Host "    $c" }
-            }
+            Invoke-EnvironmentWebConfigPatch -WebConfigPath $releasingWebConfig -RepoRoot $repoRoot -Environment $Environment
 
             # Subaplicaciones: con el web.config final del site, para que sus variables sigan a lo
             # que sirve (la misma API), y antes del sello y del manifiesto, que las incluyen.
@@ -6551,4 +6565,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath, Get-XdtAssemblyPath, Get-WebConfigPatch, Invoke-WebConfigPatch, Set-PublishSecret, Get-PublishSecretNames, Set-RemotePublishSecret, Get-RemotePublishSecretNames -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath, Get-XdtAssemblyPath, Get-WebConfigPatch, Invoke-EnvironmentWebConfigPatch, Invoke-WebConfigPatch, Set-PublishSecret, Get-PublishSecretNames, Set-RemotePublishSecret, Get-RemotePublishSecretNames -Alias Publish-Update

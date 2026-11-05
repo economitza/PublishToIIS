@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Parche del web.config de deveco-experimental-and-api: se aplica en cada publicación, sea cual sea la rama.
+     Los appsettings*.json del site se conservan, así que lo que una rama pide en su configuración va aquí como
+     variable de entorno del <aspNetCore>. -->
+<configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+  <location path="." xdt:Locator="Match(path)">
+    <system.webServer>
+      <aspNetCore>
+        <environmentVariables>
+          <!-- SI-2729: sin la estructura de producto, los endpoints de cocina responden 503. Andorra va en Avanzada. -->
+          <environmentVariable name="Kitchen__ProductStructure" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+          <environmentVariable name="Kitchen__ProductStructure" value="Avanzada" xdt:Transform="Insert" />
+        </environmentVariables>
+      </aspNetCore>
+    </system.webServer>
+  </location>
+</configuration>
