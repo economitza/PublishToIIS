@@ -13,6 +13,14 @@
         <environmentVariable name="PUERTA_ROWS_COOKIE_SECRETO" value="{secreto:PuertaCookieSecreto}" xdt:Transform="Insert" />
         <environmentVariable name="ALLOWED_ORIGINS" xdt:Transform="Remove" xdt:Locator="Match(name)" />
         <environmentVariable name="ALLOWED_ORIGINS" value="https://deveco-rows.economitza.com" xdt:Transform="Insert" />
+        <!-- Datos de verdad: la API de Andorra de test (la de deveco-experimental-and) con la cuenta de servicio de
+             escandallos; sin ella, modo demostración con el catálogo de NEXTA para todos. -->
+        <environmentVariable name="API_BASE_URL_AND" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="API_BASE_URL_AND" value="https://deveco-experimental-and-api.economitza.com" xdt:Transform="Insert" />
+        <environmentVariable name="API_CUENTA_AND_USUARIO" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="API_CUENTA_AND_USUARIO" value="{secreto:ApiCuentaAndUsuario}" xdt:Transform="Insert" />
+        <environmentVariable name="API_CUENTA_AND_CLAVE" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+        <environmentVariable name="API_CUENTA_AND_CLAVE" value="{secreto:ApiCuentaAndClave}" xdt:Transform="Insert" />
       </environmentVariables>
     </aspNetCore>
   </system.webServer>
