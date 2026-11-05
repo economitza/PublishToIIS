@@ -42,13 +42,15 @@ function Grant-RuntimeFolderWrite {
 # ─── Tipos de proyecto ──────────────────────────────────────────────────────
 # `kind` en la entrada del entorno: 'mvc' (por defecto: el e-market, MSBuild y la
 # configuración del site en Web.config + connections.config) o 'aspnetcore' (la API:
-# dotnet publish y la configuración del site en web.config + appsettings*.json).
-# Todo lo que cambia entre los dos tipos se resuelve con estas funciones.
+# dotnet publish y la configuración del site en web.config + appsettings*.json) o 'node'
+# (una aplicación Node.js, como escandallos: git archive de lo que pide el repo, IIS
+# delante con el AspNetCoreModuleV2 fuera de proceso y la configuración en web.config).
+# Todo lo que cambia entre los tipos se resuelve con estas funciones.
 
 function Resolve-PublishKind {
     param($Kind)
     $k = if ($Kind) { ([string]$Kind).Trim().ToLowerInvariant() } else { 'mvc' }
-    if ($k -notin @('mvc', 'aspnetcore')) { throw "kind '$Kind' no soportado: 'mvc' (por defecto) o 'aspnetcore'." }
+    if ($k -notin @('mvc', 'aspnetcore', 'node')) { throw "kind '$Kind' no soportado: 'mvc' (por defecto), 'aspnetcore' o 'node'." }
     $k
 }
 
@@ -60,8 +62,10 @@ function Get-SiteConfigFiles {
     .DESCRIPTION
         aspnetcore: web.config y los appsettings*.json de la raíz de -Path (los que
         tenga ese site; sin -Path, solo web.config). mvc: Web.config y connections.config.
+        node: web.config (sus variables de entorno son la configuración de la aplicación).
     #>
     param([Parameter(Mandatory)][string]$Kind, [string]$Path)
+    if ((Resolve-PublishKind $Kind) -eq 'node') { return @('web.config') }
     if ((Resolve-PublishKind $Kind) -eq 'aspnetcore') {
         $files = @('web.config')
         if ($Path -and (Test-Path $Path)) {
@@ -76,8 +80,11 @@ function Get-RuntimeFolders {
     # Carpetas donde escribe la aplicación en ejecución (IIS_IUSRS con modificación).
     # La API escribe el log de Serilog en Logs\ y el PDF de los pedidos en Upload\pdf
     # antes de subirlo a S3 (UploadsFiles de su appsettings).
+    # Una aplicación node escribe fuera del site, en su carpeta de datos (Get-NodeDataDir).
     param([Parameter(Mandatory)][string]$Kind)
-    if ((Resolve-PublishKind $Kind) -eq 'aspnetcore') { return @('Logs', 'Upload', 'Upload\pdf', 'Upload\tmp') }
+    $k = Resolve-PublishKind $Kind
+    if ($k -eq 'node') { return @() }
+    if ($k -eq 'aspnetcore') { return @('Logs', 'Upload', 'Upload\pdf', 'Upload\tmp') }
     @('Upload', 'Upload\tmp')
 }
 
@@ -179,6 +186,97 @@ function Set-AspNetCoreEnvironmentVariables {
         $node.SetAttribute('value', [string]$Variables[$name])
     }
     $xml.Save($WebConfigPath)
+}
+
+# ─── Aplicaciones node ──────────────────────────────────────────────────────
+# IIS no aloja Node: el AspNetCoreModuleV2 (del Hosting Bundle que ya sirve la API) arranca
+# node.exe fuera de proceso, le pasa el puerto en ASPNETCORE_PORT, le reenvía las peticiones y
+# lo reinicia si cae. Sin módulos nuevos en IIS (HttpPlatformHandler, iisnode) ni servicios de
+# Windows aparte. El repo trae su web.config en deploy\iis\web.config y, si quiere publicar
+# solo una parte, la lista de rutas (pathspecs de git) en deploy\iis\publicar.txt.
+
+function Get-NodeExe {
+    # node.exe del PATH o de la instalación estándar; el web.config lleva la ruta absoluta
+    # porque el proceso de IIS no tiene por qué ver el PATH del usuario que publica.
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    $exe = if ($cmd) { $cmd.Source } else { Join-Path $env:ProgramFiles 'nodejs\node.exe' }
+    if (-not (Test-Path $exe)) { throw 'node no encontrado: instala Node.js LTS en el servidor (C:\Program Files\nodejs) antes de publicar un entorno kind node.' }
+    $exe
+}
+
+function Get-NodeDataDir {
+    # Los datos de una aplicación node viven fuera del swap: <site>_data junto al site.
+    param([Parameter(Mandatory)][string]$Destination)
+    # [IO.Path] y no Join-Path, que exige que la unidad exista en la máquina que lo calcula
+    $d = $Destination.TrimEnd('\')
+    [IO.Path]::Combine([IO.Path]::GetDirectoryName($d), [IO.Path]::GetFileName($d) + '_data')
+}
+
+function Export-NodeApp {
+    <#
+    .SYNOPSIS
+        node: lo commiteado del repo (HEAD) en -OutputDir, con su web.config en la raíz.
+    .DESCRIPTION
+        git archive, no una copia de la carpeta: nunca viajan .env, node_modules ni lo que no
+        esté en git. Con deploy\iis\publicar.txt (una pathspec por línea, # comenta), solo eso;
+        sin él, todo HEAD. Si package.json declara dependencies, npm ci --omit=dev.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$OutputDir)
+    $lista = Join-Path $RepoRoot 'deploy\iis\publicar.txt'
+    $rutas = @()
+    if (Test-Path $lista) {
+        $rutas = @(Get-Content $lista -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    }
+    $zip = Join-Path ([IO.Path]::GetTempPath()) ('publish-node-' + [guid]::NewGuid().ToString('N') + '.zip')
+    try {
+        & git -C $RepoRoot archive --format=zip -o $zip HEAD @rutas
+        if ($LASTEXITCODE) { throw "git archive falló (código $LASTEXITCODE) en $RepoRoot." }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+        [IO.Compression.ZipFile]::ExtractToDirectory($zip, $OutputDir)
+    }
+    finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
+
+    $webConfigRepo = Join-Path $OutputDir 'deploy\iis\web.config'
+    if (-not (Test-Path $webConfigRepo)) { throw "El repo no trae deploy\iis\web.config (o publicar.txt no lo incluye): es el que dice a IIS cómo arrancar la aplicación." }
+    Copy-Item $webConfigRepo (Join-Path $OutputDir 'web.config') -Force
+
+    $pkg = Join-Path $OutputDir 'package.json'
+    if (Test-Path $pkg) {
+        $deps = (Get-Content $pkg -Raw -Encoding UTF8 | ConvertFrom-Json).dependencies
+        if ($deps -and @($deps.PSObject.Properties).Count) {
+            $npm = Join-Path (Split-Path (Get-NodeExe) -Parent) 'npm.cmd'
+            Push-Location $OutputDir
+            try {
+                & $npm ci --omit=dev --no-audit --no-fund
+                if ($LASTEXITCODE) { throw "npm ci falló (código $LASTEXITCODE)." }
+            }
+            finally { Pop-Location }
+        }
+    }
+}
+
+function Set-NodeWebConfig {
+    <#
+    .SYNOPSIS
+        node: el <aspNetCore> del web.config publicado arranca el node.exe de este servidor,
+        con DATA_DIR y el log de consola en la carpeta de datos (fuera del swap).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WebConfigPath,
+        [Parameter(Mandatory)][string]$NodeExe,
+        [Parameter(Mandatory)][string]$DataDir
+    )
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $xml.Load($WebConfigPath)
+    $core = $xml.SelectSingleNode('//system.webServer/aspNetCore')
+    if (-not $core) { throw "$WebConfigPath no tiene <aspNetCore>: el web.config de una aplicación node lo necesita para que IIS la arranque." }
+    $core.SetAttribute('processPath', $NodeExe)
+    $core.SetAttribute('hostingModel', 'OutOfProcess')
+    $core.SetAttribute('stdoutLogFile', [IO.Path]::Combine($DataDir, 'logs\node'))
+    $xml.Save($WebConfigPath)
+    Set-AspNetCoreEnvironmentVariables -WebConfigPath $WebConfigPath -Variables ([ordered]@{ DATA_DIR = $DataDir })
 }
 
 function Get-SubAppPoolName {
@@ -343,10 +441,11 @@ function Protect-SiteSettings {
     param(
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][string]$ReleasingDir,
-        [switch]$Override
+        [switch]$Override,
+        [string]$Kind = 'aspnetcore'
     )
     $preserved = @()
-    foreach ($name in Get-SiteConfigFiles -Kind aspnetcore -Path $Destination) {
+    foreach ($name in Get-SiteConfigFiles -Kind $Kind -Path $Destination) {
         $site = Join-Path $Destination $name
         if (-not (Test-Path $site)) { continue }
         $rel = Join-Path $ReleasingDir $name
@@ -1226,16 +1325,18 @@ function Initialize-IisSite {
     } else {
         New-WebAppPool -Name $AppPoolName | Out-Null
         # aspnetcore sin plantilla: sin código administrado (lo aloja el ASP.NET Core Module)
-        $runtime = if ($Kind -eq 'aspnetcore') { '' } else { 'v4.0' }
+        $runtime = if ($Kind -in 'aspnetcore', 'node') { '' } else { 'v4.0' }
         $pipeline = 'Integrated'
         if ($template) {
             $tp = Get-Item "IIS:\AppPools\$($template.applicationPool)" -ErrorAction SilentlyContinue
             if ($tp) { $runtime = $tp.managedRuntimeVersion; $pipeline = [string]$tp.managedPipelineMode }
         }
+        # node: la plantilla solo presta el certificado; el proceso es node.exe, nunca .NET Framework
+        if ($Kind -eq 'node') { $runtime = '' }
         Set-ItemProperty "IIS:\AppPools\$AppPoolName" managedRuntimeVersion $runtime
         Set-ItemProperty "IIS:\AppPools\$AppPoolName" managedPipelineMode $pipeline
         $extra = ''
-        if ($Kind -eq 'aspnetcore') {
+        if ($Kind -in 'aspnetcore', 'node') {
             Set-ItemProperty "IIS:\AppPools\$AppPoolName" startMode 'AlwaysRunning'
             Set-ItemProperty "IIS:\AppPools\$AppPoolName" processModel.idleTimeout ([TimeSpan]::Zero)
             $extra = ', AlwaysRunning, sin apagado por inactividad'
@@ -1259,7 +1360,7 @@ function Initialize-IisSite {
         $found = Find-SiteCertificate -TemplateHttpsBinding $templateHttps -Target $HostName
         $httpsBinding = Get-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostName
         $httpsBinding.AddSslCertificate($found.cert.Thumbprint, $found.store)
-        if ($Kind -eq 'aspnetcore') { Set-ItemProperty "IIS:\Sites\$Name" -Name applicationDefaults.preloadEnabled -Value $true }
+        if ($Kind -in 'aspnetcore', 'node') { Set-ItemProperty "IIS:\Sites\$Name" -Name applicationDefaults.preloadEnabled -Value $true }
         $site = Get-Website -Name $Name
         $actions.Add("site $Name ($HostName, cert $($found.source))")
         Write-Host ("[3/6] Site creado: {0} -> {1} (http+https SNI, cert '{2}' de {3}, caduca {4:yyyy-MM-dd})" -f `
@@ -1268,7 +1369,9 @@ function Initialize-IisSite {
 
     # 4) siembra de la configuración de la plantilla (Publish la preserva en el swap)
     $seeded = @()
-    foreach ($file in (Get-SiteConfigFiles -Kind $Kind -Path $templatePath)) {
+    # node: la configuración de la plantilla (otra aplicación) no le sirve; la primera vez publica la del repo
+    $seedFiles = if ($Kind -eq 'node') { @() } else { Get-SiteConfigFiles -Kind $Kind -Path $templatePath }
+    foreach ($file in $seedFiles) {
         $dest = Join-Path $Destination $file
         if (Test-Path $dest) { continue }
         if (-not $templatePath) { continue }
@@ -1304,6 +1407,8 @@ function Initialize-IisSite {
             $actions.Add("$settingsFile del entorno: $($claves -join ', ')")
             Write-Host "[4/6] $settingsFile con lo propio del entorno: $($claves -join ', ')" -ForegroundColor Green
         }
+    } elseif ($Kind -eq 'node') {
+        Write-Host "[4/6] node: sin siembra; el primer publish usa el web.config del repo" -ForegroundColor Gray
     } elseif ($templatePath) {
         Write-Host "[4/6] Configuración ya presente en el destino (se preservará)" -ForegroundColor Gray
     } else {
@@ -1312,7 +1417,7 @@ function Initialize-IisSite {
 
     # 5) acceso SQL del app pool (Integrated Security contra la instancia local; las
     #    cadenas de un aspnetcore viven en appsettings y usan usuario SQL)
-    if ($template -and -not $SkipSqlAccess -and $Kind -ne 'aspnetcore') {
+    if ($template -and -not $SkipSqlAccess -and $Kind -eq 'mvc') {
         $sqlServers = Get-LocalIntegratedSqlServers -WebConfigPath (Join-Path $Destination 'Web.config')
         if (-not $sqlServers) {
             Write-Host "[5/6] La configuración no conecta a SQL local con Integrated Security: nada que replicar" -ForegroundColor Gray
@@ -1967,7 +2072,13 @@ function Publish {
     }
     $Kind = Resolve-PublishKind $Kind
 
-    if ($Kind -eq 'aspnetcore') {
+    if ($Kind -eq 'node') {
+        # node.exe lo arranca el AspNetCoreModuleV2: sin él, el site respondería 500.19 a todo
+        Assert-AspNetCoreModule
+        $node = Get-NodeExe
+        Write-Host "Using node: $node ($((& $node --version).Trim()))" -ForegroundColor Yellow
+    }
+    elseif ($Kind -eq 'aspnetcore') {
         $dotnet = Get-DotNet
         Write-Host "Using dotnet: $dotnet (SDK $((& $dotnet --version).Trim()))" -ForegroundColor Yellow
     }
@@ -2025,8 +2136,9 @@ function Publish {
 
         New-Item -ItemType Directory -Path $releasingDir | Out-Null
 
-        # Resolve ProjectPath: if it's a folder, find a .csproj inside
-        if (Test-Path $ProjectPath -PathType Container) {
+        # Resolve ProjectPath: if it's a folder, find a .csproj inside (node: la carpeta es el repo)
+        if ($Kind -eq 'node') { $projectToBuild = Join-Path $ProjectPath 'package.json' }
+        elseif (Test-Path $ProjectPath -PathType Container) {
             $csproj = Get-ChildItem -Path $ProjectPath -Filter *.csproj -Recurse -File | Select-Object -First 1
             if ($csproj) { $projectToBuild = $csproj.FullName } else { throw "No .csproj found under $ProjectPath" }
         }
@@ -2046,7 +2158,26 @@ function Publish {
         try { $repoRoot = (& git -C (Split-Path $projectToBuild -Parent) rev-parse --show-toplevel 2>$null) } catch { $repoRoot = $null }
         if ($repoRoot) { $repoRoot = ([string]$repoRoot).Trim() -replace '/', '\' }
 
-        if ($Kind -eq 'aspnetcore') {
+        if ($Kind -eq 'node') {
+            if (-not $repoRoot) { throw "kind node: '$ProjectPath' no es una copia de trabajo git; se publica lo commiteado." }
+            Write-Host "git archive into releasing directory..." -ForegroundColor Yellow
+            Export-NodeApp -RepoRoot $repoRoot -OutputDir $releasingDir
+            Write-Host "git archive completed" -ForegroundColor Green
+            # El web.config del site gana al del repo (sus variables de entorno son la configuración);
+            # del repo, cómo se arranca (processPath, arguments, hostingModel).
+            $preserved = Protect-SiteSettings -Destination $Destination -ReleasingDir $releasingDir -Override:$OverrideWebconfig -Kind node
+            if ($preserved) { Write-Host "Site configuration preserved: $($preserved -join ', ')" -ForegroundColor Green }
+            else { Write-Host "No site configuration found; publishing the repo one (deploy\iis\web.config)" -ForegroundColor Yellow }
+            $nodeDataDir = Get-NodeDataDir -Destination $Destination
+            Set-NodeWebConfig -WebConfigPath $releasingWebConfig -NodeExe $node -DataDir $nodeDataDir
+            Write-Host "web.config: $node, DATA_DIR $nodeDataDir" -ForegroundColor Green
+            if (Add-DeployInfoStaticRoute -WebConfigPath $releasingWebConfig) {
+                Write-Host "web.config: deploy-info.json served by IIS as a static file" -ForegroundColor Green
+            }
+            # Los secretos (clave del traspaso, cuenta de la API) llegan por el parche del entorno ({secreto:…})
+            Invoke-EnvironmentWebConfigPatch -WebConfigPath $releasingWebConfig -RepoRoot $repoRoot -Environment $Environment
+        }
+        elseif ($Kind -eq 'aspnetcore') {
             # dotnet publish restaura los paquetes (PackageReference) de las fuentes NuGet
             # de la máquina: una privada (EconomitzaDB en el registro de GitLab) tiene que
             # estar dada de alta en un NuGet.Config que vea quien ejecuta la tarea.
@@ -2205,7 +2336,16 @@ function Publish {
         # padre no da escritura al proceso de IIS, la aplicacion crea la carpeta pero no puede
         # escribir en ella y las importaciones mueren con «Access to the path ... is denied».
         # La API escribe ademas su log en Logs\ (Serilog no avisa si no puede).
-        Grant-RuntimeFolderWrite -SitePath $Destination -Folders (Get-RuntimeFolders -Kind $Kind)
+        if ($Kind -eq 'node') {
+            # La carpeta de datos (espacio de trabajo, historial, log de consola) no viaja en el swap:
+            # se crea una vez y su grupo escribe en ella.
+            foreach ($d in @($nodeDataDir, (Join-Path $nodeDataDir 'logs'))) {
+                if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+            }
+            & icacls $nodeDataDir /grant "IIS AppPool\${AppPoolName}:(OI)(CI)M" | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Warning "No se pudo dar escritura a IIS AppPool\$AppPoolName en $nodeDataDir (icacls $LASTEXITCODE)." }
+        }
+        else { Grant-RuntimeFolderWrite -SitePath $Destination -Folders (Get-RuntimeFolders -Kind $Kind) }
 
         # Subaplicaciones: su grupo y su aplicación en IIS (la primera vez se crean), su carpeta de
         # datos fuera del swap con escritura para su grupo, y en marcha.
@@ -2338,7 +2478,8 @@ function Invoke-DeployOrder {
     }
 
     $cfg = if ($EnvironmentDef) { $EnvironmentDef } else { Get-PublishConfig -Environment $Environment }
-    $repo = Split-Path ($cfg.origin.TrimEnd('\', '/')) -Parent
+    # El origin de un mvc o un aspnetcore es la carpeta del proyecto, dentro del repo; el de un node es el repo
+    $repo = if ((Resolve-PublishKind $cfg.kind) -eq 'node') { $cfg.origin.TrimEnd('\', '/') } else { Split-Path ($cfg.origin.TrimEnd('\', '/')) -Parent }
 
     $pubArgs = @{ Environment = $Environment }
     if ($EnvironmentDef) {

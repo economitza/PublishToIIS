@@ -2674,6 +2674,71 @@ Describe 'Invoke-DeployQueueDrain con entorno ad hoc' {
     }
 }
 
+Describe 'Entornos node (escandallos)' {
+    BeforeEach {
+        $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_node_" + [Guid]::NewGuid())
+        $script:repo = Join-Path $script:tmp 'repo'
+        New-Item -ItemType Directory -Path (Join-Path $script:repo 'deploy\iis') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:repo 'tests') -Force | Out-Null
+        'export const x = 1;' | Set-Content (Join-Path $script:repo 'server.mjs')
+        'secreto' | Set-Content (Join-Path $script:repo '.env')
+        'test' | Set-Content (Join-Path $script:repo 'tests\a.test.mjs')
+        '{"name":"app","devDependencies":{"playwright":"1"}}' | Set-Content (Join-Path $script:repo 'package.json')
+        "# lo que sirve`r`n:(glob)*.mjs`r`npackage.json`r`ndeploy/iis" | Set-Content (Join-Path $script:repo 'deploy\iis\publicar.txt')
+        '<configuration><system.webServer><aspNetCore processPath="node" arguments="server.mjs" hostingModel="OutOfProcess"><environmentVariables><environmentVariable name="HOST" value="127.0.0.1" /></environmentVariables></aspNetCore></system.webServer></configuration>' |
+            Set-Content (Join-Path $script:repo 'deploy\iis\web.config')
+        '.env' | Set-Content (Join-Path $script:repo '.gitignore')
+        & git -C $script:repo init -q
+        & git -C $script:repo add -A
+        & git -C $script:repo -c user.name=t -c user.email=t@t commit -q -m init
+    }
+    AfterEach { Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'la configuración del site es su web.config, sin carpetas de ejecución dentro del site' {
+        InModuleScope PublishToIIS {
+            Get-SiteConfigFiles -Kind node | Should -Be @('web.config')
+            @(Get-RuntimeFolders -Kind node).Count | Should -Be 0
+            Get-NodeDataDir -Destination 'E:\wwwrootDevecoRows\' | Should -Be 'E:\wwwrootDevecoRows_data'
+        }
+    }
+
+    It 'Export-NodeApp: solo lo commiteado que pide publicar.txt, con el web.config del repo en la raíz' {
+        $out = Join-Path $script:tmp 'rel'
+        InModuleScope PublishToIIS -Parameters @{ repo = $script:repo; out = $out } {
+            Export-NodeApp -RepoRoot $repo -OutputDir $out
+        }
+        Test-Path (Join-Path $out 'server.mjs') | Should -BeTrue
+        Test-Path (Join-Path $out 'web.config') | Should -BeTrue
+        Test-Path (Join-Path $out '.env') | Should -BeFalse
+        Test-Path (Join-Path $out 'tests') | Should -BeFalse
+        Test-Path (Join-Path $out 'node_modules') | Should -BeFalse
+    }
+
+    It 'Export-NodeApp: sin deploy\iis\web.config para antes de publicar' {
+        Remove-Item (Join-Path $script:repo 'deploy\iis\web.config')
+        & git -C $script:repo -c user.name=t -c user.email=t@t commit -q -am 'sin web.config'
+        { InModuleScope PublishToIIS -Parameters @{ repo = $script:repo; out = (Join-Path $script:tmp 'rel') } {
+            Export-NodeApp -RepoRoot $repo -OutputDir $out
+        } } | Should -Throw '*deploy\iis\web.config*'
+    }
+
+    It 'Set-NodeWebConfig: el node.exe del servidor, DATA_DIR y el log fuera del site; lo demás se conserva' {
+        $wc = Join-Path $script:tmp 'web.config'
+        Copy-Item (Join-Path $script:repo 'deploy\iis\web.config') $wc
+        InModuleScope PublishToIIS -Parameters @{ wc = $wc } {
+            Set-NodeWebConfig -WebConfigPath $wc -NodeExe 'C:\Program Files\nodejs\node.exe' -DataDir 'E:\site_data'
+        }
+        [xml]$x = Get-Content $wc -Raw
+        $core = $x.configuration.'system.webServer'.aspNetCore
+        $core.processPath | Should -Be 'C:\Program Files\nodejs\node.exe'
+        $core.arguments | Should -Be 'server.mjs'
+        $core.stdoutLogFile | Should -Be 'E:\site_data\logs\node'
+        $vars = @{}; foreach ($v in $core.environmentVariables.environmentVariable) { $vars[$v.name] = $v.value }
+        $vars.DATA_DIR | Should -Be 'E:\site_data'
+        $vars.HOST | Should -Be '127.0.0.1'
+    }
+}
+
 Describe 'Entornos aspnetcore (la API)' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_core_" + [Guid]::NewGuid())
@@ -2682,11 +2747,12 @@ Describe 'Entornos aspnetcore (la API)' {
     }
     AfterEach { Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
-    It 'Resolve-PublishKind: mvc por defecto, aspnetcore sin distinguir mayúsculas y nada más' {
+    It 'Resolve-PublishKind: mvc por defecto, aspnetcore y node sin distinguir mayúsculas y nada más' {
         InModuleScope PublishToIIS {
             Resolve-PublishKind $null | Should -Be 'mvc'
             Resolve-PublishKind 'AspNetCore' | Should -Be 'aspnetcore'
-            { Resolve-PublishKind 'node' } | Should -Throw '*no soportado*'
+            Resolve-PublishKind 'Node' | Should -Be 'node'
+            { Resolve-PublishKind 'php' } | Should -Throw '*no soportado*'
         }
     }
 
