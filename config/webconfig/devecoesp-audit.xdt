@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Parche del web.config de devecoesp-audit: se aplica en cada publicación, sea cual sea la rama.
+     {secreto:Nombre} sale del almacén del servidor (Set-RemotePublishSecret), nunca de git. -->
+<configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+  <appSettings>
+    <!-- SI-1653: el S3Service lee bucket, región y claves del web.config; sin ellas ValidateDelivery no se construye.
+         Los de desarrollo, los mismos que el código anterior usaba con Environment=Development. -->
+    <add key="S3ServiceBucketName" xdt:Transform="Remove" xdt:Locator="Match(key)" />
+    <add key="S3ServiceBucketName" value="economitza-dev" xdt:Transform="Insert" />
+    <add key="S3ServiceRegion" xdt:Transform="Remove" xdt:Locator="Match(key)" />
+    <add key="S3ServiceRegion" value="us-east-1" xdt:Transform="Insert" />
+    <add key="S3ServiceAccessKey" xdt:Transform="Remove" xdt:Locator="Match(key)" />
+    <add key="S3ServiceAccessKey" value="{secreto:S3ServiceAccessKey}" xdt:Transform="Insert" />
+    <add key="S3ServiceSecretKey" xdt:Transform="Remove" xdt:Locator="Match(key)" />
+    <add key="S3ServiceSecretKey" value="{secreto:S3ServiceSecretKey}" xdt:Transform="Insert" />
+  </appSettings>
+</configuration>
