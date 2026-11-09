@@ -115,8 +115,11 @@ def probe(env):
             result["deployInfo"] = json.loads(r.read().decode("utf-8-sig"))
     except Exception:
         pass  # sello aún no publicado en ese site: no es un error del site
+    # Una API (aspnetcore) no sirve nada en la raíz: «/» da 404 aunque esté sana. Su semáforo es su deploy-info.json.
+    online_path = env.get("onlinePath") or ("/deploy-info.json" if env.get("kind") == "aspnetcore" else "/")
+    result["onlinePath"] = online_path
     try:
-        with http_get(base + "/") as r:
+        with http_get(base + online_path) as r:
             result["httpStatus"] = r.status
             result["online"] = "ok" if r.status == 200 else "error"
     except urllib.error.HTTPError as e:
