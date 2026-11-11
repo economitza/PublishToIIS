@@ -6,6 +6,15 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.18.0] - 2026-11-11
+
+### Added
+- **Reciclar un entorno sin publicar**: `Request-RemoteRecycle -Server <servidor> -Environment <entorno>`
+  (`POST /api/recycle`) y `Request-Recycle` en local. Orden `kind=recycle` por la misma cola FIFO que las
+  publicaciones; la tarea elevada (`Invoke-RecycleOrder`) recicla el app pool del site, o lo arranca si estaba
+  parado. Para que una API relea su `appsettings.json` o un e-market su `Web.config` tras editarlos en el
+  servidor, sin la vuelta de republicar el mismo commit.
+
 ## [0.17.0] - 2026-11-05
 
 ### Added

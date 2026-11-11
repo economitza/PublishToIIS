@@ -159,6 +159,15 @@ Uso rápido:
   La primera vez que un servidor recibe una versión con `/api/update` hay que
   actualizarlo por RDP con `Update-PublishToIIS`; a partir de ahí, ya no.
 
+- Reciclar el app pool de un entorno SIN publicar ni RDP: `Request-RemoteRecycle
+  -Server deployments-76 -Environment devecoandapi1` (`POST /api/recycle`, orden
+  `kind=recycle` por la misma cola). La tarea elevada busca el pool por la ruta
+  física del `destination` (como el refresco de BD), lo recicla, o lo arranca si
+  estaba parado, y deja en el resultado el pool y su estado antes y después. Es lo
+  que hace falta tras editar a mano en el servidor el `appsettings.json` de una API
+  o el `Web.config` de un e-market. Solo entornos de `environments.json`. En local,
+  `Request-Recycle -Environment <entorno>`.
+
 - Versionado por push: los push de este repo van por `tools\Push-Release.ps1`,
   que **sube el `ModuleVersion` en +1 el tercer dígito** (patch), commitea
   `chore(release): vX.Y.Z` y pushea en un paso. `-Minor`/`-Major` suben ese nivel

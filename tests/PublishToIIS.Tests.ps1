@@ -1414,6 +1414,70 @@ Describe 'Órdenes de actualización del módulo (kind=update)' {
     }
 }
 
+Describe 'Reciclado del app pool de un entorno (kind=recycle)' {
+    BeforeEach {
+        $script:dataDir = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_rec_" + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:dataDir | Out-Null
+        $script:token = 'c' * 64
+    }
+    AfterEach { Remove-Item $script:dataDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'Write-RecycleOrder escribe kind=recycle con el entorno y Read-PublishOrder la lee sin exigir rama' {
+        $o = Write-RecycleOrder -Environment 'devecoesp1' -DataDir $script:dataDir -RequestedBy 'PC-ANA\ana'
+        $leida = Read-PublishOrder -Path $o.path
+        $leida.kind | Should -Be 'recycle'
+        $leida.environment | Should -Be 'devecoesp1'
+        $leida.runId | Should -Be $o.runId
+        $leida.execute | Should -BeTrue
+        $leida.branch | Should -BeNullOrEmpty
+    }
+
+    It 'una orden de reciclado sin entorno o con uno fuera de la lista blanca se rechaza' {
+        $p = Join-Path $script:dataDir 'publish-order.json'
+        '{"kind":"recycle","runId":"r"}' | Set-Content $p -Encoding UTF8
+        { Read-PublishOrder -Path $p } | Should -Throw "*'environment'*"
+        { Write-RecycleOrder -Environment 'prod' -DataDir $script:dataDir } | Should -Throw '*no permitido*'
+        { Add-DeployQueueItem -Kind recycle -Environment 'no-existe' -DataDir $script:dataDir } | Should -Throw '*no permitido*'
+    }
+
+    It 'Add-DeployQueueItem -Kind recycle encola en el carril de las publicaciones y el drenador lo pasa a Request-Recycle' {
+        Mock -ModuleName PublishToIIS Request-Recycle { [pscustomobject]@{ status = 'ok'; message = 'reciclado' } }
+        $item = Add-DeployQueueItem -Kind recycle -Environment 'devecoesp1' -DataDir $script:dataDir
+        $item.lane | Should -Be 'publish'
+        @(Get-DeployQueue -DataDir $script:dataDir)[0].kind | Should -Be 'recycle'
+        Invoke-DeployQueueDrain -DataDir $script:dataDir | Should -Be 1
+        Should -Invoke -ModuleName PublishToIIS Request-Recycle -Times 1 -ParameterFilter { $Environment -eq 'devecoesp1' -and $Direct }
+        $r = Get-DeployResult -RunId $item.runId -DataDir $script:dataDir
+        $r.status | Should -Be 'ok'
+        $r.kind | Should -Be 'recycle'
+    }
+
+    It 'POST /api/recycle encola (202) y exige entorno de la lista blanca' {
+        $r = Invoke-DeployEndpointRequest -Method POST -Path '/api/recycle' -Body '{"environment":"devecoesp1","requestedBy":"PC-ANA\\ana"}' `
+            -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+        $r.status | Should -Be 202
+        $r.body.kind | Should -Be 'recycle'
+        @(Get-DeployQueue -DataDir $script:dataDir)[0].environment | Should -Be 'devecoesp1'
+
+        $mal = Invoke-DeployEndpointRequest -Method POST -Path '/api/recycle' -Body '{"environment":"prod"}' `
+            -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+        $mal.status | Should -Be 400
+        $sin = Invoke-DeployEndpointRequest -Method POST -Path '/api/recycle' -Body '{}' `
+            -Token $script:token -ExpectedToken $script:token -DataDir $script:dataDir
+        $sin.status | Should -Be 400
+    }
+
+    It 'Request-RemoteRecycle hace POST a /api/recycle con el entorno y con -NoWait devuelve el 202' {
+        Mock -ModuleName PublishToIIS Invoke-RestMethod { [pscustomobject]@{ runId = 'r1'; position = 1; kind = 'recycle' } }
+        $r = Request-RemoteRecycle -Url 'http://ep.test' -Token 't' -Environment 'devecoandapi1' -NoWait -RequestedBy 'PC-ANA\ana' 6>$null
+        $r.runId | Should -Be 'r1'
+        Should -Invoke -ModuleName PublishToIIS Invoke-RestMethod -Times 1 -ParameterFilter {
+            $Method -eq 'Post' -and $Uri -eq 'http://ep.test/api/recycle' -and
+            ([Text.Encoding]::UTF8.GetString($Body) -like '*"environment":"devecoandapi1"*')
+        }
+    }
+}
+
 Describe 'Refresco de BD (kind=dbrefresh)' {
     BeforeEach {
         $script:root = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_db_" + [Guid]::NewGuid())

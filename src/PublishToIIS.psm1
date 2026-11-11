@@ -3297,10 +3297,24 @@ function Read-PublishOrder {
     }
     $raw = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
     # Tipo de orden: 'publish' (por defecto), 'update' (actualizar el propio
-    # módulo en el servidor: git pull + reinstalar + reiniciar el listener) o
-    # 'dbrefresh' (refrescar la BD de un entorno de test desde la réplica).
+    # módulo en el servidor: git pull + reinstalar + reiniciar el listener),
+    # 'dbrefresh' (refrescar la BD de un entorno de test desde la réplica) o
+    # 'recycle' (reciclar el app pool de un entorno, sin compilar ni copiar nada).
     $kind = if ($raw.kind) { [string]$raw.kind } else { 'publish' }
-    if ($kind -notin @('publish', 'update', 'dbrefresh')) { throw "Tipo de orden desconocido: '$kind'." }
+    if ($kind -notin @('publish', 'update', 'dbrefresh', 'recycle')) { throw "Tipo de orden desconocido: '$kind'." }
+    if ($kind -eq 'recycle') {
+        if (-not $raw.environment) { throw "La orden de reciclado no indica 'environment'." }
+        return [pscustomobject]@{
+            kind        = 'recycle'
+            environment = [string]$raw.environment
+            branch      = ''
+            execute     = $true
+            overrideWebconfig = $false
+            runId       = [string]$raw.runId
+            requestedBy = [string]$raw.requestedBy
+            environmentDef = $null
+        }
+    }
     if ($kind -eq 'dbrefresh') {
         if (-not $raw.environment) { throw "La orden de refresco no indica 'environment'." }
         return [pscustomobject]@{
@@ -3919,6 +3933,135 @@ function Request-ModuleUpdate {
     return $result
 }
 
+function New-RecycleOrderBody {
+    # Validación común de una orden de reciclado (orden local, cola y endpoint): solo
+    # entornos de la lista blanca —nunca ad hoc ni prod/staging—, porque el app pool se
+    # busca por el `destination` de un site ya dado de alta.
+    param(
+        [string]$Environment,
+        [string[]]$AllowedEnvironments,
+        [string]$RunId = [Guid]::NewGuid().ToString(),
+        [string]$RequestedBy
+    )
+    if (-not $Environment) { throw "Una orden de reciclado necesita 'environment'." }
+    $allowed = Get-AllowedEnvironments -AllowedEnvironments $AllowedEnvironments
+    if ($Environment -notin $allowed) { throw "Entorno no permitido: '$Environment'. Permitidos: $($allowed -join ', ')" }
+    [ordered]@{
+        kind        = 'recycle'
+        environment = $Environment
+        branch      = ''
+        execute     = $true
+        runId       = $RunId
+        requestedBy = if ($RequestedBy) { $RequestedBy } else { Get-RequesterIdentity }
+    }
+}
+
+function Write-RecycleOrder {
+    <#
+    .SYNOPSIS
+        Deja escrita una orden de RECICLADO del app pool de un entorno (publish-order.json, kind=recycle). Sin privilegios.
+
+    .DESCRIPTION
+        Misma mecánica que Write-UpdateOrder: la tarea elevada 'Publish Local' la
+        consume y ejecuta Invoke-RecycleOrder.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string[]]$AllowedEnvironments,
+        [string]$DataDir,
+        [string]$RunId = [Guid]::NewGuid().ToString(),
+        [string]$RequestedBy
+    )
+    $ErrorActionPreference = 'Stop'
+    $orden = New-RecycleOrderBody -Environment $Environment -AllowedEnvironments $AllowedEnvironments -RunId $RunId -RequestedBy $RequestedBy
+    $dir = Get-PublishDataDir -DataDir $DataDir
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Remove-Item (Join-Path $dir 'publish-order.result.json') -Force -ErrorAction SilentlyContinue
+    $orderPath = Join-Path $dir 'publish-order.json'
+    $orden.requestedAt = (Get-Date).ToString('o')
+    [pscustomobject]$orden | ConvertTo-Json -Compress | Set-Content $orderPath -Encoding UTF8
+    [pscustomobject]@{ path = $orderPath; runId = $RunId }
+}
+
+function Invoke-RecycleOrder {
+    <#
+    .SYNOPSIS
+        Recicla el app pool que sirve un entorno de la lista blanca (requiere admin).
+
+    .DESCRIPTION
+        El pool se busca en IIS por la ruta física del `destination` del entorno
+        (Get-SiteAppPool), como al refrescar la BD: los sites antiguos no se llaman
+        como su entorno. Un pool parado se arranca; uno en marcha se recicla, que es
+        lo que hace falta para que una API de ASP.NET Core relea su appsettings.json
+        o un e-market su Web.config sin compilar ni copiar nada.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Environment)
+    $ErrorActionPreference = 'Stop'
+    $root = Resolve-SiteRoot -Environment $Environment
+    $cfg = Get-PublishConfig -Environment $Environment
+    $pool = Get-SiteAppPool -Destination $root -Fallback $(if ($cfg.appPool) { [string]$cfg.appPool } else { $Environment })
+    Import-Module WebAdministration -ErrorAction Stop -WarningAction SilentlyContinue
+    if (-not (Test-Path "IIS:\AppPools\$pool")) { throw "No existe el app pool '$pool' del entorno '$Environment'." }
+    $antes = [string](Get-WebAppPoolState -Name $pool).Value
+    if ($antes -eq 'Started') { Restart-WebAppPool -Name $pool }
+    else { Start-IISAppPool -Name $pool }
+    $despues = [string](Get-WebAppPoolState -Name $pool).Value
+    [pscustomobject]@{ environment = $Environment; appPool = $pool; before = $antes; after = $despues; siteUrl = [string]$cfg.siteUrl }
+}
+
+function Request-Recycle {
+    <#
+    .SYNOPSIS
+        Pide SIN privilegios que se recicle el app pool de un entorno de esta máquina.
+
+    .DESCRIPTION
+        Encola una orden kind=recycle en la misma cola FIFO que las publicaciones
+        (nunca recicla a mitad de un publish del mismo servidor) y espera el
+        resultado. Con -Direct se salta la cola (lo usa el drenador, que ya ES la
+        cola). Es la mitad local de Request-RemoteRecycle.
+
+    .EXAMPLE
+        Request-Recycle -Environment devecoandapi1
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Environment,
+        [string[]]$AllowedEnvironments,
+        [string]$TaskName = 'Publish Local',
+        [string]$DrainerTaskName = 'Publish Queue Drainer',
+        [string]$DataDir,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 300,
+        [switch]$Quiet,
+        [string]$RequestedBy,
+        [switch]$Direct
+    )
+    $ErrorActionPreference = 'Stop'
+    $dir = Get-PublishDataDir -DataDir $DataDir
+
+    if (-not $Direct -and (Test-ScheduledTaskPresent -TaskName $DrainerTaskName)) {
+        $item = Add-DeployQueueItem -Kind recycle -Environment $Environment -AllowedEnvironments $AllowedEnvironments `
+            -DataDir $dir -RequestedBy $RequestedBy
+        $cola = if ($item.position -gt 1) { " (posición $($item.position) en la cola)" } else { '' }
+        Write-Host "Reciclado de $Environment encolado (runId $($item.runId))$cola" -ForegroundColor Gray
+        Start-PublishTask -TaskName $DrainerTaskName -DataDir $dir
+        if ($NoWait) { return [pscustomobject]@{ status = 'queued'; kind = 'recycle'; environment = $Environment; runId = $item.runId; position = $item.position } }
+        return Wait-DeployQueueItem -RunId $item.runId -DataDir $dir -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet
+    }
+
+    $order = Write-RecycleOrder -Environment $Environment -AllowedEnvironments $AllowedEnvironments -DataDir $dir -RequestedBy $RequestedBy
+    Write-Host "Orden de reciclado escrita en $($order.path) (runId $($order.runId))" -ForegroundColor Gray
+    Start-PublishTask -TaskName $TaskName -DataDir $dir
+    if ($NoWait) { return [pscustomobject]@{ status = 'triggered'; kind = 'recycle'; environment = $Environment; runId = $order.runId } }
+    $result = Wait-PublishResult -DataDir $dir -RunId $order.runId -TimeoutSeconds $TimeoutSeconds -Quiet:$Quiet `
+        -OrderPath $order.path -TaskName $TaskName
+    $color = if ($result.status -eq 'ok') { 'Green' } else { 'Red' }
+    Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
+    return $result
+}
+
 function Get-PublishToIISRepo {
     <#
     .SYNOPSIS
@@ -4177,7 +4320,8 @@ function Add-DeployQueueItem {
         # servidor; sin entorno ni rama) o 'dbrefresh' (refrescar la BD de un
         # entorno). Van por la MISMA cola: así nunca se actualiza el módulo ni se
         # truncan tablas a mitad de una publicación.
-        [ValidateSet('publish', 'update', 'dbrefresh')][string]$Kind = 'publish',
+        # 'recycle' (reciclar el app pool de un entorno de la lista blanca) también.
+        [ValidateSet('publish', 'update', 'dbrefresh', 'recycle')][string]$Kind = 'publish',
         # Solo kind=dbrefresh: buzón de la sanitización y tablas concretas.
         [string]$TestEmail,
         [string[]]$Tables,
@@ -4219,6 +4363,12 @@ function Add-DeployQueueItem {
         if ($Branch -notmatch '^[A-Za-z0-9._/+\-]+$') {
             throw "Rama con formato inválido: '$Branch'"
         }
+    }
+    elseif ($Kind -eq 'recycle') {
+        $null = New-RecycleOrderBody -Environment $Environment -AllowedEnvironments $AllowedEnvironments
+        $Branch = ''
+        $Execute = $true
+        $OverrideWebconfig = $false
     }
     else {
         $Environment = ''
@@ -4397,6 +4547,10 @@ function Invoke-DeployQueueDrain {
                 $res = Request-DbRefresh -Environment ([string]$order.environment) -TestEmail ([string]$order.testEmail) `
                     -Tables @($order.tables | Where-Object { $_ }) -Execute:([bool]$order.execute) -Direct -Lane $Lane `
                     -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds ([Math]::Max($TimeoutSeconds, 3600)) -Quiet
+            }
+            elseif ($kind -eq 'recycle') {
+                $res = Request-Recycle -Environment ([string]$order.environment) -Direct `
+                    -RequestedBy $requestedBy -TaskName $TaskName -TimeoutSeconds $TimeoutSeconds -Quiet
             }
             else {
                 # Un entorno ad hoc viaja como definición dentro del item; se
@@ -4697,6 +4851,8 @@ function Invoke-DeployEndpointRequest {
         el drenador la publica cuando le toca · POST /api/update {requestedBy} →
         202 con runId; encola la actualización del propio módulo (git pull +
         reinstalar + reiniciar el listener), por la MISMA cola que los publish ·
+        POST /api/recycle {environment, requestedBy} → 202 con runId; encola el
+        reciclado del app pool del entorno, por la misma cola (Invoke-RecycleOrder) ·
         POST /api/dbrefresh {environment, testEmail, tables, execute} → 202 con
         runId; encola el refresco de la BD del entorno desde la réplica, con
         sanitización (Invoke-DbRefreshOrder) · GET /api/version (versión, commit y rama del código que sirve el endpoint) ·
@@ -4804,6 +4960,27 @@ function Invoke-DeployEndpointRequest {
         return [pscustomobject]@{ status = 202; body = @{
             status = 'queued'; kind = 'update'; runId = $item.runId; position = $item.position
             current = (Get-PublishToIISVersionInfo)
+            result = "/api/result?runId=$($item.runId)"
+        } }
+    }
+
+    if ($Method -eq 'POST' -and $Path -eq '/api/recycle') {
+        try { $req = $Body | ConvertFrom-Json }
+        catch { return [pscustomobject]@{ status = 400; body = @{ error = 'Cuerpo JSON inválido.' } } }
+        if (-not $req -or -not $req.environment) {
+            return [pscustomobject]@{ status = 400; body = @{ error = "Falta 'environment' en la orden de reciclado." } }
+        }
+        $requestedBy = (([string]$req.requestedBy) -replace '[^\p{L}\p{N}_.@\\\- ]', '').Trim()
+        if ($requestedBy.Length -gt 128) { $requestedBy = $requestedBy.Substring(0, 128) }
+        try {
+            $item = Add-DeployQueueItem -Kind recycle -Environment ([string]$req.environment) -RequestedBy $requestedBy -DataDir $dir
+        }
+        catch {
+            return [pscustomobject]@{ status = 400; body = @{ error = $_.Exception.Message } }
+        }
+        return [pscustomobject]@{ status = 202; body = @{
+            status = 'queued'; kind = 'recycle'; runId = $item.runId; position = $item.position
+            environment = [string]$req.environment
             result = "/api/result?runId=$($item.runId)"
         } }
     }
@@ -5311,6 +5488,48 @@ function Request-RemoteDbRefresh {
         catch { Write-Warning "No se pudo leer /api/log: $($_.Exception.Message)" }
     }
     return $result
+}
+
+function Request-RemoteRecycle {
+    <#
+    .SYNOPSIS
+        Recicla el app pool de un entorno de un servidor remoto, sin publicar ni RDP.
+
+    .DESCRIPTION
+        POST a /api/recycle: el servidor encola la orden en la misma cola FIFO que
+        las publicaciones y la tarea elevada recicla el pool del site (lo arranca si
+        estaba parado). Sirve para que una API relea su appsettings.json o un
+        e-market su Web.config después de editarlos en el servidor.
+
+    .EXAMPLE
+        Request-RemoteRecycle -Server deployments-76 -Environment devecoandapi1
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Server,
+        [string]$Url,
+        [string]$Token,
+        [Parameter(Mandatory)][string]$Environment,
+        [switch]$NoWait,
+        [int]$TimeoutSeconds = 300,
+        [int]$PollSeconds = 3,
+        [string]$RequestedBy = (Get-RequesterIdentity)
+    )
+    $ErrorActionPreference = 'Stop'
+    $ep = Resolve-RemoteEndpoint -Server $Server -Url $Url -Token $Token
+    $payload = [pscustomobject]@{ environment = $Environment; requestedBy = $RequestedBy } | ConvertTo-Json -Compress
+    try {
+        $trig = Invoke-RestMethod -Method Post -Uri "$($ep.url)/api/recycle" -Headers $ep.headers `
+            -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($payload))
+    }
+    catch {
+        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+        throw "El endpoint rechazó el reciclado: $detail (¿el servidor corre una versión sin /api/recycle? Request-RemoteUpdate primero)."
+    }
+    $pos = if ($trig.position -gt 1) { " (posición $($trig.position) en la cola)" } else { '' }
+    Write-Host "Reciclado de $Environment encolado (runId $($trig.runId))$pos." -ForegroundColor Gray
+    if ($NoWait) { return $trig }
+    Wait-RemoteResult -Url $ep.url -Headers $ep.headers -RunId $trig.runId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
 }
 
 function Resolve-RemoteEndpoint {
@@ -6706,4 +6925,4 @@ function Undo-Hotfix {
 
 Set-Alias -Name Publish-Update -Value Update-PublishToIIS
 
-Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath, Get-XdtAssemblyPath, Get-WebConfigPatch, Invoke-EnvironmentWebConfigPatch, Invoke-WebConfigPatch, Set-PublishSecret, Get-PublishSecretNames, Set-RemotePublishSecret, Get-RemotePublishSecretNames -Alias Publish-Update
+Export-ModuleMember -Function Publish, Grant-RuntimeFolderWrite, Invoke-HotfixBuild, Get-HotfixBinDelta, Test-SameFileContent, Invoke-Hotfix, Undo-Hotfix, Get-HotfixTarget, Invoke-SiteWarmup, Update-DeployInfoHotfix, Restore-HotfixFiles, Test-HotfixWritable, Get-SiteDeployInfo, Resolve-HotfixPlan, Get-HotfixDelta, Get-MSBuild, Get-NuGetExe, Restore-NuGetPackages, Get-PublishConfig, Update-PublishToIIS, Protect-ProductionWebConfig, New-DeployInfo, Invoke-DeployOrder, Read-PublishOrder, Write-PublishOrder, Read-AdHocEnvironment, Wait-PublishResult, Request-Publish, Get-PublishToIISRepo, Register-PublishTask, New-DeployEndpointToken, Get-DeployEndpointToken, Invoke-DeployEndpointRequest, Start-DeployEndpoint, Request-RemotePublish, Add-DeployQueueItem, Get-DeployQueue, Get-DeployResult, Invoke-DeployQueueDrain, Register-DeployEndpoint, Test-DeployEndpoint, Register-DeployProxySite, Set-DeployToken, Get-DeployToken, Get-DeployServerUrl, Register-Dashboard, Initialize-IisSite, Set-ConnectionStringCatalog, Write-UpdateOrder, Request-ModuleUpdate, Get-PublishToIISVersionInfo, Get-RemoteDeployVersion, Get-RemoteSiteConfig, Get-RemoteSiteFiles, Get-RemoteSiteFile, Test-RemoteSiteManifest, New-DeployManifest, Get-SiteFileManifest, Request-RemoteUpdate, Write-RecycleOrder, Invoke-RecycleOrder, Request-Recycle, Request-RemoteRecycle, Resolve-DbRefreshPlan, Invoke-DbRefreshOrder, Write-DbRefreshOrder, Request-DbRefresh, Request-RemoteDbRefresh, Get-Lane, Get-DbRefreshLock, New-DbRefreshSnapshot, Start-DbRefreshDryRun, Get-DbRefreshDryRunLogPath, Get-XdtAssemblyPath, Get-WebConfigPatch, Invoke-EnvironmentWebConfigPatch, Invoke-WebConfigPatch, Set-PublishSecret, Get-PublishSecretNames, Set-RemotePublishSecret, Get-RemotePublishSecretNames -Alias Publish-Update

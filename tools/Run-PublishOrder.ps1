@@ -4,7 +4,8 @@
 # ejecuta Invoke-DeployOrder; si la orden es kind=update, en vez de publicar
 # actualiza el propio módulo (Update-PublishToIIS) y reinicia el listener del
 # endpoint para que cargue el código nuevo; si es kind=dbrefresh, refresca la BD
-# del entorno desde la réplica con Invoke-DbRefreshOrder.
+# del entorno desde la réplica con Invoke-DbRefreshOrder; si es kind=recycle,
+# recicla el app pool del entorno con Invoke-RecycleOrder.
 #
 # Deja dos rastros para quien la disparó SIN privilegios (Request-Publish, el
 # dashboard o el job de CI), que no ve la consola de la tarea:
@@ -86,6 +87,11 @@ try {
         $done = if ($order.execute) { "BD $($plan.database) de $($order.environment) refrescada y sanitizada (correo a $($plan.testEmail)) en $($plan.elapsed); sites parados durante el refresco: $sitios." }
                 else { "DRY-RUN: plan de refresco de $($plan.database) ($($plan.dataSource)) para $($order.environment); sites que comparten la BD: $sitios. El plan de tablas está en el log." }
         Write-Result -Status 'ok' -Message $done
+    }
+    elseif ($order.kind -eq 'recycle') {
+        $r = Invoke-RecycleOrder -Environment $order.environment
+        Write-Host 'RESULT: OK'
+        Write-Result -Status 'ok' -Message "App pool $($r.appPool) de $($order.environment) reciclado ($($r.before) -> $($r.after))."
     }
     else {
         $deployArgs = @{
