@@ -730,6 +730,41 @@ Describe 'Request-RemotePublish' {
     }
 }
 
+Describe 'Wait-RemoteResult' {
+    # Dos publicaciones dieron «Timeout» con el límite gastado en la cola del endpoint (detrás de builds de 20
+    # minutos) y terminaron bien después: el límite de ejecución cuenta desde que la orden empieza a correr.
+    BeforeEach {
+        $script:polls = 0
+        $script:inicio = Get-Date
+        Mock -ModuleName PublishToIIS Start-Sleep { }
+        # Cada sondeo «avanza» 10 s el reloj del módulo
+        Mock -ModuleName PublishToIIS Get-Date { $script:inicio.AddSeconds(10 * $script:polls) }
+    }
+
+    It 'no cuenta la espera en cola contra el límite de ejecución' {
+        Mock -ModuleName PublishToIIS Invoke-RestMethod {
+            $script:polls++
+            if ($script:polls -le 4) { [pscustomobject]@{ status = 'queued'; position = 2 } }
+            elseif ($script:polls -le 6) { [pscustomobject]@{ status = 'running' } }
+            else { [pscustomobject]@{ status = 'ok'; message = 'Publicado' } }
+        }
+        $r = InModuleScope PublishToIIS { Wait-RemoteResult -Url 'http://ep.test' -Headers @{} -RunId 'r1' -TimeoutSeconds 25 -QueueTimeoutSeconds 3600 -PollSeconds 1 }
+        $r.status | Should -Be 'ok'
+    }
+
+    It 'corta si la ejecución pasa de su límite' {
+        Mock -ModuleName PublishToIIS Invoke-RestMethod { $script:polls++; [pscustomobject]@{ status = 'running' } }
+        { InModuleScope PublishToIIS { Wait-RemoteResult -Url 'http://ep.test' -Headers @{} -RunId 'r1' -TimeoutSeconds 25 -QueueTimeoutSeconds 3600 -PollSeconds 1 } } |
+            Should -Throw '*desde que empezó a correr*'
+    }
+
+    It 'corta si la orden no sale de la cola en su tope' {
+        Mock -ModuleName PublishToIIS Invoke-RestMethod { $script:polls++; [pscustomobject]@{ status = 'queued'; position = 3 } }
+        { InModuleScope PublishToIIS { Wait-RemoteResult -Url 'http://ep.test' -Headers @{} -RunId 'r1' -TimeoutSeconds 25 -QueueTimeoutSeconds 60 -PollSeconds 1 } } |
+            Should -Throw '*en cola*'
+    }
+}
+
 Describe 'Get-PublishToIISRepo' {
     BeforeEach {
         $script:tmp = Join-Path ([IO.Path]::GetTempPath()) ("p2iis_repo_" + [Guid]::NewGuid())

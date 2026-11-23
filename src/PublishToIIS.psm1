@@ -5340,7 +5340,11 @@ function Request-RemotePublish {
         [string]$EnvironmentFile,
         [string]$Token,
         [switch]$NoWait,
-        [int]$TimeoutSeconds = 1200,
+        # Límite de la publicación desde que empieza a correr en el servidor (no desde que se encola). Una build
+        # del e-market en el 76 tarda unos 20 minutos; 1800 s es lo mismo que espera el drenador del endpoint.
+        [int]$TimeoutSeconds = 1800,
+        # Tope de la espera en la cola del endpoint, aparte: detrás de otras publicaciones puede pasar de una build.
+        [int]$QueueTimeoutSeconds = 3600,
         [int]$PollSeconds = 5,
         # Quién pide: por defecto EQUIPO\usuario de este proceso. Viaja en la orden
         # hasta deploy-info.json (requestedBy) para saber quién disparó cada deploy.
@@ -5391,21 +5395,33 @@ function Request-RemotePublish {
     Write-Host "Orden encolada (runId $($trig.runId))$pos. La publicación corre en el servidor." -ForegroundColor Gray
     if ($NoWait) { return $trig }
 
-    Wait-RemoteResult -Url $Url -Headers $headers -RunId $trig.runId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+    Wait-RemoteResult -Url $Url -Headers $headers -RunId $trig.runId -TimeoutSeconds $TimeoutSeconds -QueueTimeoutSeconds $QueueTimeoutSeconds -PollSeconds $PollSeconds
 }
 
 function Wait-RemoteResult {
-    # Sondea /api/result de un endpoint remoto hasta ok/error.
+    # Sondea /api/result de un endpoint remoto hasta ok/error. Dos límites aparte: -QueueTimeoutSeconds para que
+    # la orden empiece (la cola es FIFO y puede tener delante builds de 20 minutos) y -TimeoutSeconds desde que
+    # pasa a running. Con uno solo contado desde el encolado, una publicación que esperó turno daba «Timeout» y
+    # terminaba bien después.
     param(
         [Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][hashtable]$Headers,
         [Parameter(Mandatory)][string]$RunId,
-        [int]$TimeoutSeconds = 1200,
+        [int]$TimeoutSeconds = 1800,
+        [int]$QueueTimeoutSeconds = 3600,
         [int]$PollSeconds = 5
     )
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $finCola = (Get-Date).AddSeconds($QueueTimeoutSeconds)
+    $finEjecucion = $null
     $lastStatus = ''
-    while ((Get-Date) -lt $deadline) {
+    while ($true) {
+        $ahora = Get-Date
+        if ($finEjecucion -and $ahora -ge $finEjecucion) {
+            throw "Timeout de $TimeoutSeconds s desde que empezó a correr (runId $RunId). Mira $Url/api/log con el token."
+        }
+        if (-not $finEjecucion -and $ahora -ge $finCola) {
+            throw "La orden lleva $QueueTimeoutSeconds s en cola sin empezar (runId $RunId). Mira $Url/api/queue con el token."
+        }
         Start-Sleep -Seconds $PollSeconds
         try {
             $result = Invoke-RestMethod -Method Get -Uri "$Url/api/result?runId=$RunId" -Headers $Headers
@@ -5416,6 +5432,8 @@ function Wait-RemoteResult {
             Write-Host "RESULT: $($result.status) $($result.message)" -ForegroundColor $color
             return $result
         }
+        # El límite de ejecución empieza la primera vez que se la ve corriendo
+        if ($result.status -eq 'running' -and -not $finEjecucion) { $finEjecucion = (Get-Date).AddSeconds($TimeoutSeconds) }
         # queued / running: eco del cambio de estado sin spamear cada poll
         if ($result.status -ne $lastStatus) {
             $lastStatus = $result.status
@@ -5423,7 +5441,6 @@ function Wait-RemoteResult {
             Write-Host "  ...$($result.status)$detalle" -ForegroundColor DarkGray
         }
     }
-    throw "Timeout de $TimeoutSeconds s esperando el resultado (runId $RunId). Mira $Url/api/log con el token."
 }
 
 function Request-RemoteDbRefresh {
