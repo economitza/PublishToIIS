@@ -6,6 +6,16 @@ Novedades reseñables de PublishToIIS. Formato basado en
 **contador de push**: cada push sube el tercer dígito (patch) vía
 `tools\Push-Release.ps1` (`-Minor`/`-Major` suben ese nivel y reinician los de abajo).
 
+## [0.18.2] - 2026-11-23
+
+### Fixed
+- **La espera de `Request-RemotePublish` ya no cuenta la cola contra el límite de la publicación**: el límite
+  (`-TimeoutSeconds`, ahora 1800 por defecto, como el drenador) empieza cuando la orden pasa a `running`, y la
+  espera en cola tiene su tope aparte (`-QueueTimeoutSeconds`, 3600). Antes un solo límite de 1200 s contaba
+  desde el encolado: una publicación del e-market en el 76 tarda unos 20 minutos y otra que esperaba detrás
+  daba «Timeout» aunque después terminara bien. Vale también para `Request-RemoteDbRefresh` y
+  `Request-RemoteRecycle`, que comparten la espera.
+
 ## [0.18.0] - 2026-11-11
 
 ### Added
